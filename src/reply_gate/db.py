@@ -38,18 +38,27 @@ def connect(
     settings: Settings | None = None,
     autocommit: bool = False,
     connect_timeout: int = CONNECT_TIMEOUT_SECONDS,
+    statement_timeout_ms: int | None = None,
 ) -> psycopg.Connection[DictRow]:
     """Postgres 커넥션을 연다. `with` 블록에 넣으면 정상 종료 시 커밋된다.
 
     `readonly=True` 면 SELECT 권한만 가진 계정으로 연다.
+
+    `statement_timeout_ms` 는 **접속 옵션**으로 건다(`SET` 문이 아니라). 세션이 열리는 순간부터
+    적용되고 롤백·`RESET ALL` 로 되돌아가지 않아야, 실행 경로 어디서도 상한 없는 쿼리가
+    생기지 않는다.
     """
     settings = settings if settings is not None else get_settings()
     dsn = settings.readonly_database_url if readonly else settings.database_url
+    options = (
+        None if statement_timeout_ms is None else f"-c statement_timeout={statement_timeout_ms:d}"
+    )
     return psycopg.connect(
         dsn,
         row_factory=dict_row,
         autocommit=autocommit,
         connect_timeout=connect_timeout,
+        options=options,
     )
 
 
@@ -59,16 +68,23 @@ def readonly_connect(
     autocommit: bool = True,
     connect_timeout: int = CONNECT_TIMEOUT_SECONDS,
 ) -> psycopg.Connection[DictRow]:
-    """text-to-SQL 실행 전용 커넥션 (SELECT 권한만).
+    """text-to-SQL 실행 전용 커넥션 (SELECT 권한만 + 실행 시간 상한).
 
     기본이 `autocommit=True` 인 것은 의도적이다 — 조회만 하는 경로에서 트랜잭션을
     열어둔 채 방치하지 않기 위해서다.
+
+    `statement_timeout` 을 반드시 건다: LLM 이 만든 쿼리는 코드가 검증하지만, 검증을 통과한
+    쿼리라도 실행 시간까지 코드가 예측할 수는 없다. 상한 값은 `Settings.sql_statement_timeout_ms`
+    의 조정 가능 기본값이고, 상한을 넘긴 쿼리는 `psycopg.errors.QueryCanceled` 로 끊겨
+    SQL 실패 경로(실행 오류 → 1회 재시도)를 탄다.
     """
+    settings = settings if settings is not None else get_settings()
     return connect(
         readonly=True,
         settings=settings,
         autocommit=autocommit,
         connect_timeout=connect_timeout,
+        statement_timeout_ms=settings.sql_statement_timeout_ms,
     )
 
 
