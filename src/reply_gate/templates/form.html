@@ -170,7 +170,7 @@
       </p>
       <ol id="attempts"></ol>
       <p class="hint" id="attempts-empty" hidden>
-        초안 전 인계 — 근거가 없어서 초안 생성에 진입하지 않았다(L1 판정 없음).
+        <span id="attempts-empty-text">초안 전 인계 — 초안 생성에 진입하지 않았다(L1 판정 없음).</span>
       </p>
     </section>
 
@@ -225,10 +225,22 @@
     return span;
   }
 
-  function renderAttempts(attempts) {
+  function renderAttempts(attempts, escalationReason) {
     const list = el("attempts");
     clear(list);
     show("attempts-empty", attempts.length === 0);
+    // 초안 전 인계는 사유마다 이유가 다르다 — "근거가 없어서"로 뭉치면 인과가 틀리게 보인다.
+    const preDraftReason = {
+      no_evidence: "필요한 근거를 찾지 못해 초안 생성에 진입하지 않았다",
+      missing_order_ref: "주문 조회가 필요한데 주문번호가 없어 초안 생성에 진입하지 않았다",
+      order_not_found: "해당 주문이 존재하지 않아 주문 조회에도, 초안 생성에도 진입하지 않았다",
+      sql_failed: "주문 조회가 재시도 후에도 실패해 초안 생성에 진입하지 않았다",
+      llm_call_failed: "외부 호출이 재시도 후에도 실패해 초안 생성에 진입하지 않았다",
+    };
+    if (attempts.length === 0) {
+      const why = preDraftReason[escalationReason] || "초안 생성에 진입하지 않았다";
+      setText("attempts-empty-text", `초안 전 인계 — ${why}(L1 판정 없음).`);
+    }
     attempts.forEach((attempt, index) => {
       const rejected = attempt.verdict === "reject";
       const item = document.createElement("li");
@@ -299,7 +311,7 @@
     );
     setText("inquiry-id-line", "문의 ID: " + payload.inquiry_id);
 
-    renderAttempts(payload.attempts);
+    renderAttempts(payload.attempts, payload.escalation_reason);
 
     show("escalation", escalated);
     setText("escalation-reason", payload.escalation_reason || "");

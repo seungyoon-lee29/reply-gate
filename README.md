@@ -599,4 +599,4 @@ uv run python -m scripts.evaluate --live   # 측정 1 + 측정 2 (골든셋 30�
 | [`db/init/01_roles.sh`](db/init/01_roles.sh) | 계정 2개 생성 (안전장치 1) |
 | [`data/policies/`](data/policies/) | 정책 문서 4개 · 조항 26개 (미끼 3 · 모호 3 · 상충 2) |
 | [`scripts/seed_orders.py`](scripts/seed_orders.py) · [`scripts/index_policies.py`](scripts/index_policies.py) | 시딩 · 인덱싱 |
-| [`tests/`](tests/) | 387건 (그중 DB 통합 112건) |
+| [`tests/`](tests/) | 417건 (그중 DB 통합 115건) |

@@ -50,7 +50,7 @@ CREATE INDEX IF NOT EXISTS orders_ordered_at_idx ON orders (ordered_at);
 CREATE INDEX IF NOT EXISTS orders_customer_phone_idx ON orders (customer_phone);
 
 -- ── 정책 조항 청크 + 벡터 ────────────────────────────────────────────────────
--- 청킹 단위는 **조항**이다 (spec "데이터" 절). 임베딩 적재는 T2 가 채운다 — 여기서는
+-- 청킹 단위는 **조항**이다 (spec "데이터" 절). 임베딩은 scripts.index_policies 가 채운다 — 여기서는
 -- 컬럼과 인덱스만 만든다. 차원 1536 은 `Settings.embedding_dimensions` 와 같아야 한다.
 CREATE TABLE IF NOT EXISTS policy_chunks (
     id              bigint GENERATED ALWAYS AS IDENTITY,

@@ -48,7 +48,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 python_version = "3.12"
 strict = true
 files = ["src", "tests", "scripts"]
-# 증분 캐시는 기본 on — 반복 검증(웨이브 게이트·완료 게이트)에서 재사용된다.
+# 증분 캐시는 기본 on — 반복 검증에서 캐시가 재사용된다.
 incremental = true
 
 [[tool.mypy.overrides]]

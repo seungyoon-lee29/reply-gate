@@ -40,7 +40,7 @@ from reply_gate.contracts import (
     RejectReason,
     Verdict,
 )
-from reply_gate.gate import DEFAULT_PII_PATTERNS, evaluate_draft
+from reply_gate.gate import DEFAULT_PII_PATTERNS, REASON_ORDER, evaluate_draft
 from reply_gate.pipeline import ProcessedInquiry, ReceiptError, accept_inquiry, new_inquiry_id
 
 __all__ = [
@@ -79,14 +79,6 @@ DEFAULT_GOLDEN_SET_PATH: Final = _ROOT / "data" / "golden_set.jsonl"
 DEFAULT_L1_FIXTURES_PATH: Final = _ROOT / "data" / "l1_fixtures.jsonl"
 #: 리포트 산출 위치. `.gitignore` 되어 있어 산출물은 커밋되지 않는다.
 DEFAULT_REPORT_DIR: Final = _ROOT / "reports"
-
-#: 사유별 내역의 고정 순서 (spec 사유 표 순서 = `gate._REASON_ORDER`).
-REASON_ORDER: Final[tuple[RejectReason, ...]] = (
-    RejectReason.SCHEMA_VIOLATION,
-    RejectReason.MISSING_CITATION,
-    RejectReason.INVALID_CITATION,
-    RejectReason.PII_DETECTED,
-)
 
 
 # ══ 측정 1 — L1 게이트 단위 정확도 (결정론, LLM 호출 0회) ═══════════════════

@@ -193,6 +193,9 @@ def main(argv: list[str] | None = None) -> int:
     cases = load_golden_set(args.golden_set)
 
     print(f"측정 1 — L1 픽스처 {len(fixtures)}건 (LLM 호출 0회)")
+    # 실행 시각은 측정을 **시작하기 전에** 찍는다 — 라이브 30건은 수 분이 걸려,
+    # 끝난 뒤에 찍으면 리포트의 `started_at` 이 실제 시작 시각과 어긋난다.
+    started_at = utc_now_iso()
     accuracy = measure_gate_accuracy(fixtures)
 
     run_settings = _measurement_two_settings(args=args, settings=settings)
@@ -210,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     conditions = RunConditions(
-        started_at=utc_now_iso(),
+        started_at=started_at,
         generation=generation_label,
         embedding=embedding_label,
         similarity_threshold=run_settings.vector_similarity_threshold,

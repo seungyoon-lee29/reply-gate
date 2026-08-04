@@ -7,45 +7,56 @@
 
 ```
 웹 폼 / HTTP 클라이언트
-        │  POST /inquiries
-        ▼
-  api.py (FastAPI)  ──────────────┐
-        │                          │ GET /inquiries/{id}
-        ▼                          ▼
-  pipeline.py  ← 루프 제어      records.py ── 처리 기록 저장/복원
-   │   │   │                          │
-   │   │   └── gate.py (L1)           │
-   │   └────── draft.py ──┐           │
-   └────────── evidence.py ┤          │
-                 │   │     │          │
-        policy_index.py  llm.py       │
-                 │         │          │
-                 ▼         ▼          ▼
-        Postgres+pgvector   OpenAI    Postgres
-        (앱 계정 / RO 계정)
+        │  POST /inquiries          │  GET /inquiries/{id}
+        ▼                           ▼
+  ┌──────────────────── api.py (FastAPI) ────────────────────┐
+  │  커넥션 2개(앱 계정 · RO 계정)를 열어 아래로 넘긴다        │
+  └───────┬──────────────────────────────────┬───────────────┘
+          ▼                                  ▼
+    pipeline.py ── 루프 제어             records.py ── 처리 기록 저장/복원
+      │    │    │                             │
+      │    │    └── gate.py (L1)               │ (pipeline·evidence 의 자료형을 읽는다)
+      │    └─────── draft.py ──┐               │
+      └─────────── evidence.py ┤               │
+                     │    │     │              │
+            policy_index.py   llm.py           │
+                     │          │              │
+                     ▼          ▼              ▼
+             Postgres+pgvector   OpenAI      Postgres
 ```
 
-의존 방향은 위에서 아래로만 흐른다. `gate.py` 는 아무것도 부르지 않는 잎 노드이고,
-`contracts.py` 는 모두가 부르지만 아무것도 부르지 않는다.
+**DB 커넥션은 위에서 아래로 인자로 전달된다.** `evidence.py`·`policy_index.py`·`records.py` 는
+`db.py` 를 부르지 않고 이미 열린 커넥션을 받는다 — 그래서 테스트가 롤백 커넥션을 끼워 넣을 수
+있고, text-to-SQL 이 실수로 앱 계정 커넥션을 집을 수 없다. 커넥션을 여는 곳은 `api.py` 와
+실행 스크립트뿐이다.
+
+`gate.py` 는 `contracts.py` 만 부르는 잎 노드이고, `contracts.py`·`llm.py`·`order_ref.py`·
+`config.py` 는 이 패키지의 어떤 모듈도 부르지 않는다.
 
 ## 구성요소 지도
 
-| 모듈 | 역할 | 의존 방향 |
+"의존" 열은 이 패키지 안에서 실제로 import 하는 모듈이다(외부 라이브러리 제외).
+
+| 모듈 | 역할 | 의존 |
 |---|---|---|
-| `api.py` | HTTP 표면 4개, 응답 스키마 조립, 웹 폼 서빙 | → pipeline, records, config |
-| `pipeline.py` | 접수 검증 → 근거 수집 → 초안 → L1 → 종결. **재생성 상한을 강제하는 곳** | → evidence, draft, gate, contracts |
-| `evidence.py` | 의도 분류(LLM) · 정책 검색 · 주문 존재성 선검사 · text-to-SQL 조율 | → llm, policy_index, sql_guard, db, order_ref |
-| `sql_guard.py` | 생성된 SQL 을 실행 전에 파싱·검증. 화이트리스트·주문 범위·함수·잠금절 | → (없음) |
-| `gate.py` | L1 판정. **LLM·네트워크 라이브러리를 import 하지 않는다** | → contracts |
-| `draft.py` | 근거만 컨텍스트로 답변 계약 JSON 생성. 검증하지 않는다 | → llm, contracts |
-| `policy_index.py` | 정책 문서 조항 단위 청킹·임베딩 적재·코사인 검색 | → llm, contracts, db |
-| `records.py` | 처리 기록 4테이블 저장/복원 | → contracts, db |
-| `llm.py` | OpenAI 호출 래퍼. 전송 오류 1회 재시도를 **단독 통제** | → (openai SDK) |
-| `db.py` | 앱 계정/RO 계정 커넥션 분리 | → config |
-| `order_ref.py` | 주문번호 형식의 **단독 소유자** | → (없음) |
-| `contracts.py` | 답변 계약·근거 ID 체계·판정/인계 enum | → (없음) |
-| `evaluation.py` | 측정 1(픽스처)·측정 2(골든셋) 산출, 리포트 생성 | → gate, pipeline, policy_index |
-| `config.py` | 환경 변수 설정, DSN 조립 | → (없음) |
+| `api.py` | HTTP 표면 4개, 응답 스키마 조립, 웹 폼 서빙, **커넥션 2개 개방** | config, db, llm, pipeline, records |
+| `pipeline.py` | 접수 검증 → 근거 수집 → 초안 → L1 → 종결. **재생성 상한을 강제하는 곳** | config, contracts, draft, evidence, gate, llm, order_ref |
+| `evidence.py` | 의도 분류(LLM) · 정책 검색 · 주문 존재성 선검사 · text-to-SQL 조율 | config, contracts, llm, order_ref, policy_index, sql_guard |
+| `sql_guard.py` | 생성된 SQL 을 실행 전에 파싱·검증. 화이트리스트·주문 범위·함수·잠금절 | order_ref |
+| `gate.py` | L1 판정. **LLM·네트워크 라이브러리를 import 하지 않는다** | contracts |
+| `draft.py` | 근거만 컨텍스트로 답변 계약 JSON 생성. 검증하지 않는다 | contracts, llm |
+| `policy_index.py` | 정책 문서 조항 단위 청킹·임베딩 적재·코사인 검색 | contracts, llm |
+| `records.py` | 처리 기록 4테이블 저장/복원 | contracts, evidence, pipeline |
+| `llm.py` | OpenAI 호출 래퍼. 전송 오류 1회 재시도를 **단독 통제** | (없음) |
+| `db.py` | 앱 계정/RO 계정 커넥션 분리 | config |
+| `order_ref.py` | 주문번호 형식의 **단독 소유자** | (없음) |
+| `contracts.py` | 답변 계약·근거 ID 체계·판정/인계 enum | (없음) |
+| `evaluation.py` | 측정 1(픽스처)·측정 2(골든셋) 산출, 리포트 생성 | contracts, gate, pipeline |
+| `config.py` | 환경 변수 설정, DSN 조립 | (없음) |
+
+`records.py` 가 `pipeline`·`evidence` 를 부르는 것은 **자료형 때문**이다 — 저장 대상인
+`ProcessedInquiry`·근거 스냅샷의 정의가 거기 있다. 반대 방향(파이프라인이 저장을 부르는 것)은
+없다: 저장 시점을 정하는 것은 `api.py` 다.
 
 `testing.py` 는 어휘 기반 결정론 임베딩 대역이다. 외부 키 없이 벡터 검색 배관을 끝까지 돌리기
 위한 것이고 실행 경로에서는 쓰지 않는다.

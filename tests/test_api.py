@@ -13,6 +13,7 @@ DB 가 필요한 테스트는 `db` 마커가 붙고, 쓰기는 전부 `app_conn`
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -29,7 +30,7 @@ from reply_gate.api import (
     build_generation_client,
     get_service,
 )
-from reply_gate.config import Settings
+from reply_gate.config import Settings, get_settings
 from reply_gate.contracts import EscalationReason, InquiryStatus, RejectReason, Verdict
 from reply_gate.draft import DRAFT_STAGE
 from reply_gate.evidence import INTENT_STAGE
@@ -438,3 +439,37 @@ def test_API_키가_없으면_POST_는_503_이고_인계로_기록하지_않는�
     after = app_conn.execute("SELECT count(*) AS n FROM inquiries").fetchone()
     assert after is not None
     assert after["n"] == before["n"]
+
+
+# ── 커넥션 배선 자체 (목으로 덮이는 구간) ────────────────────────────────────
+
+
+@pytest.mark.db
+def test_get_service_가_계정_두_개로_커넥션을_열고_닫는다() -> None:
+    """다른 테스트는 이 의존성을 통째로 override 하므로 배선이 목 뒤에 숨는다.
+
+    text-to-SQL 이 앱 계정 커넥션을 집으면 안전장치 1층이 무의미해지므로,
+    실제로 열리는 커넥션이 각각 어느 계정인지 한 번은 DB 에 물어 확인한다.
+    """
+    settings = get_settings()
+    generator = get_service()
+    service = next(generator)
+    try:
+        with service._app_conn.cursor() as cur:
+            cur.execute("SELECT current_user AS who")
+            row = cur.fetchone()
+            assert row is not None
+            assert row["who"] == settings.postgres_app_user
+
+        with service._readonly_conn.cursor() as cur:
+            cur.execute("SELECT current_user AS who")
+            row = cur.fetchone()
+            assert row is not None
+            assert row["who"] == settings.postgres_ro_user
+    finally:
+        with contextlib.suppress(StopIteration):
+            next(generator)
+
+    # 제너레이터가 끝나면 두 커넥션 모두 닫혀 있어야 한다 — 요청마다 새는 것을 막는다.
+    assert service._app_conn.closed
+    assert service._readonly_conn.closed

@@ -25,6 +25,7 @@ from reply_gate.contracts import Claim, Draft, Evidence, GateResult, RejectReaso
 
 __all__ = [
     "DEFAULT_PII_PATTERNS",
+    "REASON_ORDER",
     "PiiPattern",
     "evaluate_draft",
     "normalize_digits",
@@ -36,8 +37,9 @@ _CLAIMS_KEY = "claims"
 _TEXT_KEY = "text"
 _CITATION_IDS_KEY = "citation_ids"
 
-#: 사유 목록의 고정 순서 (spec 의 사유 표 순서). 검출 순서에 의존하면 결정론이 깨진다.
-_REASON_ORDER: tuple[RejectReason, ...] = (
+#: 사유 목록의 고정 순서. 검출 순서에 의존하면 같은 입력이 다른 순서를 내 결정론이 깨진다.
+#: 리포트의 사유별 내역도 이 순서를 그대로 쓴다 — 정의는 여기 한 곳뿐이다.
+REASON_ORDER: tuple[RejectReason, ...] = (
     RejectReason.SCHEMA_VIOLATION,
     RejectReason.MISSING_CITATION,
     RejectReason.INVALID_CITATION,
@@ -145,7 +147,7 @@ def evaluate_draft(
     ):
         reasons.add(RejectReason.PII_DETECTED)
 
-    ordered = tuple(reason for reason in _REASON_ORDER if reason in reasons)
+    ordered = tuple(reason for reason in REASON_ORDER if reason in reasons)
     return GateResult(
         verdict=Verdict.REJECT if ordered else Verdict.PASS,
         reject_reasons=ordered,
