@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import psycopg
 import pytest
+import sqlglot
 from psycopg.rows import DictRow
+from sqlglot import exp
 
 from reply_gate.sql_guard import (
     ORDERS_TABLE,
     SCHEMA_WHITELIST,
     SqlGuardRejection,
+    _Analyzer,
     describe_allowed_functions,
     describe_whitelist,
     validate_sql,
@@ -442,6 +445,208 @@ def test_주문_1건으로_묶인_쿼리는_통과한다() -> None:
     _ok(f"SELECT order_no FROM orders WHERE status = '배송중' AND order_no = '{ORDER_NO}'")
     _ok(
         f"SELECT order_no FROM orders WHERE (status = '배송중' OR status = '배송완료') AND order_no = '{ORDER_NO}'"
+    )
+
+
+# ── 외부 조인은 주문 1건 한정을 무력화한다 ──────────────────────────────────
+
+#: 리뷰가 **실제로 통과시키고 실행까지 한** 문자열들. 전부 서로 다른 주문 50건
+#: (= `sql_max_rows`)의 이름·전화·이메일·배송지를 돌려줬다 — 외부 조인의 ON 절은 보존측
+#: 테이블을 거르지 않기 때문이다(같은 자리에 `INNER JOIN` 을 넣으면 1행만 나온다).
+OUTER_JOIN_BYPASSES = [
+    f"SELECT o.order_no, o.customer_name, o.customer_phone, o.customer_email, o.shipping_address FROM orders o LEFT JOIN (SELECT 1 AS x) d ON o.order_no = '{ORDER_NO}'",
+    f"SELECT o.* FROM orders o LEFT JOIN (SELECT 1 AS x) d ON o.order_no='{ORDER_NO}'",
+    f"SELECT o.order_no, o.customer_name, o.customer_phone FROM orders o LEFT JOIN orders o2 ON o.order_no = '{ORDER_NO}' AND o2.order_no = '{ORDER_NO}'",
+    f"SELECT o2.order_no, o2.customer_phone FROM orders o RIGHT JOIN orders o2 ON o.order_no = '{ORDER_NO}' AND o2.order_no = '{ORDER_NO}'",
+    f"SELECT o.order_no, o.customer_phone FROM (SELECT 1 AS x) d RIGHT JOIN orders o ON o.order_no='{ORDER_NO}'",
+    f"SELECT max(o.customer_phone) AS p, max(o.customer_email) AS e FROM orders o LEFT JOIN orders o2 ON o.order_no='{ORDER_NO}' AND o2.order_no='{ORDER_NO}'",
+    f"WITH t AS (SELECT o.order_no, o.customer_phone FROM orders o LEFT JOIN (SELECT 1 AS x) d ON o.order_no='{ORDER_NO}') SELECT * FROM t",
+    f"SELECT s.customer_phone FROM (SELECT o.customer_phone FROM orders o LEFT JOIN (SELECT 1 AS x) d ON o.order_no='{ORDER_NO}') s",
+]
+
+
+def _analyze(sql: str) -> _Analyzer:
+    """조인 종류 거부 층(`_check_joins`)을 **걷어낸 채** 스코프 해석까지만 돌린다.
+
+    주문 1건 한정 판정 자체가 ON 절을 어떻게 다루는지를 따로 보기 위한 것이다 — 두 겹 중
+    한 겹만 확인하면 다른 한 겹이 없어졌을 때 조용히 샌다.
+    """
+    statement = sqlglot.parse_one(sql, read="postgres")
+    assert isinstance(statement, exp.Select)
+    analyzer = _Analyzer(SCHEMA_WHITELIST)
+    analyzer.build(statement, None, {})
+    return analyzer
+
+
+@pytest.mark.parametrize(
+    "sql",
+    OUTER_JOIN_BYPASSES,
+    ids=[
+        "left-파생테이블",
+        "left-별표",
+        "left-자기조인",
+        "right-자기조인",
+        "right-보존측이_orders",
+        "left-집계",
+        "left-CTE",
+        "left-부질의",
+    ],
+)
+def test_외부_조인_우회는_전부_거부한다(sql: str) -> None:
+    rejection = _reject(sql)
+
+    assert rejection.rule == "unsupported_join"
+    # 사유는 재시도 프롬프트에 실려 모델이 고칠 수 있어야 한다.
+    assert "INNER JOIN" in rejection.detail
+
+
+@pytest.mark.parametrize(
+    "clause",
+    [
+        "LEFT JOIN",
+        "LEFT OUTER JOIN",
+        "RIGHT JOIN",
+        "RIGHT OUTER JOIN",
+        "FULL JOIN",
+        "FULL OUTER JOIN",
+        "NATURAL LEFT JOIN",
+    ],
+)
+def test_모든_외부_조인_표기를_거부한다(clause: str) -> None:
+    sql = (
+        f"SELECT a.order_no FROM orders a {clause} orders b ON b.order_no = a.order_no"
+        f" WHERE a.order_no = '{ORDER_NO}' AND b.order_no = '{ORDER_NO}'"
+    )
+
+    assert _reject(sql).rule == "unsupported_join"
+
+
+def test_외부_조인의_ON_절은_바인딩으로_인정하지_않는다() -> None:
+    """두 번째 겹 — 조인 종류 거부를 걷어내도 ON 절만으로는 묶였다고 보지 않는다."""
+    analyzer = _analyze(
+        f"SELECT o.order_no FROM orders o LEFT JOIN orders o2"
+        f" ON o.order_no = '{ORDER_NO}' AND o2.order_no = '{ORDER_NO}'"
+    )
+
+    with pytest.raises(SqlGuardRejection) as excinfo:
+        analyzer.check_order_scope(ORDER_NO)
+
+    assert excinfo.value.rule == "order_scope"
+
+
+def test_INNER_조인의_ON_절은_바인딩으로_인정한다() -> None:
+    """양성 대조 — ON 절을 통째로 불신하면 정상 자기 조인이 막힌다."""
+    analyzer = _analyze(
+        f"SELECT o.order_no FROM orders o INNER JOIN orders o2"
+        f" ON o.order_no = '{ORDER_NO}' AND o2.order_no = '{ORDER_NO}'"
+    )
+
+    analyzer.check_order_scope(ORDER_NO)
+
+
+def test_외부_조인_없는_조인은_계속_통과한다() -> None:
+    """막는 것은 조인이 아니라 **외부** 조인이다 — 과차단 방지 양성 대조."""
+    _ok(
+        f"SELECT o.order_no FROM orders o INNER JOIN (SELECT 1 AS x) d ON o.order_no = '{ORDER_NO}'"
+    )
+    _ok(
+        f"SELECT a.order_no, b.status FROM orders a, orders b"
+        f" WHERE a.order_no = '{ORDER_NO}' AND b.order_no = '{ORDER_NO}'"
+    )
+    _ok(
+        f"SELECT a.order_no, b.status FROM orders a CROSS JOIN orders b"
+        f" WHERE a.order_no = '{ORDER_NO}' AND b.order_no = '{ORDER_NO}'"
+    )
+
+
+@pytest.mark.db
+def test_외부_조인_우회가_실제로_주문_50건을_돌려주는_것을_확인하고_거부한다(
+    ro_conn: psycopg.Connection[DictRow],
+) -> None:
+    """막았다는 주장이 아니라 **무엇을 막았는지**를 남긴다 — 실행 결과로 유출 규모를 확인한다.
+
+    가드를 거치지 않고 read-only 커넥션에 직접 넣으면 선검사를 통과한 주문이 아닌 행들이
+    상한(`LIMIT`)까지 그대로 나온다. 같은 자리에 `INNER JOIN` 을 넣은 대조군은 1행이다.
+    """
+    row = ro_conn.execute("SELECT order_no FROM orders ORDER BY order_no LIMIT 1").fetchone()
+    assert row is not None
+    order_no = row["order_no"]
+    bypass = (
+        "SELECT o.order_no, o.customer_name, o.customer_phone, o.customer_email,"
+        " o.shipping_address FROM orders o LEFT JOIN (SELECT 1 AS x) d"
+        f" ON o.order_no = '{order_no}' LIMIT {MAX_ROWS}"
+    )
+    control = bypass.replace("LEFT JOIN", "INNER JOIN")
+
+    leaked = {r["order_no"] for r in ro_conn.execute(bypass).fetchall()}
+    scoped = {r["order_no"] for r in ro_conn.execute(control).fetchall()}
+
+    # 우회 문자열은 상한만큼의 **서로 다른 주문**을 돌려준다 (대부분 선검사 주문이 아니다).
+    assert len(leaked) == MAX_ROWS
+    assert leaked - {order_no}
+    assert scoped == {order_no}
+
+    # 그리고 가드는 그 문자열을 실행 전에 거부한다.
+    with pytest.raises(SqlGuardRejection) as excinfo:
+        validate_sql(bypass, order_no=order_no, max_rows=MAX_ROWS)
+    assert excinfo.value.rule == "unsupported_join"
+
+    # 대조군(INNER JOIN)은 통과한다 — 전부 거부하는 검증기는 검증기가 아니다.
+    validate_sql(control, order_no=order_no, max_rows=MAX_ROWS)
+
+
+# ── 소스 별칭이 겹치면 조회 범위 검사가 스킵된다 ────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT o.x FROM orders o JOIN (SELECT 1 AS x) o ON TRUE",
+        "SELECT o.x FROM orders o, (SELECT 1 AS x) o",
+        f"SELECT o.order_no FROM orders o INNER JOIN orders o ON TRUE WHERE o.order_no = '{ORDER_NO}'",
+    ],
+    ids=["파생테이블이_기저를_덮어쓴다", "쉼표조인", "같은_별칭_자기조인"],
+)
+def test_소스_별칭이_겹치면_거부한다(sql: str) -> None:
+    """덮어쓰면 기저 테이블 소스가 사라져 `check_order_scope` 가 통째로 스킵된다."""
+    assert _reject(sql).rule == "duplicate_source"
+
+
+def test_별칭_충돌_원본_문자열도_거부한다() -> None:
+    """리뷰가 PASS 로 확인한 문자열 — 여기서는 외부 조인 층이 먼저 잡는다."""
+    assert _reject("SELECT o.x FROM orders o LEFT JOIN (SELECT 1 AS x) o ON TRUE").rule == (
+        "unsupported_join"
+    )
+
+
+def test_기저_테이블을_못_찾으면_통과가_아니라_거부한다() -> None:
+    """fail-closed — 검사할 기저 테이블이 하나도 없는 것은 "한정할 게 없다"가 아니다."""
+    analyzer = _analyze(f"SELECT order_no FROM orders {SCOPE}")
+    for scope in analyzer.scopes:
+        # 별칭 충돌로 기저 테이블 소스가 덮어써졌던 상황을 그대로 만든다.
+        scope.sources.clear()
+
+    with pytest.raises(SqlGuardRejection) as excinfo:
+        analyzer.check_order_scope(ORDER_NO)
+
+    assert excinfo.value.rule == "order_scope"
+
+
+def test_정상_주문_조회는_계속_통과한다() -> None:
+    """과차단 방지 양성 대조 — CS 주문 조회의 현실 형태들이다."""
+    _ok(f"SELECT order_no, status, courier, tracking_no FROM orders WHERE order_no = '{ORDER_NO}'")
+    _ok(f"SELECT o.* FROM orders o WHERE o.order_no = '{ORDER_NO}'")
+    _ok(
+        "SELECT to_char(ordered_at, 'YYYY-MM-DD') AS 주문일, product_name AS 상품"
+        f" FROM orders WHERE order_no = '{ORDER_NO}'"
+    )
+    _ok(
+        f"SELECT order_no AS 주문번호, status FROM orders WHERE order_no='{ORDER_NO}'"
+        " ORDER BY 주문번호"
+    )
+    _ok(
+        "SELECT a.order_no, b.status FROM orders a INNER JOIN orders b ON b.order_no = a.order_no"
+        f" WHERE a.order_no = '{ORDER_NO}' AND b.order_no = '{ORDER_NO}'"
     )
 
 

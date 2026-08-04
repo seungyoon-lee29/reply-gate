@@ -21,7 +21,8 @@ data-modifying CTE(`WITH x AS (INSERT ...) SELECT ...`)를 놓친다 — 둘 다
 4. **주문 1건 한정** — 생성된 쿼리가 **선검사를 통과한 주문번호 1건**으로 한정됨을 AST 로
    확인한다 (spec "파이프라인 3단계" — 선검사를 통과한 주문에 대해 조회). 어떤 행이 나올지를
    LLM 이 정하게 두면 무관한 고객의 연락처가 근거로 채택되고, L1 의 PII allowlist 가 그것을
-   정상 에코로 허용한다.
+   정상 에코로 허용한다. 조인 종류도 여기서 읽는다 — **외부 조인의 ON 절은 보존측 테이블을
+   거르지 않으므로** 한정 조건으로 인정할 수 없다(아래 `_check_joins`·`_is_inner_join`).
 5. **결과 행 수 상한** — 거부가 아니라 LIMIT 을 강제한다.
 
 거부 규칙은 `SqlGuardRule` 이 전부이고, 거부 사유는 SQL 재생성 프롬프트에 그대로 실린다
@@ -164,6 +165,14 @@ _SOURCE_ARGS: Final = frozenset({"from", "from_", "joins", "with", "with_"})
 #: 맨 이름은 언제나 입력 컬럼으로 해석되므로 별칭으로 받아주면 화이트리스트가 뚫린다.
 _ALIAS_VISIBLE_ARGS: Final = frozenset({"group", "order"})
 
+#: ON 절이 **양쪽 소스를 모두 거르는** 조인 종류 (sqlglot 의 `Join.args["kind"]` 표기).
+#: 빈 값은 `JOIN`(=INNER)과 쉼표 조인(`FROM a, b`)이다.
+#:
+#: 여기 없는 조인 — 외부 조인(LEFT/RIGHT/FULL, OUTER 포함) — 은 ON 절이 **보존측 테이블을
+#: 필터하지 않는다.** 매칭이 없으면 보존측 행은 NULL 로 채워져 그대로 남기 때문에
+#: `orders o LEFT JOIN (SELECT 1) d ON o.order_no = '...'` 는 orders **전체**를 돌려준다.
+_INNER_JOIN_KINDS: Final = frozenset({"", "INNER", "CROSS"})
+
 
 class SqlGuardRule(StrEnum):
     """거부 규칙 코드. 처리 기록의 실패 내역과 재생성 피드백이 이 값을 쓴다."""
@@ -177,6 +186,8 @@ class SqlGuardRule(StrEnum):
     LOCKING_CLAUSE = "locking_clause"
     UNKNOWN_TABLE = "unknown_table"
     UNSUPPORTED_SOURCE = "unsupported_source"
+    UNSUPPORTED_JOIN = "unsupported_join"
+    DUPLICATE_SOURCE = "duplicate_source"
     NO_WHITELISTED_TABLE = "no_whitelisted_table"
     UNKNOWN_COLUMN = "unknown_column"
     FORBIDDEN_FUNCTION = "forbidden_function"
@@ -298,6 +309,51 @@ def _require_read_only_select(statement: exp.Expr) -> exp.Select:
             "읽기 전용 단일 SELECT 가 아니므로 허용되지 않는다. 잠금 절을 빼고 조회만 한다.",
         )
     return statement
+
+
+# ── 조인 종류 (4번 "주문 1건 한정"의 전제) ──────────────────────────────────
+
+
+def _join_side_kind(join: exp.Join) -> tuple[str, str]:
+    """(`LEFT`/`RIGHT`/`FULL` 등 방향, `INNER`/`OUTER`/`CROSS` 등 종류). 없으면 빈 문자열."""
+    side = join.args.get("side")
+    kind = join.args.get("kind")
+    return str(side or "").upper(), str(kind or "").upper()
+
+
+def _is_inner_join(join: exp.Join) -> bool:
+    """이 조인의 ON 절이 **양쪽 소스를 모두 거르는가**.
+
+    주문 1건 한정 판정이 ON 절을 믿어도 되는지가 여기서 갈린다. 외부 조인의 ON 은 보존측을
+    거르지 않으므로 `False` 다. 모르는 종류(SEMI·ANTI 등)도 `False` — 안전을 증명하지 못한
+    조인은 신뢰하지 않는다.
+    """
+    side, kind = _join_side_kind(join)
+    return not side and kind in _INNER_JOIN_KINDS
+
+
+def _join_label(join: exp.Join) -> str:
+    side, kind = _join_side_kind(join)
+    return " ".join(part for part in (side, kind, "JOIN") if part)
+
+
+def _check_joins(statement: exp.Select) -> None:
+    """외부 조인을 통째로 거부한다.
+
+    `orders o LEFT JOIN (SELECT 1) d ON o.order_no = '...'` 는 ON 절이 보존측(orders)을 거르지
+    않아 **서로 다른 주문 전부**를 돌려준다 — 주문 1건 한정(4번)을 정면으로 무력화한다.
+    한정 조건을 WHERE 로 옮기면 그만이므로 CS 주문 조회에 외부 조인이 필요한 경우는 없다.
+    """
+    for join in statement.find_all(exp.Join):
+        if _is_inner_join(join):
+            continue
+        raise _reject(
+            SqlGuardRule.UNSUPPORTED_JOIN,
+            f"허용되지 않은 조인 종류다: {_join_label(join)}. 외부 조인(LEFT/RIGHT/FULL)의 ON "
+            "절은 보존측 테이블을 거르지 않아 조회 범위가 주문 1건으로 묶이지 않는다 — "
+            "주문 1건 조회에는 외부 조인이 필요하지 않다. INNER JOIN 또는 단일 테이블 조회로 "
+            f"다시 쓰고, 주문 한정 조건은 WHERE 절에 `{ORDER_SCOPE_COLUMN} = '...'` 로 넣는다.",
+        )
 
 
 # ── 2. 스코프 해석 (테이블·컬럼 화이트리스트) ───────────────────────────────
@@ -429,6 +485,14 @@ class _Analyzer:
         sources: dict[str, _Source] = {}
         for node in _direct_sources(select):
             source = self._source(node, env)
+            if source.name in sources:
+                # 덮어쓰면 기저 테이블 `_Source` 가 스코프에서 사라지고, 그 스코프의 조회 범위
+                # 검사(`check_order_scope`)가 검사할 대상을 잃어 통째로 스킵된다.
+                raise _reject(
+                    SqlGuardRule.DUPLICATE_SOURCE,
+                    f"같은 FROM/JOIN 절에서 소스 이름이 겹친다: `{source.name}`. "
+                    "테이블·부질의마다 서로 다른 별칭을 준다 (`orders o`, `orders o2`).",
+                )
             sources[source.name] = source
 
         scope = _Scope(select=select, parent=parent, sources=sources)
@@ -657,11 +721,19 @@ class _Analyzer:
         )
 
     def check_order_scope(self, order_no: str) -> None:
-        """화이트리스트 테이블을 읽는 **모든 스코프**가 주문 1건으로 묶였는지 확인한다."""
+        """화이트리스트 테이블을 읽는 **모든 스코프**가 주문 1건으로 묶였는지 확인한다.
+
+        기저 테이블을 읽는 스코프를 하나도 찾지 못하면 **통과가 아니라 거부**다. 그 상황은
+        "한정할 것이 없다"가 아니라 "해석이 기저 테이블을 놓쳤다"는 뜻이고
+        (`referenced_tables()` 가 이미 기저 테이블이 있음을 확인한 뒤에 불린다),
+        검사하지 못한 쿼리를 통과시키면 게이트가 조용히 열린다.
+        """
+        checked = 0
         for scope in self.scopes:
             bases = [source for source in scope.sources.values() if source.base_table is not None]
             if not bases:
                 continue
+            checked += 1
             bound = _bound_source_names(scope, order_no)
             for source in bases:
                 if source.name in bound:
@@ -675,6 +747,13 @@ class _Analyzer:
                     f"WHERE 절에 `{ORDER_SCOPE_COLUMN} = '{order_no}'` 동등 비교를 AND 로 넣는다 "
                     "— 조건을 빼거나, OR 로 묶거나, 다른 주문번호를 쓰면 거부된다.",
                 )
+        if not checked:
+            raise _reject(
+                SqlGuardRule.ORDER_SCOPE,
+                f"조회 범위를 확인할 기저 테이블({self._whitelist_names})을 스코프에서 찾지 "
+                f"못했다. `FROM {ORDERS_TABLE}` 로 직접 읽고 WHERE 절에 "
+                f"`{ORDER_SCOPE_COLUMN} = '{order_no}'` 를 넣는다.",
+            )
 
 
 def _lookup_source(scope: _Scope | None, qualifier: str) -> _Source | None:
@@ -769,7 +848,12 @@ def _order_scope_qualifier(condition: exp.Expr, order_no: str) -> str | None:
 
 
 def _bound_source_names(scope: _Scope, order_no: str) -> set[str]:
-    """이 스코프에서 주문 1건으로 묶인 소스 이름들 (한정자 없으면 빈 문자열)."""
+    """이 스코프에서 주문 1건으로 묶인 소스 이름들 (한정자 없으면 빈 문자열).
+
+    바인딩으로 인정하는 자리는 **WHERE 절과 INNER/CROSS 조인의 ON 절뿐이다.** 외부 조인의 ON
+    절은 보존측 테이블을 거르지 않으므로 한정 조건이 아니다 — `_check_joins` 가 외부 조인을
+    이미 거부하지만, 나중에 외부 조인을 허용하게 되더라도 이 규칙이 없으면 조용히 샌다.
+    """
     bound: set[str] = set()
     conditions: list[exp.Expr] = []
 
@@ -777,7 +861,7 @@ def _bound_source_names(scope: _Scope, order_no: str) -> set[str]:
     if isinstance(where, exp.Where) and where.this is not None:
         conditions.append(where.this)
     for join in scope.select.args.get("joins") or []:
-        if isinstance(join, exp.Join):
+        if isinstance(join, exp.Join) and _is_inner_join(join):
             on = join.args.get("on")
             if isinstance(on, exp.Expr):
                 conditions.append(on)
@@ -865,6 +949,7 @@ def validate_sql(
         raise _reject(SqlGuardRule.EMPTY, "SQL 이 비어 있다.")
 
     statement = _require_read_only_select(_parse_single_statement(text))
+    _check_joins(statement)
 
     analyzer = _Analyzer(whitelist)
     analyzer.build(statement, None, {})

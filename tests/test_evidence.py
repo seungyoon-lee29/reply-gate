@@ -615,6 +615,51 @@ def test_주문_범위를_벗어난_SQL_은_거부되고_피드백으로_1회_�
 
 
 @pytest.mark.db
+def test_외부_조인_우회는_거부되고_피드백으로_1회_재시도해_성공한다(
+    app_conn: psycopg.Connection[DictRow],
+    ro_conn: psycopg.Connection[DictRow],
+    sample_order: dict[str, Any],
+) -> None:
+    """외부 조인의 ON 절은 보존측을 거르지 않아 무관한 주문 50건이 근거가 된다.
+
+    거부 사유 코드는 **가드 내부 코드**로 남고, 새 인계 사유를 만들지 않는다
+    (재시도 상한 1회 그대로).
+    """
+    order_no = sample_order["order_no"]
+    bypass = (
+        "SELECT o.order_no, o.customer_name, o.customer_phone FROM orders o"
+        f" LEFT JOIN (SELECT 1 AS x) d ON o.order_no = '{order_no}'"
+    )
+    good = f"SELECT order_no, status FROM orders WHERE order_no = '{order_no}'"
+    client = _client(
+        {INTENT_STAGE: [_intent("order")], SQL_GENERATION_STAGE: [_sql(bypass), _sql(good)]}
+    )
+
+    result = _collector(client).collect(
+        inquiry_id=INQUIRY_ID,
+        content=INQUIRY,
+        order_no=order_no,
+        app_conn=app_conn,
+        readonly_conn=ro_conn,
+    )
+
+    assert result.escalation_reason is None
+    assert len(result.sql_failures) == 1
+    failure = result.sql_failures[0]
+    assert failure.kind is SqlFailureKind.GUARD_REJECTED
+    assert failure.query_sql == bypass
+    assert "unsupported_join" in failure.error
+
+    retry_prompt = client.calls_for(SQL_GENERATION_STAGE)[1]["user"]
+    assert "unsupported_join" in retry_prompt
+    assert "INNER JOIN" in retry_prompt
+
+    # 채택된 근거는 선검사를 통과한 주문 1건뿐이다.
+    assert len(result.sql_snapshots) == 1
+    assert {row["order_no"] for row in result.sql_snapshots[0].result_rows} == {order_no}
+
+
+@pytest.mark.db
 def test_다른_주문번호를_계속_가리키면_sql_failed_로_인계한다(
     app_conn: psycopg.Connection[DictRow],
     ro_conn: psycopg.Connection[DictRow],
