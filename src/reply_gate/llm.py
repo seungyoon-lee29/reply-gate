@@ -63,12 +63,27 @@ class LLMCallError(RuntimeError):
 
 
 class LLMFormatError(ValueError):
-    """구조화 출력이 기대 형식과 다름. 재시도 정책은 호출자가 정한다."""
+    """구조화 출력이 기대 형식과 다름. 재시도 정책은 호출자가 정한다.
 
-    def __init__(self, *, stage: str, detail: str) -> None:
+    원문(`raw_text`)과 토큰 사용량을 함께 실어 보낸다 — 초안 생성은 재시도하지 않고
+    이 산출을 그대로 L1 에 넘겨 `schema_violation` 으로 판정시키기 때문이다(spec).
+    """
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        detail: str,
+        raw_text: str = "",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+    ) -> None:
         super().__init__(f"구조화 출력 형식 불일치 (stage={stage}): {detail}")
         self.stage = stage
         self.detail = detail
+        self.raw_text = raw_text
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
 
 
 @dataclass(frozen=True)
@@ -202,17 +217,31 @@ class AnthropicClient:
             raise LLMCallError(stage=stage, reason="refusal", attempts=1)
 
         text = "".join(block.text for block in message.content if block.type == "text")
+        input_tokens = message.usage.input_tokens
+        output_tokens = message.usage.output_tokens
         if not text.strip():
-            raise LLMFormatError(stage=stage, detail="빈 응답")
+            raise LLMFormatError(
+                stage=stage,
+                detail="빈 응답",
+                raw_text=text,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise LLMFormatError(stage=stage, detail=f"JSON 파싱 실패: {exc}") from exc
+            raise LLMFormatError(
+                stage=stage,
+                detail=f"JSON 파싱 실패: {exc}",
+                raw_text=text,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            ) from exc
 
         return JsonCompletion(
             data=data,
-            input_tokens=message.usage.input_tokens,
-            output_tokens=message.usage.output_tokens,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )
 
 

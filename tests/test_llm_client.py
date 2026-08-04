@@ -152,6 +152,9 @@ def test_형식오류는_재시도하지_않고_호출자에게_위임한다() -
 
     assert excinfo.value.stage == "intent"
     assert len(messages.calls) == 1
+    # 초안 생성은 이 원문을 그대로 L1 에 넘겨 schema_violation 으로 판정시킨다.
+    assert excinfo.value.raw_text == "이건 JSON 이 아니다"
+    assert (excinfo.value.input_tokens, excinfo.value.output_tokens) == (11, 7)
 
 
 # ── 임베딩 ──────────────────────────────────────────────────────────────────
