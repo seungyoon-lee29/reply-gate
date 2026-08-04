@@ -1,0 +1,71 @@
+[project]
+name = "reply-gate"
+version = "0.1.0"
+description = "근거 없는 답변을 스스로 기각하는 이커머스 CS 답변 에이전트"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "jinja2>=3.1",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "psycopg[binary]>=3.2",
+    "pgvector>=0.3",
+    "anthropic>=0.40",
+    "openai>=1.55",
+    "sqlglot>=25.30",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "httpx>=0.28",
+    "ruff>=0.8",
+    "mypy>=1.13",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reply_gate"]
+
+# ── 린트/포맷 ────────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+# ── 타입체크 ────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests", "scripts"]
+# 증분 캐시는 기본 on — 반복 검증(웨이브 게이트·완료 게이트)에서 재사용된다.
+incremental = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+disallow_untyped_calls = false
+
+[[tool.mypy.overrides]]
+module = ["pgvector.*"]
+ignore_missing_imports = true
+
+# ── 테스트 ──────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "db: Postgres가 필요한 통합 테스트 (docker compose로 DB 기동 필요)",
+    "live: 실제 외부 API 키가 필요한 테스트 (기본 실행에서 제외)",
+]

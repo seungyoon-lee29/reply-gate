@@ -13,6 +13,13 @@ venv/
 .env.*
 !.env.example
 
+# dryforge 작업 공간 (3-doc 본문은 버전관리 대상)
+.dryforge/worktrees/
+.dryforge/backup/
+
+# 산출물
+reports/
+
 # 에디터·OS
 .DS_Store
 .idea/
