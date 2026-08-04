@@ -8,7 +8,7 @@
 (근거 재수집 없음). 재생성 1회 상한을 강제하는 것은 상위 루프(코드)다.
 
 실패 정책은 spec "LLM 호출 공통 실패 정책"을 그대로 따른다.
-- 전송 오류: `llm.AnthropicClient` 가 이미 1회 재시도했다 — `LLMCallError` 는 그대로 위로
+- 전송 오류: `llm.OpenAIGenerationClient` 가 이미 1회 재시도했다 — `LLMCallError` 는 그대로 위로
   던져 호출자가 `llm_call_failed` 인계로 매핑하게 한다.
 - 구조화 출력 형식 불일치: **재시도하지 않는다.** 모델 응답 원문을 원시 산출로 담아 돌려주고
   L1 이 `schema_violation` 으로 판정한다.
@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from reply_gate.contracts import DRAFT_JSON_SCHEMA, Evidence, RejectReason
-from reply_gate.llm import AnthropicClient, Effort, LLMFormatError
+from reply_gate.llm import GenerationClient, LLMFormatError
 
 __all__ = [
     "DRAFT_STAGE",
@@ -137,7 +137,7 @@ class DraftGeneration:
 class DraftGenerator:
     """근거 목록만 컨텍스트로 답변 계약 JSON 을 생성한다. 근거는 스스로 수집하지 않는다."""
 
-    def __init__(self, *, client: AnthropicClient, effort: Effort = "medium") -> None:
+    def __init__(self, *, client: GenerationClient, effort: str | None = None) -> None:
         self._client = client
         self._effort = effort
 

@@ -17,7 +17,7 @@ from reply_gate.draft import (
     DraftGenerator,
     build_draft_user_prompt,
 )
-from reply_gate.llm import AnthropicClient, JsonCompletion, LLMCallError, LLMFormatError
+from reply_gate.llm import GenerationClient, JsonCompletion, LLMCallError, LLMFormatError
 
 INQUIRY = "지난주에 주문한 운동화가 아직 안 왔어요. 언제쯤 받을 수 있나요?"
 
@@ -47,7 +47,7 @@ VALID_DRAFT: dict[str, Any] = {
 
 
 class _RecordingClient:
-    """`AnthropicClient.complete_json` 대역 — 호출 인자를 기록하고 정해진 결과를 돌려준다."""
+    """`GenerationClient.complete_json` 대역 — 호출 인자를 기록하고 정해진 결과를 돌려준다."""
 
     def __init__(self, outcomes: list[Any]) -> None:
         self._outcomes = outcomes
@@ -63,7 +63,7 @@ class _RecordingClient:
 
 def _generator(outcomes: list[Any]) -> tuple[DraftGenerator, _RecordingClient]:
     recorder = _RecordingClient(outcomes)
-    generator = DraftGenerator(client=cast(AnthropicClient, recorder))
+    generator = DraftGenerator(client=cast(GenerationClient, recorder))
     return generator, recorder
 
 
@@ -181,12 +181,14 @@ def test_effort_는_medium_기본이고_호출자가_바꿀_수_있다() -> None
         [JsonCompletion(data=VALID_DRAFT, input_tokens=0, output_tokens=0)]
     )
     generator.generate(inquiry=INQUIRY, evidence=EVIDENCE)
-    assert recorder.calls[0]["effort"] == "medium"
+    # reasoning effort 는 기본적으로 보내지 않는다 — 모델 등급이 조정 가능이라
+    # 지원하지 않는 계열에 보내면 요청 자체가 거부된다.
+    assert recorder.calls[0]["effort"] is None
 
     high_recorder = _RecordingClient(
         [JsonCompletion(data=VALID_DRAFT, input_tokens=0, output_tokens=0)]
     )
-    high = DraftGenerator(client=cast(AnthropicClient, high_recorder), effort="high")
+    high = DraftGenerator(client=cast(GenerationClient, high_recorder), effort="high")
     high.generate(inquiry=INQUIRY, evidence=EVIDENCE)
     assert high_recorder.calls[0]["effort"] == "high"
 
