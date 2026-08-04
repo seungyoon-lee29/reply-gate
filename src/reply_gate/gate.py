@@ -237,13 +237,26 @@ def _collect_texts(value: object, *, depth: int = 0) -> list[str]:
 
     claim 의 text 만 보지 않는 이유: 형식이 깨진 초안(원문 문자열, 엉뚱한 키)에서도
     PII 는 새어 나갈 수 있고, L1 은 그때도 검사해야 한다.
+
+    **`citation_ids` 는 제외한다.** spec 의 검사 대상은 "초안 텍스트" — 최종 사용자에게
+    보여줄 답변이다. 근거 ID 는 답변 문장이 아니라 식별자이고, `sql:<문의 UUID>:<순번>`
+    형식이라 UUID 의 16진 숫자 구간이 전화번호 패턴에 우연히 걸린다. 근거 ID 는
+    `evidence_text` 에 들어가지 않으므로 allowlist 에도 오르지 않아, 그대로 두면
+    **PII 가 전혀 없는 정상 초안이 기각된다** (무작위 UUID 20,000개 중 168개 = 0.84%).
+    이 프로젝트의 헤드라인 지표가 "정상 초안 오탐률"이므로 그 오탐이 곧 지표 오염이다.
+    참조 무결성은 `invalid_citation` 이 이미 전담하므로 여기서 볼 이유도 없다.
     """
     if depth > _MAX_TEXT_DEPTH:
         return []
     if isinstance(value, str):
         return [value]
     if isinstance(value, Mapping):
-        return [text for item in value.values() for text in _collect_texts(item, depth=depth + 1)]
+        return [
+            text
+            for key, item in value.items()
+            if key != _CITATION_IDS_KEY
+            for text in _collect_texts(item, depth=depth + 1)
+        ]
     if isinstance(value, list | tuple):
         return [text for item in value for text in _collect_texts(item, depth=depth + 1)]
     return []

@@ -548,3 +548,66 @@ def test_근거에_있는_대표번호_에코는_통과한다() -> None:
     result = evaluate_draft(raw_draft=draft, evidences=[evidence])
 
     assert result.verdict is Verdict.PASS
+
+
+# ── 근거 ID 는 PII 검사 대상이 아니다 (오탐률 = 헤드라인 지표) ────────────────
+
+
+def test_근거_ID_의_숫자는_PII_로_오인하지_않는다() -> None:
+    """SQL 근거 ID 는 `sql:<문의 UUID>:<순번>` 이라 UUID 16진 숫자가 전화번호 패턴에 걸린다.
+
+    근거 ID 는 답변 문장이 아니라 식별자이고 evidence_text 에도 없어 allowlist 에 오르지
+    않으므로, 검사 대상에 두면 PII 가 전혀 없는 정상 초안이 기각된다.
+    """
+    cid = "sql:172219ff-f0ef-4a3d-9e8d-085527370ac7:1"
+    evidence = Evidence(
+        id=cid,
+        source=EvidenceSource.SQL,
+        content="주문 조회 결과",
+        evidence_text="order_no=ORD-20260202-0001 status=배송중",
+    )
+    draft = {"claims": [{"text": "주문은 배송중입니다.", "citation_ids": [cid]}]}
+
+    result = evaluate_draft(raw_draft=draft, evidences=[evidence])
+
+    assert result.verdict is Verdict.PASS
+
+
+def test_무작위_문의ID_로_만든_근거ID_는_한_건도_오탐되지_않는다() -> None:
+    """0.84% 오탐은 지표를 오염시킨다 — 회귀하면 이 테스트가 잡는다."""
+    import uuid
+
+    for index in range(2000):
+        inquiry_id = str(uuid.UUID(int=index * 2654435761 % (1 << 128)))
+        cid = f"sql:{inquiry_id}:1"
+        evidence = Evidence(
+            id=cid, source=EvidenceSource.SQL, content="c", evidence_text="주문 상태: 배송중"
+        )
+        draft = {"claims": [{"text": "주문은 배송중입니다.", "citation_ids": [cid]}]}
+        result = evaluate_draft(raw_draft=draft, evidences=[evidence])
+        assert result.verdict is Verdict.PASS, f"{cid} 가 오탐됐다: {result.reject_reasons}"
+
+
+def test_답변_문장의_PII_는_여전히_잡는다() -> None:
+    """근거 ID 를 제외한 것이 검사를 느슨하게 만들지 않았다는 양성 대조."""
+    cid = "sql:172219ff-f0ef-4a3d-9e8d-085527370ac7:1"
+    evidence = Evidence(
+        id=cid, source=EvidenceSource.SQL, content="c", evidence_text="주문 상태: 배송중"
+    )
+    draft = {"claims": [{"text": "고객센터 010-9999-8888 로 연락주세요.", "citation_ids": [cid]}]}
+
+    result = evaluate_draft(raw_draft=draft, evidences=[evidence])
+
+    assert RejectReason.PII_DETECTED in result.reject_reasons
+
+
+def test_형식이_깨진_초안의_PII_는_계속_검사한다() -> None:
+    """원문 문자열로 넘어온 산출에서도 PII 는 새어 나갈 수 있다."""
+    evidence = Evidence(
+        id="policy:support:4-1", source=EvidenceSource.POLICY, content="c", evidence_text="운영시간"
+    )
+
+    result = evaluate_draft(raw_draft="고객센터는 1588-1234 입니다", evidences=[evidence])
+
+    assert RejectReason.SCHEMA_VIOLATION in result.reject_reasons
+    assert RejectReason.PII_DETECTED in result.reject_reasons
