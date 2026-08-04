@@ -24,8 +24,8 @@
    "데모니까 나중에"가 허용되지 않는다 — 채용 면접 역공 방지가 존재 이유.
 3. **루프 종료·데이터 접근·권한은 항상 코드가 통제.** LLM은 의도 해석·초안 생성·SQL 문자열
    생성까지만. 재생성 상한 1회는 코드가 강제.
-4. **비밀은 어디에도 평문 금지.** API 키 2개(Anthropic·OpenAI)와 DB 접속 정보는 환경 변수로만.
-   `.env`는 gitignore.
+4. **비밀은 어디에도 평문 금지.** API 키(이번 사이클 OpenAI 1개)와 DB 접속 정보는 환경
+   변수로만. `.env`는 gitignore.
 5. **완료 게이트**: spec의 "완료 검증 게이트" 5항목(pytest·ruff·mypy·평가 하네스·실동작 3종
    시연)이 전부 통과해야 완료 선언.
 6. **답변 계약 JSON 스키마와 근거 ID 체계는 다음 사이클 L2가 이어받는 계약**이다. 편의로
@@ -105,7 +105,9 @@ L1 픽스처 셋(측정용 고정 초안+근거 쌍) / 상담원 인계(사유 �
 ### 3. 기술 결정 (사용자 확정분만)
 
 - **스택**: Python / FastAPI. uv(패키지) + pytest(테스트) + ruff(린트/포맷) + mypy(타입).
-- **LLM**: 생성 계열은 Claude API `claude-opus-5`, 임베딩은 OpenAI `text-embedding-3-small`.
+- **LLM**: 생성 계열은 OpenAI(`gpt-5.6-terra` 기본, 합성 데이터 1회 생성만 상위 모델 + Batch),
+  임베딩은 OpenAI `text-embedding-3-small`. **L2 judge는 OpenAI가 아닌 다른 계열**(계열 미결) —
+  같은 계열이면 self-judging bias·blind spot 중첩으로 검출률 지표가 오염된다.
 - **저장**: 로컬 Docker Postgres + pgvector 단일 DB (주문 + 벡터 + 처리 기록).
   앱 계정과 SQL 실행용 read-only 계정 분리.
 - **에이전트 루프**: 자체 구현 (LangGraph 미사용, README 비교 문서로 키워드 확보).
@@ -117,6 +119,7 @@ L1 픽스처 셋(측정용 고정 초안+근거 쌍) / 상담원 인계(사유 �
 ### 4. 향후 범위 (go는 구현하지 않음 — 호환성 판단용 컨텍스트)
 
 - **L2 게이트**: claim 단위 LLM judge. 현 claim/citation 계약과 근거 스냅샷을 입력으로 쓴다.
+  judge는 생성과 다른 계열(OpenAI 아님 — 계열 미결).
 - **RAG 심화**: 벡터 단독 → 하이브리드(BM25+벡터) → 리랭킹 비교(단계별 recall@k·precision),
   청킹 전략 실험(고정 크기 vs 조항 단위), reject 사유의 "생성 문제 vs 검색 실패" 분해 보고.
 - **대시보드**(스택 미정), **웹훅 송출**, **n8n 여부**, **배포**, **MCP**: 모두 미결 또는 차기.
