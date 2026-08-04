@@ -21,6 +21,7 @@ from reply_gate.contracts import (
     IntentSource,
     Verdict,
 )
+from reply_gate.db import readonly_connect
 from reply_gate.evidence import (
     INQUIRY_EMBEDDING_STAGE,
     INTENT_STAGE,
@@ -575,6 +576,107 @@ def test_재시도까지_실패하면_sql_failed_이고_근거_ID_는_부여되�
 
 
 @pytest.mark.db
+def test_주문_범위를_벗어난_SQL_은_거부되고_피드백으로_1회_재시도해_성공한다(
+    app_conn: psycopg.Connection[DictRow],
+    ro_conn: psycopg.Connection[DictRow],
+    sample_order: dict[str, Any],
+) -> None:
+    """WHERE 없는 쿼리는 무관한 고객 50명의 연락처를 근거로 만든다 — 실행 전에 막아야 한다."""
+    order_no = sample_order["order_no"]
+    unscoped = "SELECT order_no, customer_name, customer_phone, customer_email FROM orders LIMIT 3"
+    good = f"SELECT order_no, status FROM orders WHERE order_no = '{order_no}'"
+    client = _client(
+        {INTENT_STAGE: [_intent("order")], SQL_GENERATION_STAGE: [_sql(unscoped), _sql(good)]}
+    )
+
+    result = _collector(client).collect(
+        inquiry_id=INQUIRY_ID,
+        content=INQUIRY,
+        order_no=order_no,
+        app_conn=app_conn,
+        readonly_conn=ro_conn,
+    )
+
+    assert result.escalation_reason is None
+    # 거부는 기존 경로를 탄다 — guard_rejected → 재시도 1회.
+    assert len(result.sql_failures) == 1
+    failure = result.sql_failures[0]
+    assert failure.kind is SqlFailureKind.GUARD_REJECTED
+    assert failure.query_sql == unscoped
+    assert "order_scope" in failure.error
+
+    retry_prompt = client.calls_for(SQL_GENERATION_STAGE)[1]["user"]
+    assert "order_scope" in retry_prompt
+    assert order_no in retry_prompt
+
+    # 채택된 근거는 그 주문 1건뿐이다.
+    assert len(result.sql_snapshots) == 1
+    assert {row["order_no"] for row in result.sql_snapshots[0].result_rows} == {order_no}
+
+
+@pytest.mark.db
+def test_다른_주문번호를_계속_가리키면_sql_failed_로_인계한다(
+    app_conn: psycopg.Connection[DictRow],
+    ro_conn: psycopg.Connection[DictRow],
+    sample_order: dict[str, Any],
+) -> None:
+    """재시도 상한은 1회 그대로다 — 새 인계 사유를 만들지 않는다."""
+    order_no = sample_order["order_no"]
+    other = "SELECT order_no, customer_phone FROM orders WHERE order_no = 'ORD-20991231-9999'"
+    both = (
+        f"SELECT order_no, customer_phone FROM orders WHERE order_no = '{order_no}'"
+        " OR order_no = 'ORD-20991231-9999'"
+    )
+    client = _client(
+        {INTENT_STAGE: [_intent("order")], SQL_GENERATION_STAGE: [_sql(other), _sql(both)]}
+    )
+
+    result = _collector(client).collect(
+        inquiry_id=INQUIRY_ID,
+        content=INQUIRY,
+        order_no=order_no,
+        app_conn=app_conn,
+        readonly_conn=ro_conn,
+    )
+
+    assert result.escalation_reason is EscalationReason.SQL_FAILED
+    assert result.evidence == ()
+    assert result.sql_snapshots == ()
+    assert [failure.attempt_no for failure in result.sql_failures] == [1, 2]
+    assert all(failure.kind is SqlFailureKind.GUARD_REJECTED for failure in result.sql_failures)
+    assert all("order_scope" in failure.error for failure in result.sql_failures)
+    # 세 번째 생성 호출은 없다.
+    assert len(client.calls_for(SQL_GENERATION_STAGE)) == 2
+
+
+@pytest.mark.db
+def test_pg_sleep_은_실행되지_않고_안전장치가_먼저_거부한다(
+    app_conn: psycopg.Connection[DictRow],
+    ro_conn: psycopg.Connection[DictRow],
+    sample_order: dict[str, Any],
+) -> None:
+    """DB 를 건드리기 전에 거부되므로 이 테스트는 2초를 자지 않는다."""
+    order_no = sample_order["order_no"]
+    sleeping = f"SELECT order_no FROM orders WHERE order_no = '{order_no}' AND pg_sleep(2) IS NULL"
+    good = f"SELECT order_no, status FROM orders WHERE order_no = '{order_no}'"
+    client = _client(
+        {INTENT_STAGE: [_intent("order")], SQL_GENERATION_STAGE: [_sql(sleeping), _sql(good)]}
+    )
+
+    result = _collector(client).collect(
+        inquiry_id=INQUIRY_ID,
+        content=INQUIRY,
+        order_no=order_no,
+        app_conn=app_conn,
+        readonly_conn=ro_conn,
+    )
+
+    assert result.escalation_reason is None
+    assert result.sql_failures[0].kind is SqlFailureKind.GUARD_REJECTED
+    assert "forbidden_function" in result.sql_failures[0].error
+
+
+@pytest.mark.db
 def test_실행_오류도_SQL_실패_경로를_탄다(
     app_conn: psycopg.Connection[DictRow],
     ro_conn: psycopg.Connection[DictRow],
@@ -802,6 +904,35 @@ def test_모든_소스_근거_0건이면_no_evidence(
 
     assert result.evidence == ()
     assert result.escalation_reason is EscalationReason.NO_EVIDENCE
+
+
+# ── 실행 시간 상한 (read-only 커넥션의 statement_timeout) ───────────────────
+
+
+@pytest.mark.db
+def test_read_only_커넥션에_statement_timeout_이_걸려_있다(
+    ro_conn: psycopg.Connection[DictRow], db_settings: Settings
+) -> None:
+    """가드가 함수를 막아도 실행 시간까지 코드가 예측할 수는 없다 — DB 에 직접 물어본다.
+
+    `0` 은 무제한이다. 무제한이면 쿼리 하나가 워커를 몇 분씩 묶는다.
+    """
+    row = ro_conn.execute("SHOW statement_timeout").fetchone()
+
+    assert row is not None
+    assert row["statement_timeout"] not in ("0", "")
+    assert db_settings.sql_statement_timeout_ms > 0
+
+
+@pytest.mark.db
+def test_상한을_넘긴_쿼리는_실제로_끊긴다(db_settings: Settings) -> None:
+    """상한이 **동작하는지**까지 확인한다. 250ms 상한 + 2초 sleep 이라 매달리지 않는다."""
+    settings = db_settings.model_copy(update={"sql_statement_timeout_ms": 250})
+
+    with readonly_connect(settings=settings) as conn:
+        assert conn.execute("SHOW statement_timeout").fetchone() == {"statement_timeout": "250ms"}
+        with pytest.raises(psycopg.errors.QueryCanceled):
+            conn.execute("SELECT pg_sleep(2)")
 
 
 # ── 토큰 집계 ───────────────────────────────────────────────────────────────

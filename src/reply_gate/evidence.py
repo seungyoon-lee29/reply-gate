@@ -59,6 +59,7 @@ from reply_gate.sql_guard import (
     SCHEMA_WHITELIST,
     SqlGuardRejection,
     ValidatedQuery,
+    describe_allowed_functions,
     describe_whitelist,
     validate_sql,
 )
@@ -144,11 +145,16 @@ SQL_SYSTEM_PROMPT: Final = """\
 너는 SQL 문자열만 만들고, 검증과 실행은 코드가 한다 — 아래 규칙을 어기면 실행 전에 거부된다.
 
 1. **화이트리스트 밖은 참조하지 않는다.** 아래에 적힌 테이블과 컬럼만 쓴다.
+   컬럼 별칭(`AS`)은 화이트리스트를 넓히지 않는다 — 별칭 이름은 ORDER BY·GROUP BY 에서만
+   이름으로 쓸 수 있다.
 2. **SELECT 단일문만.** INSERT·UPDATE·DELETE·DDL, 세미콜론으로 이은 여러 문장,
-   주석(`--`, `/* */`)은 모두 거부된다.
-3. **주어진 주문번호 1건만 조회한다.** WHERE 절에 그 주문번호를 문자열 리터럴로 넣는다.
-4. 문의에 답하는 데 필요한 컬럼을 고른다. 판단이 서지 않으면 넉넉히 고른다.
-5. 결과 행 수 상한을 넘는 LIMIT 은 쓰지 않는다.
+   주석(`--`, `/* */`), 행 잠금 절(`FOR UPDATE`·`FOR SHARE`)은 모두 거부된다.
+3. **주어진 주문번호 1건만 조회한다.** 주문 테이블을 읽는 모든 SELECT 의 WHERE 절에
+   `order_no = '<주어진 주문번호>'` 동등 비교를 **AND 로** 넣는다. 조건을 빼거나, OR 로 묶거나,
+   다른 주문번호를 쓰면 거부된다.
+4. **함수는 허용 목록 안에서만** 호출한다 (아래 [허용 함수]).
+5. 문의에 답하는 데 필요한 컬럼을 고른다. 판단이 서지 않으면 넉넉히 고른다.
+6. 결과 행 수 상한을 넘는 LIMIT 은 쓰지 않는다.
 
 산출은 다음 형태의 JSON 이다:
 {"sql": "SELECT ... FROM orders WHERE order_no = '...'"}
@@ -190,6 +196,7 @@ def build_sql_user_prompt(
         f"[문의]\n{inquiry}",
         f"[조회할 주문번호]\n{order_no}",
         f"[조회 가능한 테이블·컬럼 (화이트리스트)]\n{describe_whitelist(whitelist)}",
+        f"[허용 함수]\n{describe_allowed_functions()}",
         f"[결과 행 수 상한]\n{max_rows}",
     ]
     if previous_error is not None:
@@ -697,7 +704,9 @@ class EvidenceCollector:
                 continue
 
             try:
-                query = validate_sql(generation.sql, max_rows=max_rows)
+                # 조회 범위를 **선검사를 통과한 주문 1건**으로 묶는 것도 검증 단계의 일이다
+                # (spec 파이프라인 3단계). 프롬프트 문구는 그 보증이 되지 못한다.
+                query = validate_sql(generation.sql, order_no=order_no, max_rows=max_rows)
             except SqlGuardRejection as rejection:
                 previous_sql = generation.sql
                 previous_error = f"{rejection.rule.value}: {rejection.detail}"

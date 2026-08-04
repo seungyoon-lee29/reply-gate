@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     vector_top_k: int = 5
     vector_similarity_threshold: float = 0.3
     sql_max_rows: int = 50
+    #: text-to-SQL 실행 커넥션의 `statement_timeout`(ms). 0 이면 무제한이므로 0 을 두지 않는다 —
+    #: 생성된 쿼리 하나가 워커를 몇 분씩 묶는 것을 코드가 막는 층이다.
+    sql_statement_timeout_ms: int = 5000
 
     @property
     def database_url(self) -> str:
