@@ -1,4 +1,4 @@
-"""LLM·임베딩 클라이언트 공통 래퍼.
+"""생성 LLM·임베딩 클라이언트 공통 래퍼.
 
 spec "LLM 호출 공통 실패 정책" 중 **전송 오류 1회 재시도**만 담당한다.
 프롬프트는 담지 않는다 — 프롬프트는 근거 수집·초안 생성 모듈이 소유한다.
@@ -7,9 +7,12 @@ spec "LLM 호출 공통 실패 정책" 중 **전송 오류 1회 재시도**만 �
 (의도 해석은 1회 재시도, 초안 생성은 재시도 없이 L1 으로 넘김, SQL 생성은 SQL 실패 경로).
 따라서 형식 오류는 `LLMFormatError` 로 올려보내고 호출자가 정책을 적용한다.
 
-주의: Anthropic·OpenAI SDK 는 전송 오류·429·5xx 를 기본 2회 자동 재시도한다.
-중첩되면 스펙의 "1회 재시도"가 실제로는 최대 6회 전송 시도가 되어 지연·처리 기록이
-어긋나므로, 두 클라이언트 모두 `max_retries=0` 을 명시해 재시도를 래퍼가 단독 통제한다.
+주의: OpenAI SDK 는 전송 오류·429·5xx 를 기본 2회 자동 재시도한다. 중첩되면 스펙의
+"1회 재시도"가 실제로는 최대 6회 전송 시도가 되어 지연·처리 기록이 어긋나므로,
+`max_retries=0` 을 명시해 재시도를 래퍼가 단독 통제한다.
+
+샘플링 파라미터(temperature 등)는 보내지 않는다 — spec "재현성": 결정론을 샘플링
+파라미터로 보장하지 않으며, 모델 계열에 따라 아예 받지 않는 경우도 있다.
 """
 
 from __future__ import annotations
@@ -17,25 +20,21 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol, cast
 
-import anthropic
 import openai
-from anthropic.types import Message, OutputConfigParam
+from openai.types.responses import Response
 
 __all__ = [
-    "AnthropicClient",
-    "Effort",
     "EmbeddingClient",
     "EmbeddingResult",
+    "GenerationClient",
     "JsonCompletion",
     "LLMCallError",
     "LLMFormatError",
     "OpenAIEmbeddingClient",
+    "OpenAIGenerationClient",
 ]
-
-#: `output_config.effort` 가 받는 값. 사고 깊이와 토큰 지출을 함께 조절한다.
-type Effort = Literal["low", "medium", "high", "xhigh", "max"]
 
 #: 최초 호출 + 재시도 1회 = 최대 2회 전송 시도 (spec "LLM 호출 공통 실패 정책").
 MAX_ATTEMPTS = 2
@@ -103,6 +102,22 @@ class EmbeddingResult:
     total_tokens: int
 
 
+class GenerationClient(Protocol):
+    """생성 LLM 클라이언트 계약 — 실제 구현과 테스트 대역이 공유한다."""
+
+    def complete_json(
+        self,
+        *,
+        stage: str,
+        system: str,
+        user: str,
+        schema: dict[str, Any],
+        schema_name: str = ...,
+        effort: str | None = ...,
+        max_output_tokens: int = ...,
+    ) -> JsonCompletion: ...
+
+
 class EmbeddingClient(Protocol):
     """임베딩 클라이언트 계약 — 실제 구현과 테스트 대역이 공유한다."""
 
@@ -142,16 +157,8 @@ def _call_with_one_retry[T](
     ) from last
 
 
-def _is_anthropic_transport_error(exc: Exception) -> bool:
-    # APITimeoutError 는 APIConnectionError 의 하위 타입이다.
-    if isinstance(exc, anthropic.APIConnectionError | anthropic.RateLimitError):
-        return True
-    if isinstance(exc, anthropic.APIStatusError):
-        return exc.status_code >= 500
-    return False
-
-
 def _is_openai_transport_error(exc: Exception) -> bool:
+    # APITimeoutError 는 APIConnectionError 의 하위 타입이다.
     if isinstance(exc, openai.APIConnectionError | openai.RateLimitError):
         return True
     if isinstance(exc, openai.APIStatusError):
@@ -159,7 +166,21 @@ def _is_openai_transport_error(exc: Exception) -> bool:
     return False
 
 
-class AnthropicClient:
+def _is_openai_api_error(exc: Exception) -> bool:
+    return isinstance(exc, openai.APIError)
+
+
+def _refusal_text(response: Response) -> str | None:
+    """안전 분류기 거절이면 그 사유를, 아니면 None."""
+    for item in getattr(response, "output", []) or []:
+        for part in getattr(item, "content", []) or []:
+            if getattr(part, "type", None) == "refusal":
+                refusal = getattr(part, "refusal", "")
+                return str(refusal) if refusal else "refusal"
+    return None
+
+
+class OpenAIGenerationClient:
     """생성 계열(의도 해석·초안 생성·SQL 생성) 공통 호출 래퍼."""
 
     def __init__(
@@ -168,13 +189,15 @@ class AnthropicClient:
         api_key: str,
         model: str,
         timeout: float = 120.0,
-        client: anthropic.Anthropic | None = None,
+        client: openai.OpenAI | None = None,
     ) -> None:
         # max_retries=0: 재시도는 이 래퍼가 단독 통제한다 (모듈 docstring 참조).
-        self._client = client or anthropic.Anthropic(
-            api_key=api_key, max_retries=0, timeout=timeout
-        )
+        self._client = client or openai.OpenAI(api_key=api_key, max_retries=0, timeout=timeout)
         self._model = model
+
+    @property
+    def model(self) -> str:
+        return self._model
 
     def complete_json(
         self,
@@ -183,42 +206,54 @@ class AnthropicClient:
         system: str,
         user: str,
         schema: dict[str, Any],
-        effort: Effort = "medium",
-        max_tokens: int = 8000,
+        schema_name: str = "response",
+        effort: str | None = None,
+        max_output_tokens: int = 8000,
     ) -> JsonCompletion:
         """JSON 스키마로 제약된 구조화 출력을 1건 받는다.
 
-        `claude-opus-5` 는 temperature 등 샘플링 파라미터를 받지 않으므로 보내지 않는다
-        (보내면 400). 사고 깊이·토큰 지출은 `effort` 로 조절한다.
+        `effort` 는 reasoning 계열 모델에서만 의미가 있으므로 **지정했을 때만** 보낸다
+        — 모델 등급은 조정 가능 기본값이라 계열이 바뀔 수 있고, 지원하지 않는 모델에
+        보내면 요청 자체가 거부된다.
         """
-        output_config: OutputConfigParam = {
-            "effort": effort,
-            "format": {"type": "json_schema", "schema": schema},
+        request: dict[str, Any] = {
+            "model": self._model,
+            "instructions": system,
+            "input": user,
+            "max_output_tokens": max_output_tokens,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": schema_name,
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
         }
+        if effort is not None:
+            request["reasoning"] = {"effort": effort}
 
-        def _call() -> Message:
-            return self._client.messages.create(
-                model=self._model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-                output_config=output_config,
-            )
+        def _call() -> Response:
+            # `**request` 로 넘기면 오버로드 추론이 풀려 Any 가 되므로 반환 타입을 고정한다.
+            return cast(Response, self._client.responses.create(**request))
 
-        message = _call_with_one_retry(
+        response = _call_with_one_retry(
             stage=stage,
             call=_call,
-            is_transport_error=_is_anthropic_transport_error,
-            is_api_error=lambda exc: isinstance(exc, anthropic.APIError),
+            is_transport_error=_is_openai_transport_error,
+            is_api_error=_is_openai_api_error,
         )
 
-        # 안전 분류기가 거절하면 본문이 비거나 잘린다 — 사용 가능한 산출이 없으므로 실패다.
-        if message.stop_reason == "refusal":
+        usage = getattr(response, "usage", None)
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+
+        # 안전 분류기가 거절하면 사용 가능한 산출이 없으므로 실패다.
+        refusal = _refusal_text(response)
+        if refusal is not None:
             raise LLMCallError(stage=stage, reason="refusal", attempts=1)
 
-        text = "".join(block.text for block in message.content if block.type == "text")
-        input_tokens = message.usage.input_tokens
-        output_tokens = message.usage.output_tokens
+        text = response.output_text or ""
         if not text.strip():
             raise LLMFormatError(
                 stage=stage,
@@ -238,11 +273,7 @@ class AnthropicClient:
                 output_tokens=output_tokens,
             ) from exc
 
-        return JsonCompletion(
-            data=data,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-        )
+        return JsonCompletion(data=data, input_tokens=input_tokens, output_tokens=output_tokens)
 
 
 class OpenAIEmbeddingClient:
@@ -282,7 +313,7 @@ class OpenAIEmbeddingClient:
             stage=stage,
             call=_call,
             is_transport_error=_is_openai_transport_error,
-            is_api_error=lambda exc: isinstance(exc, openai.APIError),
+            is_api_error=_is_openai_api_error,
         )
         ordered = sorted(response.data, key=lambda item: item.index)
         return EmbeddingResult(

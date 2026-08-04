@@ -1,4 +1,4 @@
-"""LLM·임베딩 래퍼의 실패 정책 단위 테스트 (외부 호출 없음, 목 사용)."""
+"""생성·임베딩 래퍼의 실패 정책 단위 테스트 (외부 호출 없음, 목 사용)."""
 
 from __future__ import annotations
 
@@ -6,17 +6,16 @@ import json
 from types import SimpleNamespace
 from typing import Any, cast
 
-import anthropic
 import httpx
 import openai
 import pytest
 
 from reply_gate.llm import (
     MAX_ATTEMPTS,
-    AnthropicClient,
     LLMCallError,
     LLMFormatError,
     OpenAIEmbeddingClient,
+    OpenAIGenerationClient,
 )
 
 SCHEMA: dict[str, Any] = {
@@ -27,16 +26,19 @@ SCHEMA: dict[str, Any] = {
 }
 
 
-def _message(text: str, *, stop_reason: str = "end_turn") -> SimpleNamespace:
+def _response(text: str, *, refusal: str | None = None) -> SimpleNamespace:
+    parts = [SimpleNamespace(type="output_text", text=text)]
+    if refusal is not None:
+        parts = [SimpleNamespace(type="refusal", refusal=refusal)]
     return SimpleNamespace(
-        content=[SimpleNamespace(type="text", text=text)],
-        stop_reason=stop_reason,
+        output=[SimpleNamespace(content=parts)],
+        output_text=text,
         usage=SimpleNamespace(input_tokens=11, output_tokens=7),
     )
 
 
-class _RecordingMessages:
-    """`client.messages.create` 대역 — 호출 횟수를 세고 정해진 결과를 순서대로 돌려준다."""
+class _RecordingCalls:
+    """SDK 엔드포인트 대역 — 호출 인자를 모으고 정해진 결과를 순서대로 돌려준다."""
 
     def __init__(self, outcomes: list[Any]) -> None:
         self._outcomes = outcomes
@@ -50,26 +52,26 @@ class _RecordingMessages:
         return outcome
 
 
-def _anthropic_client(outcomes: list[Any]) -> tuple[AnthropicClient, _RecordingMessages]:
-    messages = _RecordingMessages(outcomes)
-    fake_sdk = cast(anthropic.Anthropic, SimpleNamespace(messages=messages))
-    client = AnthropicClient(api_key="test", model="claude-opus-5", client=fake_sdk)
-    return client, messages
+def _generation_client(outcomes: list[Any]) -> tuple[OpenAIGenerationClient, _RecordingCalls]:
+    responses = _RecordingCalls(outcomes)
+    fake_sdk = cast(openai.OpenAI, SimpleNamespace(responses=responses))
+    client = OpenAIGenerationClient(api_key="test", model="gpt-5.6-terra", client=fake_sdk)
+    return client, responses
 
 
-def _connection_error() -> anthropic.APIConnectionError:
-    return anthropic.APIConnectionError(request=httpx.Request("POST", "https://example.invalid"))
+def _connection_error() -> openai.APIConnectionError:
+    return openai.APIConnectionError(request=httpx.Request("POST", "https://example.invalid"))
 
 
-def _status_error(status_code: int) -> anthropic.APIStatusError:
+def _status_error(status_code: int) -> openai.APIStatusError:
     request = httpx.Request("POST", "https://example.invalid")
     response = httpx.Response(status_code, request=request, json={"error": {"message": "x"}})
-    return anthropic.APIStatusError("boom", response=response, body=None)
+    return openai.APIStatusError("boom", response=response, body=None)
 
 
 def test_sdk_자동재시도를_끈다() -> None:
     """래퍼 재시도와 SDK 재시도가 중첩되면 스펙의 '1회 재시도'가 깨진다."""
-    client = AnthropicClient(api_key="test", model="claude-opus-5")
+    client = OpenAIGenerationClient(api_key="test", model="gpt-5.6-terra")
     assert client._client.max_retries == 0
 
     embedder = OpenAIEmbeddingClient(
@@ -79,30 +81,45 @@ def test_sdk_자동재시도를_끈다() -> None:
 
 
 def test_정상_응답은_데이터와_토큰을_돌려준다() -> None:
-    client, messages = _anthropic_client([_message(json.dumps({"intent": "policy"}))])
+    client, responses = _generation_client([_response(json.dumps({"intent": "policy"}))])
 
     result = client.complete_json(stage="intent", system="s", user="u", schema=SCHEMA)
 
     assert result.data == {"intent": "policy"}
     assert (result.input_tokens, result.output_tokens) == (11, 7)
-    assert len(messages.calls) == 1
-    # 샘플링 파라미터는 claude-opus-5 에서 400 이므로 절대 보내지 않는다.
-    assert not {"temperature", "top_p", "top_k"} & messages.calls[0].keys()
+    assert len(responses.calls) == 1
+
+    call = responses.calls[0]
+    # 결정론을 샘플링 파라미터로 보장하지 않는다 (spec "재현성") — 아예 보내지 않는다.
+    assert not {"temperature", "top_p"} & call.keys()
+    # reasoning 은 지정했을 때만 — 지원하지 않는 모델 등급에서 요청이 거부되기 때문.
+    assert "reasoning" not in call
+    assert call["model"] == "gpt-5.6-terra"
+    assert call["text"]["format"]["schema"] is SCHEMA
+    assert call["text"]["format"]["type"] == "json_schema"
+
+
+def test_effort_는_지정했을_때만_전달된다() -> None:
+    client, responses = _generation_client([_response(json.dumps({"intent": "policy"}))])
+
+    client.complete_json(stage="intent", system="s", user="u", schema=SCHEMA, effort="low")
+
+    assert responses.calls[0]["reasoning"] == {"effort": "low"}
 
 
 def test_전송오류는_1회만_재시도한다() -> None:
-    client, messages = _anthropic_client(
-        [_connection_error(), _message(json.dumps({"intent": "order"}))]
+    client, responses = _generation_client(
+        [_connection_error(), _response(json.dumps({"intent": "order"}))]
     )
 
     result = client.complete_json(stage="intent", system="s", user="u", schema=SCHEMA)
 
     assert result.data == {"intent": "order"}
-    assert len(messages.calls) == MAX_ATTEMPTS
+    assert len(responses.calls) == MAX_ATTEMPTS
 
 
 def test_전송오류가_지속되면_인계용_예외를_던진다() -> None:
-    client, messages = _anthropic_client([_connection_error()])
+    client, responses = _generation_client([_connection_error()])
 
     with pytest.raises(LLMCallError) as excinfo:
         client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
@@ -110,33 +127,33 @@ def test_전송오류가_지속되면_인계용_예외를_던진다() -> None:
     assert excinfo.value.stage == "draft"
     assert excinfo.value.reason == "transport_error"
     assert excinfo.value.attempts == MAX_ATTEMPTS
-    assert len(messages.calls) == MAX_ATTEMPTS
+    assert len(responses.calls) == MAX_ATTEMPTS
 
 
 def test_5xx_는_전송오류로_재시도한다() -> None:
-    client, messages = _anthropic_client(
-        [_status_error(503), _message(json.dumps({"intent": "both"}))]
+    client, responses = _generation_client(
+        [_status_error(503), _response(json.dumps({"intent": "both"}))]
     )
 
     assert client.complete_json(stage="sql", system="s", user="u", schema=SCHEMA).data == {
         "intent": "both"
     }
-    assert len(messages.calls) == MAX_ATTEMPTS
+    assert len(responses.calls) == MAX_ATTEMPTS
 
 
 def test_4xx_는_재시도하지_않고_즉시_실패한다() -> None:
-    client, messages = _anthropic_client([_status_error(400)])
+    client, responses = _generation_client([_status_error(400)])
 
     with pytest.raises(LLMCallError) as excinfo:
         client.complete_json(stage="intent", system="s", user="u", schema=SCHEMA)
 
     assert excinfo.value.reason == "api_error"
     assert excinfo.value.attempts == 1
-    assert len(messages.calls) == 1
+    assert len(responses.calls) == 1
 
 
 def test_거절_응답은_사용가능한_산출이_없으므로_실패다() -> None:
-    client, _ = _anthropic_client([_message("", stop_reason="refusal")])
+    client, _ = _generation_client([_response("", refusal="정책상 답할 수 없습니다")])
 
     with pytest.raises(LLMCallError) as excinfo:
         client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
@@ -145,32 +162,26 @@ def test_거절_응답은_사용가능한_산출이_없으므로_실패다() -> 
 
 
 def test_형식오류는_재시도하지_않고_호출자에게_위임한다() -> None:
-    client, messages = _anthropic_client([_message("이건 JSON 이 아니다")])
+    client, responses = _generation_client([_response("이건 JSON 이 아니다")])
 
     with pytest.raises(LLMFormatError) as excinfo:
         client.complete_json(stage="intent", system="s", user="u", schema=SCHEMA)
 
     assert excinfo.value.stage == "intent"
-    assert len(messages.calls) == 1
+    assert len(responses.calls) == 1
     # 초안 생성은 이 원문을 그대로 L1 에 넘겨 schema_violation 으로 판정시킨다.
     assert excinfo.value.raw_text == "이건 JSON 이 아니다"
     assert (excinfo.value.input_tokens, excinfo.value.output_tokens) == (11, 7)
 
 
+def test_빈_응답도_형식오류다() -> None:
+    client, _ = _generation_client([_response("   ")])
+
+    with pytest.raises(LLMFormatError):
+        client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
+
+
 # ── 임베딩 ──────────────────────────────────────────────────────────────────
-
-
-class _RecordingEmbeddings:
-    def __init__(self, outcomes: list[Any]) -> None:
-        self._outcomes = outcomes
-        self.calls: list[dict[str, Any]] = []
-
-    def create(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
-        outcome = self._outcomes[min(len(self.calls) - 1, len(self._outcomes) - 1)]
-        if isinstance(outcome, Exception):
-            raise outcome
-        return outcome
 
 
 def _embedding_response(vectors: list[tuple[int, list[float]]]) -> SimpleNamespace:
@@ -180,8 +191,8 @@ def _embedding_response(vectors: list[tuple[int, list[float]]]) -> SimpleNamespa
     )
 
 
-def _openai_client(outcomes: list[Any]) -> tuple[OpenAIEmbeddingClient, _RecordingEmbeddings]:
-    embeddings = _RecordingEmbeddings(outcomes)
+def _openai_client(outcomes: list[Any]) -> tuple[OpenAIEmbeddingClient, _RecordingCalls]:
+    embeddings = _RecordingCalls(outcomes)
     fake_sdk = cast(openai.OpenAI, SimpleNamespace(embeddings=embeddings))
     client = OpenAIEmbeddingClient(
         api_key="test", model="text-embedding-3-small", dimensions=3, client=fake_sdk
@@ -199,8 +210,9 @@ def test_임베딩은_입력_순서대로_정렬해_돌려준다() -> None:
 
 
 def test_임베딩_전송오류도_1회만_재시도한다() -> None:
-    error = openai.APIConnectionError(request=httpx.Request("POST", "https://example.invalid"))
-    client, embeddings = _openai_client([error, _embedding_response([(0, [1.0, 0.0, 0.0])])])
+    client, embeddings = _openai_client(
+        [_connection_error(), _embedding_response([(0, [1.0, 0.0, 0.0])])]
+    )
 
     result = client.embed(stage="inquiry", texts=["문의"])
 

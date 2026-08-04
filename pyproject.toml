@@ -12,7 +12,6 @@ dependencies = [
     "pydantic-settings>=2.6",
     "psycopg[binary]>=3.2",
     "pgvector>=0.3",
-    "anthropic>=0.40",
     "openai>=1.55",
     "sqlglot>=25.30",
 ]
