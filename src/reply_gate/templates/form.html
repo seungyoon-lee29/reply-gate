@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reply-Gate — 근거 없는 답변을 기각하는 CS 답변 에이전트</title>
+  <!--
+    외부 리소스를 하나도 불러오지 않는다 (CDN·웹폰트·외부 스크립트 금지) — 오프라인에서 열려야 한다.
+    화면의 주인공은 예쁜 챗 UI 가 아니라 **판정 과정**이다: 시도별 pass/reject 와 기각 사유 코드가
+    답변보다 먼저·크게 보이도록 배치한다.
+  -->
+  <style>
+    :root {
+      --ink: #16181d;
+      --muted: #5f6672;
+      --line: #d9dde3;
+      --bg: #f6f7f9;
+      --pass: #0f7b3f;
+      --pass-bg: #e6f4ec;
+      --reject: #b3261e;
+      --reject-bg: #fdecea;
+      --escalate: #8a4b00;
+      --escalate-bg: #fdf1e0;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 2rem 1rem 4rem;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: system-ui, -apple-system, "Segoe UI", "Apple SD Gothic Neo",
+                   "Noto Sans KR", "Malgun Gothic", sans-serif;
+      line-height: 1.6;
+    }
+    main { max-width: 46rem; margin: 0 auto; }
+    h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
+    h2 { font-size: 1rem; margin: 0 0 .5rem; letter-spacing: .02em; }
+    .lede { color: var(--muted); margin: 0 0 1.5rem; font-size: .92rem; }
+    .card {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: .6rem;
+      padding: 1rem 1.1rem;
+      margin-bottom: 1rem;
+    }
+    label { display: block; font-weight: 600; font-size: .85rem; margin-bottom: .25rem; }
+    input, textarea {
+      width: 100%;
+      font: inherit;
+      padding: .5rem .6rem;
+      border: 1px solid var(--line);
+      border-radius: .35rem;
+      background: #fff;
+      color: inherit;
+    }
+    textarea { min-height: 5.5rem; resize: vertical; }
+    .field { margin-bottom: .8rem; }
+    .row { display: flex; gap: .5rem; align-items: flex-end; }
+    .row .field { flex: 1; margin-bottom: 0; }
+    button {
+      font: inherit;
+      font-weight: 600;
+      padding: .5rem 1rem;
+      border: 1px solid var(--ink);
+      border-radius: .35rem;
+      background: var(--ink);
+      color: #fff;
+      cursor: pointer;
+    }
+    button.ghost { background: #fff; color: var(--ink); }
+    button[disabled] { opacity: .5; cursor: progress; }
+    .hint { color: var(--muted); font-size: .82rem; margin: .2rem 0 .8rem; }
+    .badge {
+      display: inline-block;
+      font-weight: 700;
+      font-size: .8rem;
+      padding: .1rem .5rem;
+      border-radius: .3rem;
+      letter-spacing: .04em;
+    }
+    .badge-pass { background: var(--pass-bg); color: var(--pass); }
+    .badge-reject { background: var(--reject-bg); color: var(--reject); }
+    .badge-escalate { background: var(--escalate-bg); color: var(--escalate); }
+    #status-line { font-size: 1.05rem; font-weight: 700; margin: 0 0 .2rem; }
+    #attempts { list-style: none; margin: 0; padding: 0; }
+    #attempts li {
+      border: 1px solid var(--line);
+      border-left-width: .35rem;
+      border-radius: .35rem;
+      padding: .55rem .7rem;
+      margin-bottom: .5rem;
+    }
+    #attempts li.reject { border-left-color: var(--reject); background: var(--reject-bg); }
+    #attempts li.pass { border-left-color: var(--pass); background: var(--pass-bg); }
+    .attempt-head { font-weight: 700; font-size: .9rem; }
+    .reasons { list-style: none; margin: .35rem 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: .35rem; }
+    .reasons li { margin: 0; padding: 0; border: 0; background: none; }
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: .82rem;
+    }
+    .reason-code {
+      background: var(--reject);
+      color: #fff;
+      padding: .1rem .45rem;
+      border-radius: .25rem;
+      font-weight: 700;
+    }
+    #escalation.card { border-color: var(--escalate); background: var(--escalate-bg); }
+    #citations { margin: 0; padding-left: 1.2rem; }
+    #citations li { margin-bottom: .5rem; }
+    #citations .cid { font-weight: 700; }
+    #citations pre { white-space: pre-wrap; margin: .2rem 0 0; color: var(--muted); }
+    #claims { margin: .5rem 0 0; padding-left: 1.2rem; color: var(--muted); font-size: .85rem; }
+    #answer { margin: 0; }
+    #error { color: var(--reject); font-weight: 600; }
+    pre#raw-json { white-space: pre-wrap; word-break: break-all; margin: .5rem 0 0; }
+    [hidden] { display: none !important; }
+    footer { color: var(--muted); font-size: .8rem; margin-top: 2rem; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Reply-Gate</h1>
+  <p class="lede">
+    근거 없는 답변을 <strong>스스로 기각</strong>하는 이커머스 CS 답변 에이전트.
+    이 화면은 답변보다 <strong>판정 과정</strong>을 먼저 보여준다 — L1 게이트가 무엇을 왜 기각했는지.
+  </p>
+
+  <form class="card" id="inquiry-form">
+    <div class="field">
+      <label for="order-no">주문번호 (선택)</label>
+      <input id="order-no" name="order_no" placeholder="ORD-20260315-0001" autocomplete="off">
+      <p class="hint">형식 검증은 코드가 한다. 형식이 틀리면 파이프라인을 돌리지 않고 422 로 거부한다.</p>
+    </div>
+    <div class="field">
+      <label for="content">문의 내용 (필수)</label>
+      <textarea id="content" name="content" placeholder="예) 환불은 언제까지 신청할 수 있나요?"></textarea>
+    </div>
+    <button id="submit" type="submit">문의 접수 · 처리</button>
+  </form>
+
+  <form class="card" id="lookup-form">
+    <div class="row">
+      <div class="field">
+        <label for="lookup-id">처리 기록 조회 (문의 ID)</label>
+        <input id="lookup-id" placeholder="문의 ID (UUID)" autocomplete="off">
+      </div>
+      <button class="ghost" type="submit">기록 불러오기</button>
+    </div>
+    <p class="hint">저장된 처리 기록에서 같은 화면을 다시 그린다 (GET /inquiries/&lt;id&gt;).</p>
+  </form>
+
+  <p id="error" hidden></p>
+
+  <section id="result" hidden>
+    <div class="card">
+      <p id="status-line"></p>
+      <p class="hint" id="inquiry-id-line"></p>
+    </div>
+
+    <section class="card" id="verdict-flow">
+      <h2>L1 게이트 판정 — 시도 이력</h2>
+      <p class="hint">
+        L1 은 <strong>LLM 호출 0회</strong>의 기계 검사다. 시도마다
+        <span class="badge badge-pass">pass</span> 통과 또는
+        <span class="badge badge-reject">reject</span> 기각(사유 코드 전부)이 찍힌다.
+        기각되면 사유 전체를 피드백으로 붙여 <strong>1회만</strong> 재생성하고, 재기각이면 인계로 끝난다 —
+        이 상한은 코드가 강제한다.
+      </p>
+      <ol id="attempts"></ol>
+      <p class="hint" id="attempts-empty" hidden>
+        초안 전 인계 — 근거가 없어서 초안 생성에 진입하지 않았다(L1 판정 없음).
+      </p>
+    </section>
+
+    <section class="card" id="escalation" hidden>
+      <h2>상담원 인계</h2>
+      <p>인계 사유: <code class="reason-code" id="escalation-reason"></code></p>
+    </section>
+
+    <section class="card" id="answer-section" hidden>
+      <h2>확정 답변</h2>
+      <p id="answer"></p>
+      <ol id="claims"></ol>
+    </section>
+
+    <section class="card">
+      <h2>수집된 근거 (citations)</h2>
+      <p class="hint">초안 전 인계라도 그 시점까지 모은 근거는 감사 목적으로 남는다.</p>
+      <ol id="citations"></ol>
+      <p class="hint" id="citations-empty" hidden>수집된 근거 없음.</p>
+    </section>
+
+    <section class="card">
+      <h2>처리 지표</h2>
+      <p class="hint" id="metrics"></p>
+      <details>
+        <summary>원본 응답 JSON</summary>
+        <pre id="raw-json"></pre>
+      </details>
+    </section>
+  </section>
+
+  <footer>
+    노드별 [LLM]/[코드] 경계 — 접수·근거 수집·L1 게이트·종결은 코드, 의도 해석·SQL 생성·초안 생성은 LLM.
+  </footer>
+</main>
+
+<script>
+  "use strict";
+
+  const el = (id) => document.getElementById(id);
+  const setText = (id, value) => { el(id).textContent = value; };
+  const show = (id, visible) => { el(id).hidden = !visible; };
+
+  function clear(node) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
+  function badge(kind, label) {
+    const span = document.createElement("span");
+    span.className = "badge badge-" + kind;
+    span.textContent = label;
+    return span;
+  }
+
+  function renderAttempts(attempts) {
+    const list = el("attempts");
+    clear(list);
+    show("attempts-empty", attempts.length === 0);
+    attempts.forEach((attempt, index) => {
+      const rejected = attempt.verdict === "reject";
+      const item = document.createElement("li");
+      item.className = rejected ? "reject" : "pass";
+
+      const head = document.createElement("div");
+      head.className = "attempt-head";
+      const label = index === 0 ? "시도 1 — 최초 초안" : "시도 " + (index + 1) + " — 재생성";
+      head.appendChild(document.createTextNode(label + " "));
+      head.appendChild(badge(rejected ? "reject" : "pass", attempt.verdict));
+      item.appendChild(head);
+
+      if (rejected) {
+        const reasons = document.createElement("ul");
+        reasons.className = "reasons";
+        attempt.reject_reasons.forEach((reason) => {
+          const li = document.createElement("li");
+          const code = document.createElement("code");
+          code.className = "reason-code";
+          code.textContent = reason;
+          li.appendChild(code);
+          reasons.appendChild(li);
+        });
+        item.appendChild(reasons);
+      }
+      list.appendChild(item);
+    });
+  }
+
+  function renderCitations(citations) {
+    const list = el("citations");
+    clear(list);
+    show("citations-empty", citations.length === 0);
+    citations.forEach((citation) => {
+      const item = document.createElement("li");
+      const head = document.createElement("div");
+      const cid = document.createElement("code");
+      cid.className = "cid";
+      cid.textContent = citation.id;
+      head.appendChild(cid);
+      head.appendChild(document.createTextNode(" (" + citation.source + ")"));
+      item.appendChild(head);
+      const body = document.createElement("pre");
+      body.textContent = citation.content;
+      item.appendChild(body);
+      list.appendChild(item);
+    });
+  }
+
+  function renderClaims(claims) {
+    const list = el("claims");
+    clear(list);
+    claims.forEach((claim) => {
+      const item = document.createElement("li");
+      item.textContent = claim.text + " — 근거: " + claim.citation_ids.join(", ");
+      list.appendChild(item);
+    });
+  }
+
+  function render(payload) {
+    const escalated = payload.status === "escalated";
+    const line = el("status-line");
+    clear(line);
+    line.appendChild(document.createTextNode("최종 상태: "));
+    line.appendChild(badge(escalated ? "escalate" : "pass", payload.status));
+    line.appendChild(
+      document.createTextNode(escalated ? " 상담원 인계" : " 답변 확정")
+    );
+    setText("inquiry-id-line", "문의 ID: " + payload.inquiry_id);
+
+    renderAttempts(payload.attempts);
+
+    show("escalation", escalated);
+    setText("escalation-reason", payload.escalation_reason || "");
+
+    show("answer-section", payload.answer !== null);
+    setText("answer", payload.answer || "");
+    renderClaims(payload.claims);
+
+    renderCitations(payload.citations);
+
+    const tokens = payload.metrics.tokens;
+    setText(
+      "metrics",
+      "지연 " + payload.metrics.latency_ms + " ms · 생성 토큰 입력 " +
+        tokens.input + " / 출력 " + tokens.output +
+        " (임베딩 토큰은 처리 기록에 별도로 남는다)"
+    );
+    setText("raw-json", JSON.stringify(payload, null, 2));
+    show("result", true);
+  }
+
+  function fail(message) {
+    show("result", false);
+    setText("error", message);
+    show("error", true);
+  }
+
+  async function call(url, options, busyButton) {
+    show("error", false);
+    busyButton.disabled = true;
+    try {
+      const response = await fetch(url, options);
+      const payload = await response.json();
+      if (!response.ok) {
+        fail("요청이 거부되었다 (HTTP " + response.status + "): " + JSON.stringify(payload.detail));
+        return;
+      }
+      render(payload);
+    } catch (error) {
+      fail("요청을 보내지 못했다: " + error);
+    } finally {
+      busyButton.disabled = false;
+    }
+  }
+
+  el("inquiry-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const body = JSON.stringify({
+      content: el("content").value,
+      order_no: el("order-no").value
+    });
+    const options = {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: body
+    };
+    call("/inquiries", options, el("submit"));
+  });
+
+  el("lookup-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const id = el("lookup-id").value.trim();
+    if (!id) {
+      fail("문의 ID 를 입력해야 한다.");
+      return;
+    }
+    call("/inquiries/" + encodeURIComponent(id), {}, event.submitter || el("submit"));
+  });
+</script>
+</body>
+</html>
