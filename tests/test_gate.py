@@ -465,3 +465,86 @@ def test_to_draft_는_citation_이_비어도_변환한다() -> None:
 def test_to_draft_는_구조가_깨진_초안을_거부한다(raw_draft: object) -> None:
     with pytest.raises(ValueError):
         to_draft(raw_draft)
+
+
+# ── 미끼 조항이 실제로 기각을 유발하는지 (spec "데이터" 절) ──────────────────
+
+
+def _decoy_evidence() -> Evidence:
+    """고객센터 안내이면서 전화번호를 일부러 비워 둔 미끼 조항."""
+    text = (
+        "고객센터는 평일 09:00부터 18:00까지 운영하며 점심시간은 12:00부터 13:00까지입니다. "
+        "상담이 필요하시면 운영시간 내에 고객센터로 연락해 주십시오."
+    )
+    return Evidence(
+        id="policy:support:4-1",
+        source=EvidenceSource.POLICY,
+        content=text,
+        evidence_text=text,
+    )
+
+
+def test_미끼_조항에_없는_대표번호를_지어내면_기각된다() -> None:
+    draft = {
+        "claims": [
+            {
+                "text": "고객센터 전화번호는 1588-1234 입니다.",
+                "citation_ids": ["policy:support:4-1"],
+            }
+        ]
+    }
+
+    result = evaluate_draft(raw_draft=draft, evidences=[_decoy_evidence()])
+
+    assert result.verdict is Verdict.REJECT
+    assert RejectReason.PII_DETECTED in result.reject_reasons
+
+
+def test_미끼_조항에_없는_이메일을_지어내면_기각된다() -> None:
+    draft = {
+        "claims": [
+            {
+                "text": "서류는 help@example.com 으로 보내주세요.",
+                "citation_ids": ["policy:support:4-1"],
+            }
+        ]
+    }
+
+    result = evaluate_draft(raw_draft=draft, evidences=[_decoy_evidence()])
+
+    assert RejectReason.PII_DETECTED in result.reject_reasons
+
+
+def test_미끼를_피해_운영시간만_답하면_통과한다() -> None:
+    """기각이 목적이 아니다 — 근거 안에 머무른 답변은 그대로 통과해야 한다."""
+    draft = {
+        "claims": [
+            {
+                "text": "고객센터는 평일 09:00부터 18:00까지 운영합니다.",
+                "citation_ids": ["policy:support:4-1"],
+            }
+        ]
+    }
+
+    result = evaluate_draft(raw_draft=draft, evidences=[_decoy_evidence()])
+
+    assert result.verdict is Verdict.PASS
+
+
+def test_근거에_있는_대표번호_에코는_통과한다() -> None:
+    text = "고객센터 대표번호는 1588-0000 입니다."
+    evidence = Evidence(
+        id="policy:support:4-9",
+        source=EvidenceSource.POLICY,
+        content=text,
+        evidence_text=text,
+    )
+    draft = {
+        "claims": [
+            {"text": "고객센터는 15880000 번으로 연락하시면 됩니다.", "citation_ids": [evidence.id]}
+        ]
+    }
+
+    result = evaluate_draft(raw_draft=draft, evidences=[evidence])
+
+    assert result.verdict is Verdict.PASS
