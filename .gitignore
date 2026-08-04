@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 환경·시크릿
+.env
+.env.*
+!.env.example
+
+# dryforge 로컬 계약 아카이브 (프로젝트 하네스 문서는 추적한다)
+.dryforge/
+
+# 에디터·OS
+.DS_Store
+.idea/
+.vscode/
