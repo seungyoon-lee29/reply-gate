@@ -15,8 +15,9 @@
 상태 집합 + 허용 인계 사유 집합 + 기각 기대 여부 + 금지 기각 사유 집합. 초안이 확률적이라
 같은 문의가 여러 정당한 결말을 가질 수 있기 때문이다.
 
-**목표치는 이 모듈에 없다.** 첫 측정값을 보고 확정하는 것이 이번 사이클의 결정이고,
-하네스가 수치를 산출하는 것까지가 완료 조건이다. 리포트는 목표치를 "미확정"으로 적는다.
+**목표치는 실측값을 보고 확정했다**(2026-08-05 · `docs/tracking/decisions/0006`). `TARGETS` 가
+정의이고 리포트가 달성 여부를 함께 찍는다. 측정하지 않은 지표는 달성 여부를 `None` 으로
+남긴다 — 돌지 않은 측정을 "미달"로도 "달성"으로도 적지 않는다.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ __all__ = [
     "DEFAULT_L1_FIXTURES_PATH",
     "DEFAULT_REPORT_DIR",
     "REASON_ORDER",
+    "TARGETS",
     "EvaluationReport",
     "ExpectedOutcomeSet",
     "GateAccuracy",
@@ -55,6 +57,7 @@ __all__ = [
     "GoldenOutcome",
     "L1Fixture",
     "L1Outcome",
+    "MetricTarget",
     "PipelineAgreement",
     "PipelineRunning",
     "ReasonBreakdown",
@@ -77,7 +80,8 @@ _ROOT: Final = Path(__file__).resolve().parents[2]
 DEFAULT_GOLDEN_SET_PATH: Final = _ROOT / "data" / "golden_set.jsonl"
 #: 저장소의 L1 픽스처 셋 — 고정 초안+근거 쌍(LLM 호출 없음).
 DEFAULT_L1_FIXTURES_PATH: Final = _ROOT / "data" / "l1_fixtures.jsonl"
-#: 리포트 산출 위치. `.gitignore` 되어 있어 산출물은 커밋되지 않는다.
+#: 리포트 산출 위치. `evaluation-live*` 만 저장소가 추적하고 나머지는 gitignore 된다
+#: (라이브 실측은 재생성에 과금이 들어 근거로 커밋한다 — `scripts/evaluate.py`).
 DEFAULT_REPORT_DIR: Final = _ROOT / "reports"
 
 
@@ -625,12 +629,61 @@ class RunConditions:
 
 
 @dataclass(frozen=True)
+class MetricTarget:
+    """지표 목표치 1개 — 이름·경계·비교 방향. 판정은 `met` 이 한다."""
+
+    key: str
+    label: str
+    #: 경계값(비율). `at_most` 면 이하가 달성, 아니면 이상이 달성.
+    bound: float
+    at_most: bool = False
+
+    def met(self, value: float | None) -> bool | None:
+        """달성 여부. **측정하지 않았으면 `None`** — 미측정을 미달로 적지 않는다."""
+        if value is None:
+            return None
+        return value <= self.bound if self.at_most else value >= self.bound
+
+    def describe(self) -> str:
+        """경계만 적는다 — 표에서 이름은 옆 칸이 이미 들고 있다."""
+        return f"{'≤' if self.at_most else '≥'} {self.bound * 100:.0f}%"
+
+
+#: 지표 목표치 — 2026-08-05 확정(`docs/tracking/decisions/0006`).
+#:
+#: L1 두 지표는 **결정론 층**이라 100%/0% 를 목표로 박을 수 있다: 픽스처가 고정이고
+#: 게이트가 LLM 을 부르지 않으므로 달성은 재현되며, 미달은 곧 회귀다.
+#: 일치율은 확률 층이라 반복 실행마다 흔들린다 — 3회 실측 71.1%(70.0~73.3%) 위에
+#: 75% 를 둔 것은 **지금 닿지 않는 목표**이고, 그 간극이 다음 사이클(L2·임계값)의 몫이다.
+TARGETS: Final[tuple[MetricTarget, ...]] = (
+    MetricTarget(key="detection_rate", label="측정 1 구조적 오류 검출률", bound=1.0),
+    MetricTarget(
+        key="false_positive_rate",
+        label="측정 1 정상 초안 오탐률",
+        bound=0.0,
+        at_most=True,
+    ),
+    MetricTarget(key="match_rate", label="측정 2 허용 결과 집합 대비 일치율", bound=0.75),
+)
+
+
+@dataclass(frozen=True)
 class EvaluationReport:
     """리포트 1건 — 사람이 읽는 마크다운과 기계가 읽는 JSON 의 공통 원본."""
 
     conditions: RunConditions
     gate_accuracy: GateAccuracy
     pipeline: PipelineAgreement | SkippedMeasurement
+
+    def measured(self) -> dict[str, float | None]:
+        """목표치 대조에 쓰는 실측값. 측정 2 미실행이면 일치율은 `None`."""
+        return {
+            "detection_rate": self.gate_accuracy.detection_rate,
+            "false_positive_rate": self.gate_accuracy.false_positive_rate,
+            "match_rate": (
+                None if isinstance(self.pipeline, SkippedMeasurement) else self.pipeline.match_rate
+            ),
+        }
 
 
 def build_report(
@@ -699,16 +752,32 @@ def render_markdown(report: EvaluationReport) -> str:
         f"- 골든셋: {conditions.golden_case_count}건 (`{conditions.golden_set_path}`)",
         f"- OPENAI_API_KEY 설정 여부: {'설정됨' if conditions.api_key_present else '없음'}",
         "",
-        "## 목표치",
-        "",
-        "**미확정 — 첫 측정값을 보고 결정한다(조정 가능으로 기록).** 지표 목표치를 지금 박지",
-        "않는 것은 결정이며, 평가 하네스가 수치를 산출하는 것까지가 이번 사이클의 완료 조건이다.",
-        "",
     ]
+    lines.extend(_render_targets(report))
     lines.extend(_render_measurement_one(report.gate_accuracy))
     lines.extend(_render_measurement_two(report.pipeline, conditions))
     lines.append(_LIMITS)
     return "\n".join(lines)
+
+
+def _render_targets(report: EvaluationReport) -> list[str]:
+    """목표치 대비 표. **미측정은 미달이 아니다** — 그렇게 적으면 리포트가 거짓말을 한다."""
+    measured = report.measured()
+    lines = [
+        "## 목표치 대비",
+        "",
+        "2026-08-05 확정(`docs/tracking/decisions/0006`). 미측정 지표는 판정하지 않는다.",
+        "",
+        "| 지표 | 목표 | 실측 | 판정 |",
+        "| --- | --- | ---: | :---: |",
+    ]
+    for target in TARGETS:
+        value = measured[target.key]
+        met = target.met(value)
+        verdict = "미측정" if met is None else ("달성" if met else "**미달**")
+        lines.append(f"| {target.label} | {target.describe()} | {_pct(value)} | {verdict} |")
+    lines.append("")
+    return lines
 
 
 def _render_measurement_one(accuracy: GateAccuracy) -> list[str]:
@@ -852,7 +921,22 @@ def report_to_json(report: EvaluationReport) -> dict[str, Any]:
     conditions = report.conditions
     accuracy = report.gate_accuracy
     payload: dict[str, Any] = {
-        "targets": "미확정 — 첫 측정값을 보고 결정 (조정 가능)",
+        "targets": {
+            "decided_at": "2026-08-05",
+            "decision": "docs/tracking/decisions/0006",
+            "metrics": [
+                {
+                    "key": target.key,
+                    "label": target.label,
+                    "bound": target.bound,
+                    "direction": "at_most" if target.at_most else "at_least",
+                    "measured": report.measured()[target.key],
+                    #: 미측정이면 null — 돌지 않은 측정을 미달로 적지 않는다.
+                    "met": target.met(report.measured()[target.key]),
+                }
+                for target in TARGETS
+            ],
+        },
         "conditions": {
             "started_at": conditions.started_at,
             "generation": conditions.generation,

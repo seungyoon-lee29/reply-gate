@@ -41,6 +41,7 @@ from reply_gate.evaluation import (
     ExpectedOutcomeSet,
     GoldenCase,
     L1Fixture,
+    MetricTarget,
     RunConditions,
     SkippedMeasurement,
     StubGenerationClient,
@@ -487,15 +488,47 @@ def test_미실행_측정2_는_0_이_아니라_사유로_남는다(tmp_path: Pat
     assert markdown_path.exists() and json_path.exists()
 
 
-def test_리포트는_목표치를_미확정으로_적는다() -> None:
+def test_확정된_목표치가_리포트에_실린다() -> None:
     report = build_report(
         conditions=_conditions(),
         gate_accuracy=measure_gate_accuracy(FIXTURES),
         pipeline=SkippedMeasurement(reason="미요청"),
     )
     markdown = render_markdown(report)
-    assert "**미확정 — 첫 측정값을 보고 결정한다(조정 가능으로 기록).**" in markdown
-    assert report_to_json(report)["targets"].startswith("미확정")
+    assert "## 목표치 대비" in markdown
+    assert "| 측정 1 구조적 오류 검출률 | ≥ 100% |" in markdown
+    assert "| 측정 1 정상 초안 오탐률 | ≤ 0% |" in markdown
+    assert "| 측정 2 허용 결과 집합 대비 일치율 | ≥ 75% |" in markdown
+
+    metrics = report_to_json(report)["targets"]["metrics"]
+    by_key = {metric["key"]: metric for metric in metrics}
+    assert by_key["detection_rate"]["bound"] == 1.0
+    assert by_key["false_positive_rate"]["direction"] == "at_most"
+    assert by_key["match_rate"]["bound"] == 0.75
+
+
+def test_측정하지_않은_지표는_미달로_적지_않는다() -> None:
+    """돌지 않은 측정을 "미달"로 찍으면 리포트가 거짓말을 한다 — `None` 이어야 한다."""
+    report = build_report(
+        conditions=_conditions(),
+        gate_accuracy=measure_gate_accuracy(FIXTURES),
+        pipeline=SkippedMeasurement(reason="미요청"),
+    )
+    metrics = report_to_json(report)["targets"]["metrics"]
+    match_rate = next(metric for metric in metrics if metric["key"] == "match_rate")
+    assert match_rate["measured"] is None
+    assert match_rate["met"] is None
+    assert "미측정" in render_markdown(report)
+
+
+def test_목표치는_경계값을_달성으로_본다() -> None:
+    at_least = MetricTarget(key="k", label="l", bound=0.75)
+    at_most = MetricTarget(key="k", label="l", bound=0.0, at_most=True)
+    assert at_least.met(0.75) is True
+    assert at_least.met(0.7499) is False
+    assert at_most.met(0.0) is True
+    assert at_most.met(0.0001) is False
+    assert at_least.met(None) is None
 
 
 def test_리포트는_실행_조건과_한계를_함께_적는다() -> None:
