@@ -150,7 +150,7 @@ def test_형식_불일치는_재시도없이_원문을_원시산출로_돌려준
 
     assert result.raw == "이건 JSON 이 아니다"
     assert (result.input_tokens, result.output_tokens) == (99, 3)
-    # 초안 생성은 형식 불일치를 재시도하지 않는다 (spec LLM 호출 공통 실패 정책).
+    # 초안 생성은 형식 불일치를 재시도하지 않는다 (docs/standards.md "재시도 상한").
     assert len(recorder.calls) == 1
 
 

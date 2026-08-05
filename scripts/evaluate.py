@@ -10,6 +10,10 @@
 기본값으로 돌리지 않는다. 실행하지 않았으면 리포트에 **미실행 사유가 그대로 남는다** —
 조용히 0 이나 빈 값을 채워 "돌았다"처럼 보이게 하지 않는다.
 
+**라이브 실행은 리포트 이름이 다르다** — `--live` 는 `evaluation-live.{md,json}` 에 쓰고
+그 밖의 실행은 `evaluation.{md,json}` 에 쓴다. 문서가 인용하는 실측 근거를 나중의 기본
+실행이 덮어쓰는 것을 막기 위해서다. 라이브 이름으로 실측 아닌 결과를 쓰려 하면 거부한다.
+
 `--stub-llm` 은 정책 청크를 **어휘 임베딩 대역**으로 다시 적재해야 하므로, 적재를
 트랜잭션 안에서 하고 끝나면 **롤백한다**. 공유 DB 의 실제 임베딩을 덮어쓰지 않는다.
 """
@@ -58,6 +62,16 @@ from reply_gate.testing import LexicalEmbeddingClient
 #: 배관 검증용 실행에서만 쓰는 낮춘 기본값이고, 리포트에 그대로 기록된다.
 STUB_SIMILARITY_THRESHOLD = 0.05
 
+#: 기본 실행(측정 2 미실행)과 대역 실행이 쓰는 리포트 이름.
+DEFAULT_REPORT_STEM = "evaluation"
+
+#: 라이브 실측이 쓰는 리포트 이름. 이 접두사로 시작하는 리포트만 저장소가 추적한다.
+#:
+#: 라이브 실행과 기본 실행이 같은 파일에 쓰면, 나중에 아무 생각 없이 돌린 기본 실행이
+#: **유일한 실측 근거를 덮어쓴다.** 실제로 한 번 그렇게 잃었다 — 문서가 인용하는 수치의
+#: 산출물이 "측정 2 미실행" 리포트로 바뀌어 재생성이 불가능해졌다.
+LIVE_REPORT_STEM = "evaluation-live"
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -77,7 +91,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--golden-set", type=Path, default=DEFAULT_GOLDEN_SET_PATH)
     parser.add_argument("--l1-fixtures", type=Path, default=DEFAULT_L1_FIXTURES_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_REPORT_DIR)
-    parser.add_argument("--report-stem", default="evaluation")
+    parser.add_argument(
+        "--report-stem",
+        default=None,
+        help=(
+            f"리포트 파일 이름 "
+            f"(기본: --live 면 `{LIVE_REPORT_STEM}`, 아니면 `{DEFAULT_REPORT_STEM}`)"
+        ),
+    )
     parser.add_argument(
         "--similarity-threshold",
         type=float,
@@ -100,6 +121,20 @@ def _skip_reason(*, args: argparse.Namespace, settings: Settings) -> str | None:
     if args.live and not settings.openai_api_key:
         return "OPENAI_API_KEY 가 없다 — 측정 2 는 실제 생성 LLM 이 있어야 진짜 수치가 나온다"
     return database_unavailable_reason(settings=settings)
+
+
+def _resolve_report_stem(*, args: argparse.Namespace, measurement2_is_real: bool) -> str:
+    """리포트 이름을 정한다 — 라이브 실측 산출물을 덮어쓰지 못하게 막는 자리다."""
+    if args.report_stem is None:
+        return LIVE_REPORT_STEM if args.live else DEFAULT_REPORT_STEM
+    stem = str(args.report_stem)
+    if stem.startswith(LIVE_REPORT_STEM) and not measurement2_is_real:
+        raise SystemExit(
+            f"거부: `{stem}` 은 라이브 실측 리포트 이름인데 이 실행은 "
+            "실측이 아니다(측정 2 미실행 또는 대역). 라이브 산출물을 덮어쓰면 "
+            "문서가 인용하는 수치의 근거가 사라진다. 다른 --report-stem 을 쓰라."
+        )
+    return stem
 
 
 def _measurement_two_settings(*, args: argparse.Namespace, settings: Settings) -> Settings:
@@ -228,7 +263,8 @@ def main(argv: list[str] | None = None) -> int:
     report: EvaluationReport = build_report(
         conditions=conditions, gate_accuracy=accuracy, pipeline=pipeline
     )
-    markdown_path, json_path = write_report(report, out_dir=args.out_dir, stem=args.report_stem)
+    stem = _resolve_report_stem(args=args, measurement2_is_real=conditions.measurement2_is_real)
+    markdown_path, json_path = write_report(report, out_dir=args.out_dir, stem=stem)
 
     _print_summary(report)
     print(f"\n리포트: {markdown_path}\n리포트(JSON): {json_path}")

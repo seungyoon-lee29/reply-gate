@@ -1,6 +1,7 @@
-"""에이전트 루프 — 접수 → 근거 수집 → 초안 생성 → L1 게이트 → 종결 (spec "파이프라인 행위").
+"""에이전트 루프 — 접수 → 근거 수집 → 초안 생성 → L1 게이트 → 종결.
 
-이 모듈이 spec 의 파이프라인 순서를 코드로 들고 있는 유일한 곳이다. LangGraph 같은
+순서의 근거는 docs/architecture.md "대표 흐름" 이고, 이 모듈이 그 순서를 코드로 들고 있는
+유일한 곳이다. LangGraph 같은
 프레임워크를 쓰지 않고 **루프 종료 조건을 코드가 직접 통제**하는 것이 제품의 구조적 주장이다:
 
 * **재생성 상한 1회** — 초안 생성은 최대 `MAX_DRAFT_ATTEMPTS`(=2)회다. 프롬프트나 모델의
@@ -65,8 +66,9 @@ __all__ = [
     "new_inquiry_id",
 ]
 
-#: 초안 생성 호출의 상한 = 최초 1회 + 재생성 1회 (spec "종결 [코드]").
-#: **이 숫자를 늘리는 것은 spec 변경이다** — `db/schema.sql` 의 attempt_no CHECK(1..2)도
+#: 초안 생성 호출의 상한 = 최초 1회 + 재생성 1회 (docs/standards.md "재시도 상한").
+#: **이 숫자를 늘리는 것은 docs/standards.md "재시도 상한" 변경이다** —
+#: `db/schema.sql` 의 attempt_no CHECK(1..2)도
 #: 함께 깨진다.
 MAX_DRAFT_ATTEMPTS: Final = 2
 
@@ -125,7 +127,7 @@ def new_inquiry_id() -> str:
 
 @dataclass(frozen=True)
 class AttemptRecord:
-    """초안 1건에 대한 L1 판정 (spec "판정·상태 모델" — 최대 2건)."""
+    """초안 1건에 대한 L1 판정 (docs/business-rules.md "상태 전이" — 최대 2건)."""
 
     attempt_no: int
     verdict: Verdict
@@ -222,7 +224,9 @@ class InquiryPipeline:
         app_conn: psycopg.Connection[DictRow],
         readonly_conn: psycopg.Connection[DictRow],
     ) -> ProcessedInquiry:
-        """spec 파이프라인 2~6단계를 순서대로 실행한다 (1단계 접수는 `accept_inquiry`).
+        """docs/architecture.md "대표 흐름" 2~6단계를 순서대로 실행한다.
+
+        1단계 접수는 `accept_inquiry` 가 맡는다.
 
         `latency_ms` 는 이 메서드 전체의 벽시계 시간이다 — 처리 기록 저장(`records.py`)은
         측정에 포함하지 않는다. 평가 지표(p50/p95)가 재는 것은 **문의 처리**이지 저장이

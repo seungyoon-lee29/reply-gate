@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     )
 
     # ── 외부 API 키 ─────────────────────────────────────────────────────────
-    # 이번 사이클 API 키는 OpenAI 1개 (생성·임베딩 공통) — spec "기술 결정".
+    # 이번 사이클 API 키는 OpenAI 1개 (생성·임베딩 공통) — docs/architecture.md "외부 의존".
     openai_api_key: str = ""
 
     # ── Postgres 접속 ───────────────────────────────────────────────────────
@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     postgres_ro_password: str = ""
 
     # ── 모델 ────────────────────────────────────────────────────────────────
-    # 생성 LLM 모델 등급은 조정 가능 기본값 (spec "조정 가능 기본값").
+    # 생성 LLM 모델 등급은 조정 가능 기본값 (docs/operations.md "환경 변수").
     generation_model: str = "gpt-5.6-terra"
     #: 합성 데이터 1회 제작에만 쓰는 상위 모델. 런타임 경로에는 쓰지 않는다.
     bulk_generation_model: str = "gpt-5.6-sol"
@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 1536
 
-    # ── 조정 가능 기본값 (spec "조정 가능 기본값" 절) ────────────────────────
+    # ── 조정 가능 기본값 (docs/operations.md "환경 변수" 절) ────────────────────────
     vector_top_k: int = 5
     vector_similarity_threshold: float = 0.3
     sql_max_rows: int = 50

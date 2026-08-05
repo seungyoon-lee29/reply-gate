@@ -1,4 +1,4 @@
-"""L1 게이트 테스트 — spec "L1 게이트 검사 규칙" 을 코드로 고정한다.
+"""L1 게이트 테스트 — docs/business-rules.md "L1 게이트 판정 규칙" 을 코드로 고정한다.
 
 게이트는 제품 정체성("근거 없는 답변을 스스로 기각한다")이 실제로 구현된 지점이므로,
 사유 4종의 양성·음성, PII allowlist, 복수 사유 동시 수집, 결정론, LLM 호출 0회를
@@ -142,7 +142,7 @@ def test_회귀_스키마검사에_citation_최소개수를_넣으면_missing_ci
     """`citation_ids: []` 의 유일한 사유는 missing_citation 이어야 한다.
 
     스키마 검사기에 minItems 성격의 제약이 들어가면 schema_violation 이 함께 붙어
-    이 단언이 깨진다 — 사유 분리가 무너졌다는 신호다(spec L1 절 각주).
+    이 단언이 깨진다 — 사유 분리가 무너졌다는 신호다(docs/business-rules.md "L1 게이트 판정 규칙").
     """
     raw_draft = {"claims": [{"text": NORMAL_TEXT, "citation_ids": []}]}
 
@@ -467,7 +467,7 @@ def test_to_draft_는_구조가_깨진_초안을_거부한다(raw_draft: object)
         to_draft(raw_draft)
 
 
-# ── 미끼 조항이 실제로 기각을 유발하는지 (spec "데이터" 절) ──────────────────
+# ── 미끼 조항이 실제로 기각을 유발하는지 (docs/business-rules.md "평가용 데이터의 지위" 절) ──────────────────
 
 
 def _decoy_evidence() -> Evidence:

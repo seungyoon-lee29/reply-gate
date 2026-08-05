@@ -90,7 +90,7 @@ def test_정상_응답은_데이터와_토큰을_돌려준다() -> None:
     assert len(responses.calls) == 1
 
     call = responses.calls[0]
-    # 결정론을 샘플링 파라미터로 보장하지 않는다 (spec "재현성") — 아예 보내지 않는다.
+    # 결정론을 샘플링 파라미터로 보장하지 않는다 (docs/standards.md "샘플링 파라미터를 보내지 않는다") — 아예 보내지 않는다.
     assert not {"temperature", "top_p"} & call.keys()
     # reasoning 은 지정했을 때만 — 지원하지 않는 모델 등급에서 요청이 거부되기 때문.
     assert "reasoning" not in call

@@ -1,6 +1,7 @@
 """사이클 간 계약 — 답변 계약, 근거 ID 체계, 판정·상태 enum.
 
-이 모듈은 spec 의 "답변 계약" / "L1 게이트 검사 규칙" / "판정·상태 모델" 절을 코드로 옮긴 것이다.
+이 모듈은 docs/contracts.md "답변 계약" 과 docs/business-rules.md 의
+"L1 게이트 판정 규칙"·"상태 전이" 를 코드로 옮긴 것이다.
 **다음 사이클의 L2(claim 단위 LLM judge)가 그대로 이어받는 계약**이므로, 편의로 구조를 바꾸지
 않는다(바꾸려면 사용자 승인).
 
@@ -96,7 +97,7 @@ class Draft:
 
 
 class RejectReason(StrEnum):
-    """L1 기각 사유. spec "L1 게이트 검사 규칙" 의 enum 이 전부다."""
+    """L1 기각 사유. docs/business-rules.md "L1 게이트 판정 규칙" 의 enum 이 전부다."""
 
     SCHEMA_VIOLATION = "schema_violation"
     MISSING_CITATION = "missing_citation"
@@ -120,7 +121,7 @@ class GateResult:
 
 
 class EscalationReason(StrEnum):
-    """상담원 인계 사유. spec "판정·상태 모델" 의 6종이 전부다."""
+    """상담원 인계 사유. docs/business-rules.md "인계 사유 6종" 이 전부다."""
 
     NO_EVIDENCE = "no_evidence"
     MISSING_ORDER_REF = "missing_order_ref"
@@ -140,7 +141,8 @@ class InquiryStatus(StrEnum):
 #: 초안 생성 LLM 의 구조화 출력 스키마 = L1 기계 검사의 대상.
 #:
 #: **`citation_ids` 에 `minItems` 를 넣지 않는다.** "citation_ids 1개 이상"의 위반 판정은
-#: L1 `missing_citation` 이 전담한다(spec L1 절). 생성 측에서 최소 개수를 강제하면
+#: L1 `missing_citation` 이 전담한다(docs/business-rules.md "L1 게이트 판정 규칙").
+#: 생성 측에서 최소 개수를 강제하면
 #: missing_citation 이 영원히 발화하지 않아 사유 분리가 무너진다.
 DRAFT_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",

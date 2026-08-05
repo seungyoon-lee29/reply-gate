@@ -1,4 +1,4 @@
-"""text-to-SQL 안전장치 1 — read-only DB 계정 (spec "text-to-SQL 안전장치" 절).
+"""text-to-SQL 안전장치 1 — read-only DB 계정 (docs/security.md "text-to-SQL 안전장치" 절).
 
 SQL 실행 계정이 SELECT 밖의 무엇도 못 한다는 것을 DB 에게 직접 물어본다. 코드의 검증
 로직(안전장치 2·3)이 뚫려도 **권한 계층이 마지막으로 막는다**는 것이 이 계정의 존재 이유이므로,
@@ -76,7 +76,7 @@ def test_readonly_account_cannot_read_processing_records(
 ) -> None:
     """방어층 하나 더 — SQL 실행 계정에는 주문 외 테이블 권한 자체를 주지 않는다.
 
-    text-to-SQL 의 조회 대상은 주문뿐이다(spec "근거 수집" 절). 안전장치 2(스키마
+    text-to-SQL 의 조회 대상은 주문뿐이다(docs/security.md "text-to-SQL 안전장치" 절). 안전장치 2(스키마
     화이트리스트)가 코드에서 막는 것을 권한이 한 번 더 막는다.
     """
     with pytest.raises(psycopg.errors.InsufficientPrivilege):

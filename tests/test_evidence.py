@@ -467,7 +467,7 @@ def test_SQL_근거의_evidence_text_에_연락처_원문이_그대로_들어간
     ro_conn: psycopg.Connection[DictRow],
     sample_order: dict[str, Any],
 ) -> None:
-    """마스킹하면 L1 PII allowlist 가 정상 에코를 오기각한다 (spec PII 정책)."""
+    """마스킹하면 L1 PII allowlist 가 정상 에코를 오기각한다 (docs/business-rules.md "PII 규칙")."""
     order_no = sample_order["order_no"]
     client = _client(
         {
@@ -777,7 +777,8 @@ def test_SQL_생성의_전송_오류는_llm_call_failed_다(
     ro_conn: psycopg.Connection[DictRow],
     sample_order: dict[str, Any],
 ) -> None:
-    """전송 오류는 SQL 실패 경로가 아니라 공통 실패 정책 소관이다 (spec)."""
+    """전송 오류는 SQL 실패 경로가 아니라 공통 실패 정책 소관이다
+    (docs/standards.md "재시도 상한")."""
     client = _client(
         {
             INTENT_STAGE: [_intent("order")],

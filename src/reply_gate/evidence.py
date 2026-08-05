@@ -1,4 +1,4 @@
-"""근거 수집 — 의도 해석[LLM] → 코드가 조회 실행 (spec 파이프라인 2~3단계).
+"""근거 수집 — 의도 해석[LLM] → 코드가 조회 실행 (docs/architecture.md "대표 흐름" 2~3단계).
 
 **조회 실행 주체는 항상 코드다.** LLM 이 하는 일은 두 가지뿐이다: 필요한 근거 소스를
 분류하는 것(`policy`/`order`/`both`)과 주문 조회 SQL **문자열을 만드는 것**. 그 문자열이
@@ -8,16 +8,17 @@ DB 에 닿을지, 몇 번 다시 만들지, 결과를 근거로 채택할지는 
 
 수집의 결과는 둘 중 하나다: **근거 목록** 또는 **초안 전 인계 사유**. 어느 쪽이든 그 시점까지
 모은 근거·토큰 사용량(생성/임베딩 분리)·SQL 실패 내역을 함께 돌려준다 — 처리 기록과 API
-응답이 그것을 쓴다(spec "API 표면" — 초안 전 인계라도 수집된 근거는 citations 에 남긴다).
+응답이 그것을 쓴다(docs/contracts.md "POST /inquiries" — 초안 전 인계라도 수집된 근거는
+citations 에 남긴다).
 
-인계 우선순위 (spec "초안 전 인계"):
+인계 우선순위 (docs/business-rules.md "근거 부족 판정"):
 
 * 주문 측의 **구조적** 사유(`missing_order_ref`·`order_not_found`·`sql_failed`)는 정책 근거를
   이미 확보했더라도 인계가 우선한다.
 * 반면 선검사를 통과한 주문에 대해 **SQL 이 정상 실행되고 0건**인 것은 구조적 실패가 아니라
   "주문 소스 근거 0건"이다 — `order` 단독이면 `no_evidence`, `both` 면 정책 근거만으로 진행한다.
 
-실패 정책 (spec "LLM 호출 공통 실패 정책" / "SQL 실패 경로"):
+실패 정책 (docs/standards.md "재시도 상한" / docs/business-rules.md "인계 사유 6종"):
 
 * **전송 오류**는 래퍼가 이미 1회 재시도했다 — `LLMCallError` 가 오면 어느 단계에서 왔든
   `llm_call_failed` 인계이고, 실패한 단계 이름을 남긴다. SQL 생성의 전송 오류도 여기에 속한다.
@@ -96,10 +97,10 @@ INTENT_STAGE: Final = "intent"
 SQL_GENERATION_STAGE: Final = "sql_generation"
 INQUIRY_EMBEDDING_STAGE: Final = "inquiry_embedding"
 
-#: 의도 해석: 최초 호출 + 형식 불일치 재시도 1회 (spec "구조화 출력 형식 불일치").
+#: 의도 해석: 최초 호출 + 형식 불일치 재시도 1회 (docs/standards.md "재시도 상한").
 INTENT_MAX_ATTEMPTS: Final = 2
 
-#: SQL 생성: 최초 호출 + 실패 피드백 재시도 1회 (spec "SQL 실패 경로").
+#: SQL 생성: 최초 호출 + 실패 피드백 재시도 1회 (docs/standards.md "재시도 상한").
 SQL_MAX_ATTEMPTS: Final = 2
 
 #: 표시용 `content` 에 싣는 SQL 결과 행 수. 원문 대조용 `evidence_text` 는 자르지 않는다.
@@ -308,8 +309,8 @@ class SqlGenerationResult:
     """SQL 생성 **1회** 호출의 결과. 재시도 여부는 호출자(수집기)가 정한다.
 
     `sql` 이 `None` 이면 유효한 SQL 을 얻지 못한 것이고 `error` 에 사유가 담긴다 —
-    spec "SQL 실패 경로"의 "LLM 의 유효 SQL 생성 실패"다. 전송 오류는 `LLMCallError` 로
-    올라간다(그건 `sql_failed` 가 아니라 `llm_call_failed`다).
+    docs/business-rules.md "인계 사유 6종"의 "LLM 의 유효 SQL 생성 실패"다.
+    전송 오류는 `LLMCallError` 로 올라간다(그건 `sql_failed` 가 아니라 `llm_call_failed`다).
     """
 
     sql: str | None
@@ -380,7 +381,7 @@ ORDER_EXISTS_SQL: Final = "SELECT 1 AS present FROM orders WHERE order_no = %s L
 
 
 def order_exists(*, conn: psycopg.Connection[DictRow], order_no: str) -> bool:
-    """해당 주문이 있는지만 확인한다 (spec 파이프라인 3단계 "주문 존재성 선검사").
+    """해당 주문이 있는지만 확인한다 (docs/architecture.md "대표 흐름" 3단계 "주문 존재성 선검사").
 
     **결과를 근거로 쓰지 않는다** — 주문 근거는 text-to-SQL 경로로만 수집한다. 이 쿼리는
     근거 ID 도 받지 않는다. `order_not_found` 를 판정하는 주체는 이 선검사뿐이다.
@@ -441,7 +442,7 @@ def _sql_evidence_texts(*, sql: str, rows: Sequence[Mapping[str, Any]]) -> tuple
 
     **`evidence_text` 는 어떤 값도 요약·마스킹하지 않는다.** L1 의 PII allowlist 가 초안의
     연락처·이메일을 이 텍스트와 대조하므로, 여기서 값을 가리면 근거에 있는 값의 정상
-    에코까지 `pii_detected` 로 오기각된다(spec PII 정책).
+    에코까지 `pii_detected` 로 오기각된다(docs/business-rules.md "PII 규칙").
     """
     header = f"실행 쿼리: {sql}\n결과 {len(rows)}건"
     return (
@@ -476,7 +477,7 @@ class SqlFailureKind(StrEnum):
 
 @dataclass(frozen=True)
 class SqlFailure:
-    """실패한 SQL 시도 1건. **근거 ID 를 받지 않는다** (spec "근거 ID 체계")."""
+    """실패한 SQL 시도 1건. **근거 ID 를 받지 않는다** (docs/contracts.md "답변 계약")."""
 
     attempt_no: int
     kind: SqlFailureKind
@@ -505,7 +506,7 @@ class EvidenceCollection:
     intent: IntentSource | None
     evidence: tuple[Evidence, ...]
     escalation_reason: EscalationReason | None
-    #: `llm_call_failed` 일 때 실패한 단계 이름 (spec "LLM 호출 공통 실패 정책").
+    #: `llm_call_failed` 일 때 실패한 단계 이름 (docs/standards.md "재시도 상한").
     failed_stage: str | None
     sql_snapshots: tuple[SqlEvidenceSnapshot, ...]
     sql_failures: tuple[SqlFailure, ...]
@@ -648,7 +649,8 @@ class EvidenceCollector:
             return EscalationReason.MISSING_ORDER_REF
         normalized = normalize_order_no(order_no)
         # 형식이 깨진 값은 참조가 없는 것과 같다 — `order_not_found` 는 형식이 맞는
-        # 주문번호에만 쓴다(spec 인계 사유 표). 정상 경로에서는 접수 단계가 먼저 막는다.
+        # 주문번호에만 쓴다(docs/business-rules.md "인계 사유 6종").
+        # 정상 경로에서는 접수 단계가 먼저 막는다.
         if not is_valid_order_no(normalized):
             return EscalationReason.MISSING_ORDER_REF
 
@@ -706,7 +708,7 @@ class EvidenceCollector:
 
             try:
                 # 조회 범위를 **선검사를 통과한 주문 1건**으로 묶는 것도 검증 단계의 일이다
-                # (spec 파이프라인 3단계). 프롬프트 문구는 그 보증이 되지 못한다.
+                # (docs/architecture.md "대표 흐름" 3단계). 프롬프트 문구는 그 보증이 되지 못한다.
                 query = validate_sql(generation.sql, order_no=order_no, max_rows=max_rows)
             except SqlGuardRejection as rejection:
                 previous_sql = generation.sql
@@ -754,7 +756,7 @@ class EvidenceCollector:
         sql: str,
         rows: tuple[dict[str, Any], ...],
     ) -> None:
-        """채택된 쿼리에만 순번과 근거 ID 를 매긴다 (spec "근거 ID 체계")."""
+        """채택된 쿼리에만 순번과 근거 ID 를 매긴다 (docs/contracts.md "답변 계약")."""
         sequence = len(ledger.snapshots) + 1
         evidence_id = sql_evidence_id(inquiry_id=inquiry_id, sequence=sequence)
         content, evidence_text = _sql_evidence_texts(sql=sql, rows=rows)

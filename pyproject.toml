@@ -13,7 +13,10 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "pgvector>=0.3",
     "openai>=1.55",
-    "sqlglot>=25.30",
+    # 상한을 박는다: SQL 검증기가 sqlglot 의 AST 노드 구조에 직접 의존하므로 메이저
+    # 업그레이드가 안전장치를 조용히 깨뜨릴 수 있다. 우회 시도 회귀 테스트가 방어선이지만,
+    # 그 방어선이 도는 것은 여기서 허용한 버전에서다. 올릴 때는 실제로 돌려서 확인한다.
+    "sqlglot>=25.30,<31",
 ]
 
 [dependency-groups]

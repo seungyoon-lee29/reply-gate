@@ -1,4 +1,4 @@
-"""FastAPI 표면 — 엔드포인트 4개와 응답 스키마 (spec "API 표면").
+"""FastAPI 표면 — 엔드포인트 4개와 응답 스키마 (docs/contracts.md).
 
 | `POST /inquiries`       | 문의 접수 + 동기 처리 |
 | `GET  /inquiries/{id}`  | 처리 기록 조회 (저장된 값에서 재구성) |
@@ -130,7 +130,7 @@ class MetricsOut(BaseModel):
 
 
 class InquiryResponse(BaseModel):
-    """spec "API 표면" 의 공통 골격. 값이 없을 때도 키는 사라지지 않는다."""
+    """docs/contracts.md "공통 규약" 의 공통 골격. 값이 없을 때도 키는 사라지지 않는다."""
 
     inquiry_id: str
     status: str

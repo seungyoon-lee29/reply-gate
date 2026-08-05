@@ -97,8 +97,13 @@ uv run python -m scripts.evaluate --live     # 측정 2 포함 — API 키 필�
 uv run python -m scripts.evaluate --stub-llm # 배관 검증용 — 실제 수치가 아니다
 ```
 
-리포트는 `reports/evaluation.md`(사람용)와 `reports/evaluation.json`(기계용)으로 나온다.
-`reports/` 는 gitignore 된다.
+리포트는 `.md`(사람용)와 `.json`(기계용)으로 나온다. **실행 종류에 따라 파일 이름이
+갈린다** — `--live` 는 `reports/evaluation-live.*` 에, 기본·대역 실행은
+`reports/evaluation.*` 에 쓴다. 라이브 실측 리포트만 저장소가 추적하고
+(`.gitignore` 가 `reports/*` 를 제외하되 `evaluation-live*` 는 남긴다), 그 밖의 리포트는
+gitignore 된다. `--report-stem` 으로 이름을 지정할 수 있지만 **실측이 아닌 실행에
+`evaluation-live` 로 시작하는 이름을 주면 거부된다** — 문서가 인용하는 근거를 덮어쓰지
+않기 위해서다(engineering-notes 의 "라이브 리포트를 기본 실행이 덮어썼다").
 
 `--live` 는 골든셋 30건을 실제 모델에 흘린다(과금·비결정론). 실행 전에 5번 단계가
 최신인지 확인한다 — 하네스는 이미 적재된 임베딩을 그대로 읽는다.

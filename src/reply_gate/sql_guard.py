@@ -1,4 +1,5 @@
-"""text-to-SQL 안전장치 2·3 — 스키마 화이트리스트 + 쿼리 검증 (spec "text-to-SQL 안전장치").
+"""text-to-SQL 안전장치 2·3 — 스키마 화이트리스트 + 쿼리 검증
+(docs/security.md "text-to-SQL 안전장치").
 
 검증은 **실행 전에 전부 끝난다.** LLM 은 SQL 문자열을 만들 뿐이고, 그 문자열이 DB 에 닿을지는
 이 모듈이 정한다. 통과한 쿼리도 실행은 SELECT 권한만 가진 계정(`db.readonly_connect`)으로만
@@ -7,7 +8,7 @@
 파싱은 `sqlglot` 으로 한다. 정규식으로 훑으면 주석 안에 숨긴 문장(`-- ; DROP ...`)과
 data-modifying CTE(`WITH x AS (INSERT ...) SELECT ...`)를 놓친다 — 둘 다 여기서 실제로 막는다.
 
-이 모듈이 실행 전에 확인하는 것 (spec "하드 게이트 3" — 데이터 접근은 항상 코드가 통제):
+이 모듈이 실행 전에 확인하는 것 (docs/standards.md "하드 게이트" — 데이터 접근은 항상 코드가 통제):
 
 1. **단일 읽기 전용 SELECT** — DML/DDL·다중문·주석·`SELECT ... INTO`·잠금 절(`FOR UPDATE`)을
    거부한다. 잠금 절은 read-only 계정 권한으로도 막히지만 그건 실행 시점이라 재시도 1회를
@@ -19,15 +20,16 @@ data-modifying CTE(`WITH x AS (INSERT ...) SELECT ...`)를 놓친다 — 둘 다
 3. **함수 허용 목록** — `pg_sleep` 같은 호출이 실행 시간을 무한정 잡는 것을 막는다.
    (권한이 필요한 함수는 안전장치 1이 막지만, 가용성은 권한이 막아주지 않는다.)
 4. **주문 1건 한정** — 생성된 쿼리가 **선검사를 통과한 주문번호 1건**으로 한정됨을 AST 로
-   확인한다 (spec "파이프라인 3단계" — 선검사를 통과한 주문에 대해 조회). 어떤 행이 나올지를
-   LLM 이 정하게 두면 무관한 고객의 연락처가 근거로 채택되고, L1 의 PII allowlist 가 그것을
-   정상 에코로 허용한다. 조인 종류도 여기서 읽는다 — **외부 조인의 ON 절은 보존측 테이블을
-   거르지 않으므로** 한정 조건으로 인정할 수 없다(아래 `_check_joins`·`_is_inner_join`).
+   확인한다 (docs/architecture.md "대표 흐름" — 선검사를 통과한 주문에 대해 조회).
+   어떤 행이 나올지를 LLM 이 정하게 두면 무관한 고객의 연락처가 근거로 채택되고,
+   L1 의 PII allowlist 가 그것을 정상 에코로 허용한다. 조인 종류도 여기서 읽는다 —
+   **외부 조인의 ON 절은 보존측 테이블을 거르지 않으므로** 한정 조건으로 인정할 수 없다
+   (아래 `_check_joins`·`_is_inner_join`).
 5. **결과 행 수 상한** — 거부가 아니라 LIMIT 을 강제한다.
 
 거부 규칙은 `SqlGuardRule` 이 전부이고, 거부 사유는 SQL 재생성 프롬프트에 그대로 실린다
-(spec "SQL 실패 경로" — 오류 내용을 피드백으로 1회 재시도). 그러므로 사유 메시지는 **무엇을
-어떻게 고쳐야 하는지**를 담아야 한다.
+(docs/standards.md "재시도 상한" — 오류 내용을 피드백으로 1회 재시도). 그러므로 사유
+메시지는 **무엇을 어떻게 고쳐야 하는지**를 담아야 한다.
 """
 
 from __future__ import annotations
@@ -60,7 +62,8 @@ __all__ = [
 #: 파싱·생성 대상 방언. 실행 대상이 Postgres 이므로 검증도 같은 방언으로 읽는다.
 DIALECT: Final = "postgres"
 
-#: text-to-SQL 의 유일한 조회 대상 (spec "근거 수집" 절 — 주문 근거만 SQL 로 모은다).
+#: text-to-SQL 의 유일한 조회 대상 — 주문 근거만 SQL 로 모은다
+#: (docs/security.md "text-to-SQL 안전장치").
 ORDERS_TABLE: Final = "orders"
 
 #: 조회 범위를 주문 1건으로 묶는 컬럼. 선검사(`evidence.order_exists`)가 쓰는 것과 같다.

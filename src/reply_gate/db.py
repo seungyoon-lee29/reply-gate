@@ -1,6 +1,6 @@
 """Postgres 커넥션 헬퍼 — 애플리케이션 계정과 read-only 계정을 분리해서 연다.
 
-spec "text-to-SQL 안전장치" 1번(read-only DB 계정)의 코드 쪽 진입점이다. text-to-SQL
+docs/security.md "text-to-SQL 안전장치" 1번(read-only DB 계정)의 코드 쪽 진입점이다. text-to-SQL
 실행 경로는 반드시 `readonly_connect()` 를 쓴다 — 권한 자체가 SELECT 뿐이라 실수로
 쓰기 경로를 타도 DB 가 거부한다.
 

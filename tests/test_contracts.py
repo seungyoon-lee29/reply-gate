@@ -1,4 +1,4 @@
-"""사이클 간 계약이 spec 대로 유지되는지 지키는 테스트."""
+"""사이클 간 계약이 docs/contracts.md "답변 계약" 대로 유지되는지 지키는 테스트."""
 
 from __future__ import annotations
 

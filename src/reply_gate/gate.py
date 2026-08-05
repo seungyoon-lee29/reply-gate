@@ -1,7 +1,7 @@
 """L1 게이트 — 근거 없는 답변을 코드로 기각한다.
 
-spec "L1 게이트 검사 규칙" 을 그대로 옮긴 모듈이다. 제품 정체성이 실제로 구현되는 곳이므로
-아래 두 성질은 어떤 편의로도 깨지 않는다.
+docs/business-rules.md "L1 게이트 판정 규칙" 을 그대로 옮긴 모듈이다. 제품 정체성이
+실제로 구현되는 곳이므로 아래 두 성질은 어떤 편의로도 깨지 않는다.
 
 * **LLM 호출 0회.** 이 모듈은 LLM·네트워크 라이브러리를 import 하지 않는다.
 * **100% 결정론.** 시간·난수·환경에 의존하지 않는다 — 같은 입력은 항상 같은 판정과
@@ -89,7 +89,8 @@ DEFAULT_PII_PATTERNS: tuple[PiiPattern, ...] = (
         regex=re.compile(r"(?<![0-9])0[2-9][0-9]?[-. ]?[0-9]{3,4}[-. ]?[0-9]{4}(?![0-9])"),
         normalize=normalize_digits,
     ),
-    # 15xx/16xx/17xx/18xx 대표번호. 개인 연락처는 아니지만 spec "데이터" 절의 미끼 조항이
+    # 15xx/16xx/17xx/18xx 대표번호. 개인 연락처는 아니지만
+    # docs/business-rules.md "평가용 데이터의 지위" 의 미끼 조항이
     # 겨냥하는 값이 바로 이것이다 — 고객센터 번호를 비워 둔 조항을 근거로 받고 모델이
     # 일반 지식으로 번호를 채우면 `pii_detected` 로 걸려야 한다. 빼면 미끼가 무력해진다.
     PiiPattern(
@@ -187,7 +188,7 @@ def _inspect_schema(raw_draft: object) -> _SchemaInspection:
     """구조(필수 키·타입·claims 비어 있음)까지만 본다.
 
     **`citation_ids` 최소 개수 제약을 여기에 넣지 않는다.** 넣으면 `missing_citation` 이
-    영원히 발화하지 않아 사유 분리가 무너진다(spec L1 절 각주).
+    영원히 발화하지 않아 사유 분리가 무너진다(docs/business-rules.md "L1 게이트 판정 규칙").
 
     스키마에 없는 추가 키는 위반으로 보지 않는다 — 답변 계약은 다음 사이클 L2 가 이어받아
     확장할 계약이고, 추가 키는 claim 이 근거를 딛고 섰는지와 무관하기 때문이다.
@@ -240,7 +241,8 @@ def _collect_texts(value: object, *, depth: int = 0) -> list[str]:
     claim 의 text 만 보지 않는 이유: 형식이 깨진 초안(원문 문자열, 엉뚱한 키)에서도
     PII 는 새어 나갈 수 있고, L1 은 그때도 검사해야 한다.
 
-    **`citation_ids` 는 제외한다.** spec 의 검사 대상은 "초안 텍스트" — 최종 사용자에게
+    **`citation_ids` 는 제외한다.** docs/business-rules.md "PII 규칙" 의 검사 대상은
+    "초안 텍스트" — 최종 사용자에게
     보여줄 답변이다. 근거 ID 는 답변 문장이 아니라 식별자이고, `sql:<문의 UUID>:<순번>`
     형식이라 UUID 의 16진 숫자 구간이 전화번호 패턴에 우연히 걸린다. 근거 ID 는
     `evidence_text` 에 들어가지 않으므로 allowlist 에도 오르지 않아, 그대로 두면

@@ -1,4 +1,4 @@
-"""text-to-SQL 안전장치 2·3 단위 테스트 (spec "text-to-SQL 안전장치" 절).
+"""text-to-SQL 안전장치 2·3 단위 테스트 (docs/security.md "text-to-SQL 안전장치" 절).
 
 여기서 검증하는 것은 **실행 전에 끝나는 코드 검증**이다. DB 권한(안전장치 1)은
 `tests/test_db_readonly.py` 가, 실행 시간 상한(read-only 커넥션의 `statement_timeout`)은
