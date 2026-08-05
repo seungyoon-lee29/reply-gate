@@ -1,4 +1,4 @@
-"""근거 수집 — 의도 해석[LLM] → 코드가 조회 실행 (docs/architecture.md "대표 흐름" 2~3단계).
+"""근거 수집 — 의도 해석[LLM] → 코드가 조회 실행 (docs/architecture.md "대표 흐름" 3단계).
 
 **조회 실행 주체는 항상 코드다.** LLM 이 하는 일은 두 가지뿐이다: 필요한 근거 소스를
 분류하는 것(`policy`/`order`/`both`)과 주문 조회 SQL **문자열을 만드는 것**. 그 문자열이
@@ -309,7 +309,7 @@ class SqlGenerationResult:
     """SQL 생성 **1회** 호출의 결과. 재시도 여부는 호출자(수집기)가 정한다.
 
     `sql` 이 `None` 이면 유효한 SQL 을 얻지 못한 것이고 `error` 에 사유가 담긴다 —
-    docs/business-rules.md "인계 사유 6종"의 "LLM 의 유효 SQL 생성 실패"다.
+    `sql_failed`(생성 실패) 경로다 — docs/business-rules.md "인계 사유 6종".
     전송 오류는 `LLMCallError` 로 올라간다(그건 `sql_failed` 가 아니라 `llm_call_failed`다).
     """
 
@@ -381,7 +381,8 @@ ORDER_EXISTS_SQL: Final = "SELECT 1 AS present FROM orders WHERE order_no = %s L
 
 
 def order_exists(*, conn: psycopg.Connection[DictRow], order_no: str) -> bool:
-    """해당 주문이 있는지만 확인한다 (docs/architecture.md "대표 흐름" 3단계 "주문 존재성 선검사").
+    """해당 주문이 있는지만 확인한다 — 대표 흐름 3단계의 존재성 선검사
+    (docs/architecture.md "구성요소 지도").
 
     **결과를 근거로 쓰지 않는다** — 주문 근거는 text-to-SQL 경로로만 수집한다. 이 쿼리는
     근거 ID 도 받지 않는다. `order_not_found` 를 판정하는 주체는 이 선검사뿐이다.
@@ -506,7 +507,7 @@ class EvidenceCollection:
     intent: IntentSource | None
     evidence: tuple[Evidence, ...]
     escalation_reason: EscalationReason | None
-    #: `llm_call_failed` 일 때 실패한 단계 이름 (docs/standards.md "재시도 상한").
+    #: `llm_call_failed` 일 때 실패한 단계 이름 (docs/business-rules.md "인계 사유 6종").
     failed_stage: str | None
     sql_snapshots: tuple[SqlEvidenceSnapshot, ...]
     sql_failures: tuple[SqlFailure, ...]

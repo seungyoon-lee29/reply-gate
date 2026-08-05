@@ -1,7 +1,7 @@
 #!/bin/bash
 # 컨테이너 최초 기동 시 1회 실행된다 (docker-entrypoint-initdb.d, superuser 권한).
 #
-# 계정 2개를 만든다 (spec "저장" 절 — 애플리케이션 계정과 text-to-SQL 실행용 read-only 계정 분리):
+# 계정 2개를 만든다 (docs/security.md "text-to-SQL 안전장치" 1층 — 계정 분리):
 #   * 앱 계정      — public 스키마에 객체를 만들고 읽고 쓴다.
 #   * read-only 계정 — NOLOGIN 그룹 `reply_gate_readers` 의 멤버로서 SELECT 만 상속받는다.
 #     테이블 단위 SELECT 부여는 `db/schema.sql` 이 그 그룹에 한다(계정 이름이 환경 변수라

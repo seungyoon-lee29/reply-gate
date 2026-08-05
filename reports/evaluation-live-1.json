@@ -8,8 +8,8 @@
     "top_k": 5,
     "l1_fixture_count": 27,
     "golden_case_count": 30,
-    "l1_fixtures_path": "/Users/ian/workspace/reply-gate/data/l1_fixtures.jsonl",
-    "golden_set_path": "/Users/ian/workspace/reply-gate/data/golden_set.jsonl",
+    "l1_fixtures_path": "data/l1_fixtures.jsonl",
+    "golden_set_path": "data/golden_set.jsonl",
     "api_key_present": true,
     "measurement2_is_real": true
   },

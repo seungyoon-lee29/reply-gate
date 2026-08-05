@@ -1,4 +1,4 @@
-# Reply-Gate 로컬 개발 DB — Postgres + pgvector 컨테이너 1개 (spec "저장" 절).
+# Reply-Gate 로컬 개발 DB — Postgres + pgvector 컨테이너 1개 (docs/operations.md "DB 기동").
 #
 # 사용:
 #   docker compose up -d          # 기동 (healthy 까지 기다리려면 --wait)

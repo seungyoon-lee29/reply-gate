@@ -70,7 +70,7 @@ def _status_error(status_code: int) -> openai.APIStatusError:
 
 
 def test_sdk_자동재시도를_끈다() -> None:
-    """래퍼 재시도와 SDK 재시도가 중첩되면 스펙의 '1회 재시도'가 깨진다."""
+    """래퍼 재시도와 SDK 재시도가 중첩되면 docs/standards.md "재시도 상한"이 깨진다."""
     client = OpenAIGenerationClient(api_key="test", model="gpt-5.6-terra")
     assert client._client.max_retries == 0
 

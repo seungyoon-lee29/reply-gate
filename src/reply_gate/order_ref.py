@@ -2,7 +2,7 @@
 
 정규식·검증·생성 규칙이 여기 한 곳에만 있다. 데이터 시딩(`scripts.seed_orders`)과
 접수 검증이 같은 정의를 import 해서 쓰고, 어디서도 형식을 다시 정의하지 않는다
-(docs/contracts.md "POST /inquiries" 절 — "주문번호 형식의 정의는 코드 한 곳에 두고 데이터 시딩과
+(docs/standards.md "소유권" — "주문번호 형식의 정의는 코드 한 곳에 두고 데이터 시딩과
 접수 검증이 같은 정의를 공유한다").
 
 형식: ``ORD-YYYYMMDD-NNNN``

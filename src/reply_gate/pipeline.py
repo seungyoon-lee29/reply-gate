@@ -127,7 +127,7 @@ def new_inquiry_id() -> str:
 
 @dataclass(frozen=True)
 class AttemptRecord:
-    """초안 1건에 대한 L1 판정 (docs/business-rules.md "상태 전이" — 최대 2건)."""
+    """초안 1건에 대한 L1 판정 (docs/business-rules.md "엔티티와 관계" — 문의당 최대 2건)."""
 
     attempt_no: int
     verdict: Verdict
@@ -224,9 +224,10 @@ class InquiryPipeline:
         app_conn: psycopg.Connection[DictRow],
         readonly_conn: psycopg.Connection[DictRow],
     ) -> ProcessedInquiry:
-        """docs/architecture.md "대표 흐름" 2~6단계를 순서대로 실행한다.
+        """docs/architecture.md "대표 흐름" 3~7단계를 순서대로 실행한다.
 
-        1단계 접수는 `accept_inquiry` 가 맡는다.
+        1단계 접수는 `accept_inquiry`, 2단계 문의 ID 생성은 호출자의 `new_inquiry_id`,
+        8단계 저장은 `records.py`, 9단계 응답 조립은 `api.py` 가 맡는다.
 
         `latency_ms` 는 이 메서드 전체의 벽시계 시간이다 — 처리 기록 저장(`records.py`)은
         측정에 포함하지 않는다. 평가 지표(p50/p95)가 재는 것은 **문의 처리**이지 저장이
@@ -274,7 +275,7 @@ class InquiryPipeline:
             started=started,
         )
 
-    # ── 4~6단계: 초안 생성 → L1 → 종결 ──────────────────────────────────────
+    # ── 5~7단계: 초안 생성 → L1 → 종결 ──────────────────────────────────────
 
     @dataclass(frozen=True)
     class _LoopOutcome:

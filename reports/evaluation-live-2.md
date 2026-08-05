@@ -9,8 +9,8 @@
 - 생성 LLM: OpenAI `gpt-5.6-terra` (effort=기본값)
 - 임베딩: OpenAI `text-embedding-3-small` (1536차원)
 - 유사도 임계값: 0.3 / top k: 5
-- L1 픽스처: 27건 (`/Users/ian/workspace/reply-gate/data/l1_fixtures.jsonl`)
-- 골든셋: 30건 (`/Users/ian/workspace/reply-gate/data/golden_set.jsonl`)
+- L1 픽스처: 27건 (`data/l1_fixtures.jsonl`)
+- 골든셋: 30건 (`data/golden_set.jsonl`)
 - OPENAI_API_KEY 설정 여부: 설정됨
 
 ## 목표치

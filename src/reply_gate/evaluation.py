@@ -1,4 +1,5 @@
-"""평가 하네스 — 결정론 층과 확률 층을 **분리해서** 측정한다 (scripts/AGENTS.md "불변식" 절).
+"""평가 하네스 — 결정론 층과 확률 층을 **분리해서** 측정한다
+(docs/tracking/decisions/0001-게이트를-2층으로-나눈다.md 의 층 분리가 측정에도 이어진다).
 
 두 측정은 서로의 수치를 오염시키지 않는다. 그것이 이 모듈의 존재 이유다.
 
@@ -48,6 +49,8 @@ __all__ = [
     "DEFAULT_GOLDEN_SET_PATH",
     "DEFAULT_L1_FIXTURES_PATH",
     "DEFAULT_REPORT_DIR",
+    "DEFAULT_REPORT_STEM",
+    "LIVE_REPORT_STEM",
     "REASON_ORDER",
     "TARGETS",
     "EvaluationReport",
@@ -61,16 +64,21 @@ __all__ = [
     "PipelineAgreement",
     "PipelineRunning",
     "ReasonBreakdown",
+    "ReportStemError",
     "RunConditions",
     "SkippedMeasurement",
     "StubGenerationClient",
+    "TargetAssessment",
+    "assess_targets",
     "build_report",
+    "display_path",
     "load_golden_set",
     "load_l1_fixtures",
     "measure_gate_accuracy",
     "measure_pipeline_agreement",
     "render_markdown",
     "report_to_json",
+    "resolve_report_stem",
     "write_report",
 ]
 
@@ -81,8 +89,105 @@ DEFAULT_GOLDEN_SET_PATH: Final = _ROOT / "data" / "golden_set.jsonl"
 #: 저장소의 L1 픽스처 셋 — 고정 초안+근거 쌍(LLM 호출 없음).
 DEFAULT_L1_FIXTURES_PATH: Final = _ROOT / "data" / "l1_fixtures.jsonl"
 #: 리포트 산출 위치. `evaluation-live*` 만 저장소가 추적하고 나머지는 gitignore 된다
-#: (라이브 실측은 재생성에 과금이 들어 근거로 커밋한다 — `scripts/evaluate.py`).
+#: (라이브 실측은 재생성에 과금이 들어 근거로 커밋한다 — `resolve_report_stem`).
 DEFAULT_REPORT_DIR: Final = _ROOT / "reports"
+
+#: 기본 실행(측정 2 미실행)과 대역 실행이 쓰는 리포트 이름.
+DEFAULT_REPORT_STEM: Final = "evaluation"
+
+#: 라이브 실측이 쓰는 리포트 이름 접두. 이 접두로 시작하는 리포트만 저장소가 추적한다.
+LIVE_REPORT_STEM: Final = "evaluation-live"
+
+
+class ReportStemError(ValueError):
+    """리포트 이름이 라이브 실측 보존 계약을 어긴다 — **측정을 시작하기 전에** 거부한다."""
+
+
+def display_path(path: Path) -> str:
+    """리포트에 남길 경로 — 저장소 안이면 상대 경로로 적는다.
+
+    커밋되는 라이브 리포트에 절대 경로가 실리면 개발 머신의 사용자명·디렉터리 구조가
+    저장소에 남는다. 측정 데이터가 아닌 환경 정보라 상대화해도 재현성을 해치지 않는다.
+    """
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(_ROOT))
+    except ValueError:
+        return str(resolved)
+
+
+def _next_free_live_stem(out_dir: Path) -> str:
+    """제안용 — 비어 있는 `evaluation-live-N` 이름을 찾는다."""
+    n = 1
+    while any((out_dir / f"{LIVE_REPORT_STEM}-{n}{ext}").exists() for ext in (".md", ".json")):
+        n += 1
+    return f"{LIVE_REPORT_STEM}-{n}"
+
+
+def resolve_report_stem(
+    *,
+    requested: str | None,
+    live_requested: bool,
+    measurement2_is_real: bool,
+    out_dir: Path,
+) -> str:
+    """리포트 이름을 확정한다 — 라이브 실측 산출물을 잃지 않게 막는 유일한 자리다.
+
+    규칙은 양방향이다: **라이브 이름 ⇔ 실측.**
+
+    * 실측이 아닌 실행(측정 2 미실행·대역)은 라이브 이름을 쓸 수 없다. `--live` 를 줬어도
+      키·DB 문제로 측정 2 가 미실행이면 비실측이므로 기본 이름은 `evaluation` 으로 떨어진다.
+    * 실측(과금) 실행은 라이브 이름만 쓸 수 있다 — 실측 결과가 gitignore 되는 이름으로
+      새어 나가 다음 기본 실행에 덮이는 것을 막는다.
+    * 실측 실행은 **이미 존재하는 라이브 리포트를 덮어쓸 수 없다** — 비결정론이라 덮인
+      수치는 재생성되지 않는다. 비어 있는 이름을 제안한다.
+    * 이름은 경로가 아니라 **파일 이름 조각**이어야 한다 — `./`·`../`·절대경로로 검사를
+      우회해 같은 파일명에 쓰는 것을 막는다. 대소문자 변형(macOS 기본 FS 는 대소문자
+      무시)도 라이브 이름으로 취급한다.
+
+    실행 전에 호출해야 한다: 여기서 거부되면 과금도 측정도 시작되지 않아야 한다.
+    """
+    if requested is None:
+        stem = LIVE_REPORT_STEM if measurement2_is_real else DEFAULT_REPORT_STEM
+    else:
+        stem = requested
+        if (
+            not stem
+            or stem != stem.strip()
+            or stem.startswith(".")
+            or "/" in stem
+            or "\\" in stem
+            or stem != Path(stem).name
+        ):
+            raise ReportStemError(
+                f"거부: --report-stem 은 경로가 아니라 파일 이름 조각이어야 한다: {stem!r}"
+            )
+
+    #: 대소문자 무시 파일시스템에서 `Evaluation-live` 는 라이브 리포트와 같은 파일이다.
+    is_live_name = stem.casefold().startswith(LIVE_REPORT_STEM)
+
+    if is_live_name and not measurement2_is_real:
+        raise ReportStemError(
+            f"거부: `{stem}` 은 라이브 실측 리포트 이름인데 이 실행은 실측이 아니다"
+            f"(측정 2 미실행 또는 대역). 라이브 산출물을 덮어쓰면 문서가 인용하는 수치의 "
+            f"근거가 사라진다. 다른 --report-stem 을 쓰거나 기본값(`{DEFAULT_REPORT_STEM}`)을 쓰라."
+        )
+    if measurement2_is_real and not stem.startswith(LIVE_REPORT_STEM):
+        raise ReportStemError(
+            f"거부: 실측(과금) 실행이 `{stem}` 에 쓰면 산출물이 gitignore 되어 다음 기본 "
+            f"실행에 덮인다 — 실제로 한 번 그렇게 잃었다. `{LIVE_REPORT_STEM}` 로 시작하는 "
+            f"이름을 쓰라."
+        )
+    if measurement2_is_real:
+        candidates = (out_dir / f"{stem}{ext}" for ext in (".md", ".json"))
+        existing = [path for path in candidates if path.exists()]
+        if existing:
+            raise ReportStemError(
+                f"거부: {existing[0]} 이 이미 있다 — 실측은 비결정론이라 덮이면 그 수치는 "
+                f"재생성되지 않는다. 비어 있는 이름을 쓰라 (예: "
+                f"--report-stem {_next_free_live_stem(out_dir)})."
+            )
+    return stem
 
 
 # ══ 측정 1 — L1 게이트 단위 정확도 (결정론, LLM 호출 0회) ═══════════════════
@@ -637,6 +742,9 @@ class MetricTarget:
     #: 경계값(비율). `at_most` 면 이하가 달성, 아니면 이상이 달성.
     bound: float
     at_most: bool = False
+    #: 확률 층 지표인가. 대역 실행의 값으로는 판정하지 않는다 — 대역 수치를 실제 수치처럼
+    #: "달성"으로 찍으면 리포트가 거짓말을 한다(scripts/AGENTS.md 불변식 6과 같은 규칙).
+    probabilistic: bool = False
 
     def met(self, value: float | None) -> bool | None:
         """달성 여부. **측정하지 않았으면 `None`** — 미측정을 미달로 적지 않는다."""
@@ -646,10 +754,11 @@ class MetricTarget:
 
     def describe(self) -> str:
         """경계만 적는다 — 표에서 이름은 옆 칸이 이미 들고 있다."""
-        return f"{'≤' if self.at_most else '≥'} {self.bound * 100:.0f}%"
+        return f"{'≤' if self.at_most else '≥'} {self.bound * 100:g}%"
 
 
-#: 지표 목표치 — 2026-08-05 확정(`docs/tracking/decisions/0006`).
+#: 지표 목표치 — 2026-08-05 확정
+#: (`docs/tracking/decisions/0006-지표-목표치를-실측-뒤에-확정한다.md`).
 #:
 #: L1 두 지표는 **결정론 층**이라 100%/0% 를 목표로 박을 수 있다: 픽스처가 고정이고
 #: 게이트가 LLM 을 부르지 않으므로 달성은 재현되며, 미달은 곧 회귀다.
@@ -663,8 +772,25 @@ TARGETS: Final[tuple[MetricTarget, ...]] = (
         bound=0.0,
         at_most=True,
     ),
-    MetricTarget(key="match_rate", label="측정 2 허용 결과 집합 대비 일치율", bound=0.75),
+    MetricTarget(
+        key="match_rate",
+        label="측정 2 허용 결과 집합 대비 일치율",
+        bound=0.75,
+        probabilistic=True,
+    ),
 )
+
+
+@dataclass(frozen=True)
+class TargetAssessment:
+    """목표치 1개의 판정 결과 — 마크다운 표·JSON·콘솔 요약이 같은 원본을 쓴다."""
+
+    target: MetricTarget
+    value: float | None
+    #: 판정하지 않았으면(미측정·대역) `None`.
+    met: bool | None
+    #: 사람용 판정 문구: 달성 | 미달 | 미측정 | 대역 — 판정 없음.
+    verdict: str
 
 
 @dataclass(frozen=True)
@@ -684,6 +810,30 @@ class EvaluationReport:
                 None if isinstance(self.pipeline, SkippedMeasurement) else self.pipeline.match_rate
             ),
         }
+
+
+def assess_targets(report: EvaluationReport) -> tuple[TargetAssessment, ...]:
+    """목표치 전부를 판정한다. **미측정·대역은 미달도 달성도 아니다.**"""
+    measured = report.measured()
+    assessments: list[TargetAssessment] = []
+    for target in TARGETS:
+        value = measured[target.key]
+        if value is None:
+            assessments.append(
+                TargetAssessment(target=target, value=None, met=None, verdict="미측정")
+            )
+            continue
+        if target.probabilistic and not report.conditions.measurement2_is_real:
+            # 대역 값은 존재하지만 판정에 쓰지 않는다 — 값 자체는 배관 검증용으로만 남긴다.
+            assessments.append(
+                TargetAssessment(target=target, value=value, met=None, verdict="대역 — 판정 없음")
+            )
+            continue
+        met = target.met(value)
+        assessments.append(
+            TargetAssessment(target=target, value=value, met=met, verdict="달성" if met else "미달")
+        )
+    return tuple(assessments)
 
 
 def build_report(
@@ -761,21 +911,22 @@ def render_markdown(report: EvaluationReport) -> str:
 
 
 def _render_targets(report: EvaluationReport) -> list[str]:
-    """목표치 대비 표. **미측정은 미달이 아니다** — 그렇게 적으면 리포트가 거짓말을 한다."""
-    measured = report.measured()
+    """목표치 대비 표. **미측정·대역은 미달이 아니다** — 그렇게 적으면 리포트가 거짓말을 한다."""
     lines = [
         "## 목표치 대비",
         "",
-        "2026-08-05 확정(`docs/tracking/decisions/0006`). 미측정 지표는 판정하지 않는다.",
+        "2026-08-05 확정(`docs/tracking/decisions/0006-지표-목표치를-실측-뒤에-확정한다.md`).",
+        "미측정 지표와 대역으로 낸 확률 층 수치는 판정하지 않는다.",
         "",
         "| 지표 | 목표 | 실측 | 판정 |",
         "| --- | --- | ---: | :---: |",
     ]
-    for target in TARGETS:
-        value = measured[target.key]
-        met = target.met(value)
-        verdict = "미측정" if met is None else ("달성" if met else "**미달**")
-        lines.append(f"| {target.label} | {target.describe()} | {_pct(value)} | {verdict} |")
+    for item in assess_targets(report):
+        value_cell = "미측정" if item.value is None else _pct(item.value)
+        verdict_cell = "**미달**" if item.verdict == "미달" else item.verdict
+        lines.append(
+            f"| {item.target.label} | {item.target.describe()} | {value_cell} | {verdict_cell} |"
+        )
     lines.append("")
     return lines
 
@@ -923,18 +1074,19 @@ def report_to_json(report: EvaluationReport) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "targets": {
             "decided_at": "2026-08-05",
-            "decision": "docs/tracking/decisions/0006",
+            "decision": "docs/tracking/decisions/0006-지표-목표치를-실측-뒤에-확정한다.md",
             "metrics": [
                 {
-                    "key": target.key,
-                    "label": target.label,
-                    "bound": target.bound,
-                    "direction": "at_most" if target.at_most else "at_least",
-                    "measured": report.measured()[target.key],
-                    #: 미측정이면 null — 돌지 않은 측정을 미달로 적지 않는다.
-                    "met": target.met(report.measured()[target.key]),
+                    "key": item.target.key,
+                    "label": item.target.label,
+                    "bound": item.target.bound,
+                    "direction": "at_most" if item.target.at_most else "at_least",
+                    "measured": item.value,
+                    # 미측정·대역이면 null — 판정하지 않은 것을 미달로도 달성으로도 적지 않는다.
+                    "met": item.met,
+                    "verdict": item.verdict,
                 }
-                for target in TARGETS
+                for item in assess_targets(report)
             ],
         },
         "conditions": {

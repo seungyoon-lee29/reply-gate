@@ -1,4 +1,5 @@
--- Reply-Gate 스키마 — 주문 / 정책 청크(+벡터) / 처리 기록이 한 DB 에 산다 (spec "저장" 절).
+-- Reply-Gate 스키마 — 주문 / 정책 청크(+벡터) / 처리 기록이 한 DB 에 산다
+-- (docs/architecture.md "전체 구성").
 --
 -- 적용 주체는 **애플리케이션 계정**이다 (`reply_gate.db.apply_schema`). 그래야 테이블 소유자가
 -- 앱 계정이 되고, 앱 계정이 read-only 그룹에 SELECT 를 줄 수 있다.
@@ -50,7 +51,8 @@ CREATE INDEX IF NOT EXISTS orders_ordered_at_idx ON orders (ordered_at);
 CREATE INDEX IF NOT EXISTS orders_customer_phone_idx ON orders (customer_phone);
 
 -- ── 정책 조항 청크 + 벡터 ────────────────────────────────────────────────────
--- 청킹 단위는 **조항**이다 (spec "데이터" 절). 임베딩은 scripts.index_policies 가 채운다 — 여기서는
+-- 청킹 단위는 **조항**이다 (docs/architecture.md "구성요소 지도" 의 policy_index 행).
+-- 임베딩은 scripts.index_policies 가 채운다 — 여기서는
 -- 컬럼과 인덱스만 만든다. 차원 1536 은 `Settings.embedding_dimensions` 와 같아야 한다.
 CREATE TABLE IF NOT EXISTS policy_chunks (
     id              bigint GENERATED ALWAYS AS IDENTITY,
@@ -76,12 +78,12 @@ CREATE INDEX IF NOT EXISTS policy_chunks_embedding_idx
     ON policy_chunks USING hnsw (embedding vector_cosine_ops);
 
 -- ── 처리 기록 1 — 문의 ───────────────────────────────────────────────────────
--- 평가 지표(p50/p95 지연, 건당 토큰 비용)의 원천이다 (spec "저장"·"평가" 절).
+-- 평가 지표(p50/p95 지연, 건당 토큰 비용)의 원천이다 (docs/business-rules.md "엔티티와 관계").
 -- 생성 계열 토큰과 임베딩 토큰을 **분리해서** 기록한다.
 CREATE TABLE IF NOT EXISTS inquiries (
     id                 uuid        NOT NULL DEFAULT gen_random_uuid(),
     -- 주문 테이블로의 FK 를 두지 않는다: 존재하지 않는 주문번호도 접수되어야
-    -- `order_not_found` 인계 경로가 처리 기록에 남는다 (spec "초안 전 인계" 절).
+    -- `order_not_found` 인계 경로가 처리 기록에 남는다 (docs/business-rules.md "엔티티와 관계").
     order_no           text,
     content            text        NOT NULL,
     intent_source      text,
@@ -89,7 +91,7 @@ CREATE TABLE IF NOT EXISTS inquiries (
     answer             text,
     claims             jsonb       NOT NULL DEFAULT '[]'::jsonb,
     escalation_reason  text,
-    -- `llm_call_failed` 일 때 실패한 단계 이름 (spec "LLM 호출 공통 실패 정책").
+    -- `llm_call_failed` 일 때 실패한 단계 이름 (docs/business-rules.md "인계 사유 6종").
     failed_stage       text,
     latency_ms         integer     NOT NULL,
     input_tokens       integer     NOT NULL DEFAULT 0,
@@ -143,7 +145,7 @@ CREATE TABLE IF NOT EXISTS inquiry_attempts (
     CONSTRAINT inquiry_attempts_inquiry_fkey
         FOREIGN KEY (inquiry_id) REFERENCES inquiries (id) ON DELETE CASCADE,
     CONSTRAINT inquiry_attempts_inquiry_attempt_key UNIQUE (inquiry_id, attempt_no),
-    -- 루프 상한(재생성 1회)을 DB 도 강제한다 (spec "종결 [코드]").
+    -- 루프 상한(재생성 1회)을 DB 도 강제한다 (docs/standards.md "재시도 상한").
     CONSTRAINT inquiry_attempts_attempt_no_range CHECK (attempt_no BETWEEN 1 AND 2),
     -- `reply_gate.contracts.Verdict`
     CONSTRAINT inquiry_attempts_verdict_enum CHECK (verdict IN ('pass', 'reject')),
@@ -162,7 +164,7 @@ CREATE TABLE IF NOT EXISTS inquiry_attempts (
 CREATE INDEX IF NOT EXISTS inquiry_attempts_inquiry_idx ON inquiry_attempts (inquiry_id);
 
 -- ── 처리 기록 3 — 근거 스냅샷 ────────────────────────────────────────────────
--- SQL 근거는 **실행된 쿼리문과 결과 행 전체**를 영속화한다 (spec "근거 ID 체계").
+-- SQL 근거는 **실행된 쿼리문과 결과 행 전체**를 영속화한다 (docs/contracts.md "답변 계약").
 -- 감사·재현·차기 L2 claim 대조가 모두 이 스냅샷 위에 선다.
 CREATE TABLE IF NOT EXISTS inquiry_evidence (
     id             bigint      GENERATED ALWAYS AS IDENTITY,
@@ -210,7 +212,7 @@ CREATE INDEX IF NOT EXISTS inquiry_evidence_inquiry_idx ON inquiry_evidence (inq
 
 -- ── 처리 기록 4 — SQL 실패 내역 ──────────────────────────────────────────────
 -- 안전장치에 거부되거나 실행에 실패한 쿼리는 **근거 ID 없이** 쿼리문·오류만 남긴다
--- (spec "근거 ID 체계" / "SQL 실패 경로").
+-- (docs/contracts.md "답변 계약" / docs/business-rules.md "인계 사유 6종").
 CREATE TABLE IF NOT EXISTS inquiry_sql_failures (
     id            bigint      GENERATED ALWAYS AS IDENTITY,
     inquiry_id    uuid        NOT NULL,
@@ -242,7 +244,7 @@ CREATE INDEX IF NOT EXISTS inquiry_sql_failures_inquiry_idx ON inquiry_sql_failu
 -- 환경 변수여도 이 정적 DDL 이 권한을 부여할 수 있다.
 --
 -- **orders 에만** SELECT 를 준다. text-to-SQL 의 조회 대상은 주문뿐이고
--- (spec "근거 수집" 절), 처리 기록·정책 청크는 앱 계정만 읽는다 — 안전장치 2(스키마
+-- (docs/security.md "text-to-SQL 안전장치"), 처리 기록·정책 청크는 앱 계정만 읽는다 — 안전장치 2(스키마
 -- 화이트리스트)와 겹치는 방어층을 하나 더 두는 것이다.
 DO $$
 BEGIN

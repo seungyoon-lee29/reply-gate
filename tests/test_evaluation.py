@@ -38,10 +38,13 @@ from reply_gate.evaluation import (
     DEFAULT_GOLDEN_SET_PATH,
     DEFAULT_L1_FIXTURES_PATH,
     REASON_ORDER,
+    TARGETS,
+    EvaluationReport,
     ExpectedOutcomeSet,
     GoldenCase,
     L1Fixture,
     MetricTarget,
+    ReportStemError,
     RunConditions,
     SkippedMeasurement,
     StubGenerationClient,
@@ -52,6 +55,7 @@ from reply_gate.evaluation import (
     measure_pipeline_agreement,
     render_markdown,
     report_to_json,
+    resolve_report_stem,
     utc_now_iso,
     write_report,
 )
@@ -529,6 +533,150 @@ def test_목표치는_경계값을_달성으로_본다() -> None:
     assert at_most.met(0.0) is True
     assert at_most.met(0.0001) is False
     assert at_least.met(None) is None
+
+
+def test_목표치_키와_실측값_키는_항상_정렬돼_있다() -> None:
+    """TARGETS 에 지표를 추가하고 measured() 갱신을 빠뜨리면 여기서 먼저 깨져야 한다."""
+    report = build_report(
+        conditions=_conditions(),
+        gate_accuracy=measure_gate_accuracy(FIXTURES),
+        pipeline=SkippedMeasurement(reason="미요청"),
+    )
+    assert {target.key for target in TARGETS} == set(report.measured().keys())
+
+
+def _real_agreement_report(*, matched: bool) -> EvaluationReport:
+    """실측(measurement2_is_real=True) 1건짜리 일치율 리포트 — 달성/미달 판정 검증용."""
+    expected = (InquiryStatus.ANSWERED,) if matched else (InquiryStatus.ESCALATED,)
+    agreement = measure_pipeline_agreement(
+        cases=[_case("A", statuses=expected)],
+        pipeline=ScriptedPipeline([_processed()]),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+    return build_report(
+        conditions=_conditions(is_real=True),
+        gate_accuracy=measure_gate_accuracy(FIXTURES),
+        pipeline=agreement,
+    )
+
+
+def test_실측된_일치율은_달성과_미달을_실제로_판정한다() -> None:
+    """판정 배선을 뒤집는 회귀(달성↔미달)를 렌더링과 JSON 양쪽에서 잡는다."""
+    met_report = _real_agreement_report(matched=True)  # 일치율 1/1 = 100% ≥ 75%
+    missed_report = _real_agreement_report(matched=False)  # 일치율 0/1 = 0% < 75%
+
+    met_json = next(
+        metric
+        for metric in report_to_json(met_report)["targets"]["metrics"]
+        if metric["key"] == "match_rate"
+    )
+    missed_json = next(
+        metric
+        for metric in report_to_json(missed_report)["targets"]["metrics"]
+        if metric["key"] == "match_rate"
+    )
+    assert met_json["met"] is True and met_json["verdict"] == "달성"
+    assert missed_json["met"] is False and missed_json["verdict"] == "미달"
+
+    assert "| 100.0% | 달성 |" in render_markdown(met_report)
+    assert "| 0.0% | **미달** |" in render_markdown(missed_report)
+
+
+def test_대역_일치율은_달성으로_판정하지_않는다() -> None:
+    """대역 수치로 확률 층 목표를 "달성" 이라 찍으면 리포트가 거짓말을 한다."""
+    agreement = measure_pipeline_agreement(
+        cases=[_case("A")],
+        pipeline=ScriptedPipeline([_processed()]),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+    report = build_report(
+        conditions=_conditions(is_real=False),
+        gate_accuracy=measure_gate_accuracy(FIXTURES),
+        pipeline=agreement,
+    )
+    match_rate = next(
+        metric
+        for metric in report_to_json(report)["targets"]["metrics"]
+        if metric["key"] == "match_rate"
+    )
+    assert match_rate["measured"] is not None  # 값은 남긴다 — 배관 검증용
+    assert match_rate["met"] is None  # 판정은 하지 않는다
+    assert match_rate["verdict"] == "대역 — 판정 없음"
+    assert "대역 — 판정 없음" in render_markdown(report)
+
+
+# ── 리포트 이름 가드 — 라이브 실측 보존 계약 ─────────────────────────────────
+
+
+def test_기본_이름은_실측일_때만_라이브다(tmp_path: Path) -> None:
+    resolve = lambda real: resolve_report_stem(  # noqa: E731
+        requested=None, live_requested=True, measurement2_is_real=real, out_dir=tmp_path
+    )
+    assert resolve(True) == "evaluation-live"
+    # --live 를 줬어도 키·DB 문제로 측정 2 가 미실행이면 비실측 — 라이브 이름을 쓰면 안 된다.
+    assert resolve(False) == "evaluation"
+
+
+def test_비실측은_라이브_이름을_쓸_수_없다(tmp_path: Path) -> None:
+    for stem in ("evaluation-live", "evaluation-live-9", "Evaluation-live", "EVALUATION-LIVE-2"):
+        with pytest.raises(ReportStemError):
+            resolve_report_stem(
+                requested=stem, live_requested=False, measurement2_is_real=False, out_dir=tmp_path
+            )
+
+
+def test_이름_조각이_아닌_stem_은_거부된다(tmp_path: Path) -> None:
+    """`./`·`../`·절대경로·빈 문자열로 가드를 우회해 같은 파일명에 쓰는 것을 막는다."""
+    for stem in (
+        "./evaluation-live-x",
+        "../reports/evaluation-live",
+        "/tmp/evaluation-live",
+        "sub/evaluation-live",
+        "..",
+        "",
+        " evaluation-live",
+        ".hidden",
+    ):
+        with pytest.raises(ReportStemError):
+            resolve_report_stem(
+                requested=stem, live_requested=False, measurement2_is_real=False, out_dir=tmp_path
+            )
+
+
+def test_실측은_라이브_이름만_쓸_수_있다(tmp_path: Path) -> None:
+    """실측 결과가 gitignore 되는 이름으로 새면 다음 기본 실행이 그대로 덮는다."""
+    with pytest.raises(ReportStemError):
+        resolve_report_stem(
+            requested="evaluation", live_requested=True, measurement2_is_real=True, out_dir=tmp_path
+        )
+    assert (
+        resolve_report_stem(
+            requested="evaluation-live-9",
+            live_requested=True,
+            measurement2_is_real=True,
+            out_dir=tmp_path,
+        )
+        == "evaluation-live-9"
+    )
+
+
+def test_실측은_기존_라이브_리포트를_덮어쓸_수_없다(tmp_path: Path) -> None:
+    """실측은 비결정론이라 덮이면 그 수치는 재생성되지 않는다 — 빈 이름을 제안해야 한다."""
+    (tmp_path / "evaluation-live.md").write_text("기존 실측", encoding="utf-8")
+    (tmp_path / "evaluation-live-1.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ReportStemError, match="evaluation-live-2"):
+        resolve_report_stem(
+            requested=None, live_requested=True, measurement2_is_real=True, out_dir=tmp_path
+        )
+    with pytest.raises(ReportStemError):
+        resolve_report_stem(
+            requested="evaluation-live-1",
+            live_requested=True,
+            measurement2_is_real=True,
+            out_dir=tmp_path,
+        )
 
 
 def test_리포트는_실행_조건과_한계를_함께_적는다() -> None:

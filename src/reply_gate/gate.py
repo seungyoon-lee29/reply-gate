@@ -89,9 +89,9 @@ DEFAULT_PII_PATTERNS: tuple[PiiPattern, ...] = (
         regex=re.compile(r"(?<![0-9])0[2-9][0-9]?[-. ]?[0-9]{3,4}[-. ]?[0-9]{4}(?![0-9])"),
         normalize=normalize_digits,
     ),
-    # 15xx/16xx/17xx/18xx 대표번호. 개인 연락처는 아니지만
-    # docs/business-rules.md "평가용 데이터의 지위" 의 미끼 조항이
-    # 겨냥하는 값이 바로 이것이다 — 고객센터 번호를 비워 둔 조항을 근거로 받고 모델이
+    # 15xx/16xx/17xx/18xx 대표번호. 개인 연락처는 아니지만 정책 문서의 미끼 조항이
+    # 겨냥하는 값이 바로 이것이다(docs/engineering-notes.md "대표번호(15xx~18xx)를
+    # PII 패턴에 넣은 이유") — 고객센터 번호를 비워 둔 조항을 근거로 받고 모델이
     # 일반 지식으로 번호를 채우면 `pii_detected` 로 걸려야 한다. 빼면 미끼가 무력해진다.
     PiiPattern(
         name="service_phone",

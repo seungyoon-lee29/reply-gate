@@ -97,12 +97,12 @@ uv run python -m scripts.evaluate --live     # 측정 2 포함 — API 키 필�
 uv run python -m scripts.evaluate --stub-llm # 배관 검증용 — 실제 수치가 아니다
 ```
 
-리포트는 `.md`(사람용)와 `.json`(기계용)으로 나온다. **실행 종류에 따라 파일 이름이
-갈린다** — `--live` 는 `reports/evaluation-live.*` 에, 기본·대역 실행은
-`reports/evaluation.*` 에 쓴다. 라이브 실측 리포트만 저장소가 추적하고
-(`.gitignore` 가 `reports/*` 를 제외하되 `evaluation-live*` 는 남긴다), 그 밖의 리포트는
-gitignore 된다. `--report-stem` 으로 이름을 지정할 수 있지만 **실측이 아닌 실행에
-`evaluation-live` 로 시작하는 이름을 주면 거부된다** — 문서가 인용하는 근거를 덮어쓰지
+리포트는 `.md`(사람용)와 `.json`(기계용)으로 나온다. **파일 이름 규칙은 양방향이다:
+라이브 이름 ⇔ 실측.** 실측(`--live` 성공) 실행만 `reports/evaluation-live*` 에 쓸 수 있고,
+실측은 그 이름에만 쓰며, 이미 존재하는 라이브 리포트는 덮어쓸 수 없다(빈 번호를 제안받는다).
+그 밖의 실행 — 기본·대역, 그리고 `--live` 를 줬어도 키·DB 문제로 측정 2 가 미실행인 경우 —
+은 `reports/evaluation.*` 에 쓴다. 라이브 실측 리포트만 저장소가 추적하고 나머지는
+gitignore 된다. 규칙 위반은 **측정 시작 전에** 거부된다 — 문서가 인용하는 근거를 덮어쓰지
 않기 위해서다(engineering-notes 의 "라이브 리포트를 기본 실행이 덮어썼다").
 
 `--live` 는 골든셋 30건을 실제 모델에 흘린다(과금·비결정론). 실행 전에 5번 단계가

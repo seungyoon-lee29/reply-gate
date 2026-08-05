@@ -1,8 +1,8 @@
 """합성 주문 500건 시딩 — `uv run python -m scripts.seed_orders`.
 
 시딩 경로는 **저장소에 커밋된 픽스처**(`db/fixtures/orders.jsonl`)를 읽어 넣는 것뿐이다
-(docs/business-rules.md "평가용 데이터의 지위" — "검수한 산출물을 저장소에 픽스처로
-커밋하고, 시딩은 그 픽스처를 로드한다"). 시딩 중에 데이터를 새로 만들지 않으므로
+(docs/standards.md "데이터 재현성" — 합성 주문은 저장소에 커밋된 픽스처를 로드하고
+시딩 경로에 LLM 생성을 넣지 않는다). 시딩 중에 데이터를 새로 만들지 않으므로
 몇 번을 돌려도 같은 500건이다.
 
 픽스처 자체는 `--regenerate` 로 다시 만든다. 생성기는 손으로 고른 한국어 어휘 목록을
@@ -43,7 +43,7 @@ __all__ = [
     "write_fixture",
 ]
 
-#: docs/business-rules.md "평가용 데이터의 지위" 절 — 합성 주문 DB 500건.
+#: 합성 주문 픽스처의 기대 건수 — `db/fixtures/orders.jsonl` 의 줄 수와 같아야 한다.
 ORDER_COUNT: Final = 500
 
 #: 커밋된 픽스처. 시딩은 이 파일만 읽는다.

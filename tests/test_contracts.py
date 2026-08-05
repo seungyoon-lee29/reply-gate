@@ -26,7 +26,7 @@ def test_근거_ID_형식() -> None:
     assert sql_evidence_id(inquiry_id="inq_1", sequence=1) == "sql:inq_1:1"
 
 
-def test_기각사유와_인계사유_집합이_스펙과_일치한다() -> None:
+def test_기각사유와_인계사유_집합이_문서_계약과_일치한다() -> None:
     assert {reason.value for reason in RejectReason} == {
         "schema_violation",
         "missing_citation",
