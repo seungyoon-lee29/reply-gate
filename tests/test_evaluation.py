@@ -1380,8 +1380,18 @@ def test_측정3_의_예상_밖_예외는_이미_과금된_측정2_산출물을_
     `evaluate_judge_fixture` 가 잡는 것은 판정 형식·전송 오류뿐이라, SDK 스큐(TypeError)나
     Ctrl-C 는 그대로 올라온다 — 미실행으로 강등하고 사유에 예외 종류와 메시지를 남긴 뒤
     리포트는 **반드시** 쓴다.
+
+    `SystemExit` 도 같은 경로다: `BaseException` 직계라 `except (Exception, KeyboardInterrupt)`
+    로는 잡히지 않아, 판정 SDK 나 그 의존이 `sys.exit()` 를 부르면 리포트 없이 프로세스가
+    끝난다 — 과금된 산출물을 남기는 것이 종료 신호를 전달하는 것보다 우선이다.
     """
-    for index, error in enumerate((TypeError("SDK 버전 스큐"), KeyboardInterrupt())):
+    for index, error in enumerate(
+        (
+            TypeError("SDK 버전 스큐"),
+            KeyboardInterrupt(),
+            SystemExit("판정 SDK 의존이 sys.exit() 를 불렀다"),
+        )
+    ):
         out_dir = tmp_path / f"run{index}"
 
         def _boom(settings: Any, error: BaseException = error) -> Any:
@@ -1403,6 +1413,196 @@ def test_측정3_의_예상_밖_예외는_이미_과금된_측정2_산출물을_
         judged = payload["measurement_3_l2_judge_accuracy"]
         assert judged["executed"] is False
         assert type(error).__name__ in judged["skip_reason"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        psycopg.OperationalError("서버가 연결을 끊었다"),
+        KeyboardInterrupt(),
+        SystemExit("의존이 sys.exit() 를 불렀다"),
+    ],
+    ids=["인프라 예외", "Ctrl-C", "SystemExit"],
+)
+def test_측정2_의_예상_밖_예외도_리포트를_남기고_측정3_을_잇지_않는다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: BaseException
+) -> None:
+    """**가장 비싼 측정**이 죽어도 산출물은 남는다 — 그리고 판정을 더 사지 않는다.
+
+    `measure_pipeline_agreement` 는 인프라 예외를 그대로 터뜨리는 것이 설계다(지표가 아니라
+    환경 고장이다). 30건 중 25건째에 DB 컨테이너가 재기동하면 그 예외가 `main` 밖으로 나가
+    **이미 과금된 완주분과 무료인 측정 1 산출물까지** 트레이스백과 함께 사라진다 — 측정 3 에서
+    고친 것과 정확히 같은 실패 모양이라 같은 패턴으로 막는다.
+
+    이어서 측정 3 을 돌리지도 않는다: 중단 사유가 Ctrl-C 면 이어 도는 것이 곧 추가 과금이다.
+    """
+    judge_builds: list[object] = []
+
+    def _boom(*, cases: Any, args: Any, settings: Any) -> Any:
+        del cases, args, settings
+        raise error
+
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings())
+    monkeypatch.setattr(evaluate, "database_unavailable_reason", lambda *, settings: None)
+    monkeypatch.setattr(evaluate, "_run_measurement_two", _boom)
+    monkeypatch.setattr(evaluate, "build_judge", lambda settings: judge_builds.append(settings))
+    _block_outbound_sockets(monkeypatch)
+
+    # 산출물을 남기고 실패를 종료 코드로 알린다 — 조용한 성공이 아니다.
+    assert evaluate.main(["--live", "--out-dir", str(tmp_path)]) == 1
+
+    payload = json.loads((tmp_path / "evaluation-live-l2-1.json").read_text(encoding="utf-8"))
+    agreement = payload["measurement_2_pipeline_agreement"]
+    assert agreement["executed"] is False
+    # 사유에 예외 종류와 메시지가 그대로 남는다 — 실패가 조용한 성공으로 보이면 안 된다.
+    assert type(error).__name__ in agreement["skip_reason"]
+    assert str(error) in agreement["skip_reason"]
+    # 판정 모델을 조립조차 하지 않는다 — 중단된 실행이 판정 비용을 더 쓰면 안 된다.
+    assert not judge_builds
+    judged = payload["measurement_3_l2_judge_accuracy"]
+    assert judged["executed"] is False
+    assert "측정 2" in judged["skip_reason"]
+    # 무료인 측정 1 은 비싼 측정의 사고에 인질로 잡히지 않는다.
+    assert payload["measurement_1_l1_gate_accuracy"]["detection_rate"] == 1.0
+    # 실행 조건에 **무엇으로 돌리던 중이었는지**가 남는다 — 어느 모델에 돈을 썼는지가
+    # 산출물에서 사라지면 중단 리포트를 읽을 수 없다.
+    assert "OpenAI" in payload["conditions"]["generation"]
+    assert "측정 2 중단" in payload["conditions"]["generation"]
+    assert "측정 2 중단" in payload["conditions"]["judge"]
+
+
+def test_과금_실행에서_판정_픽스처_로드_실패는_종료_코드_1_이다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """골든셋 30건을 사고 측정 3 은 못 낸 실행이 `exit 0` 으로 성공처럼 읽히면 안 된다.
+
+    구조가 같은 중단 강등은 이미 1 을 세우는데 로드 실패만 경고로 끝나면 종료 코드 규칙이
+    갈린다 — 산출물은 저장소가 추적하는 `evaluation-live-l2-1` 이고 종료 코드는 0 이라,
+    래퍼·CI 는 "L2 실측이 성공했다"로 읽는다.
+    """
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings())
+    monkeypatch.setattr(evaluate, "database_unavailable_reason", lambda *, settings: None)
+    _canned_measurement_two(monkeypatch)
+    _block_outbound_sockets(monkeypatch)
+    missing = tmp_path / "오타.jsonl"
+
+    assert (
+        evaluate.main(["--live", "--judge-fixtures", str(missing), "--out-dir", str(tmp_path)]) == 1
+    )
+
+    payload = json.loads((tmp_path / "evaluation-live-l2-1.json").read_text(encoding="utf-8"))
+    # 과금이 끝난 측정 2 는 그대로 남는다 — 실패는 종료 코드와 미실행 사유가 든다.
+    assert payload["measurement_2_pipeline_agreement"]["executed"] is True
+    judged = payload["measurement_3_l2_judge_accuracy"]
+    assert judged["executed"] is False
+    assert "FileNotFoundError" in judged["skip_reason"]
+    # 세지 못한 픽스처 수를 0 으로 채우지 않는다.
+    assert payload["conditions"]["judge_fixture_count"] is None
+
+
+#: 매트릭스 안에서 "tmp_path 아래의 없는 파일"을 가리키는 자리표시자.
+_MISSING_FIXTURES = "<없는-판정-픽스처>"
+
+#: `--live` 조합의 종료 코드 — 규칙은 하나다: **과금 실행에서 측정 3 이 미실행이면 1**.
+#: (설명, argv, 키, 측정 2, 측정 3, 기대 종료 코드, 리포트 stem)
+_EXIT_CODE_MATRIX: tuple[tuple[str, list[str], str, str, str, int, str], ...] = (
+    ("과금·측정 2·3 완주", ["--live"], "both", "canned", "oracle", 0, "evaluation-live-l2-1"),
+    ("과금·측정 3 중단", ["--live"], "both", "canned", "boom", 1, "evaluation-live-l2-1"),
+    (
+        "과금·판정 픽스처 로드 실패",
+        ["--live", "--judge-fixtures", _MISSING_FIXTURES],
+        "both",
+        "canned",
+        "oracle",
+        1,
+        "evaluation-live-l2-1",
+    ),
+    ("과금·측정 2 중단", ["--live"], "both", "boom", "oracle", 1, "evaluation-live-l2-1"),
+    ("비과금·생성 키 없음", ["--live"], "none", "unused", "oracle", 0, "evaluation"),
+    ("비과금·판정 키 없음", ["--live"], "no-judge", "unused", "oracle", 0, "evaluation"),
+    ("비과금·대역 실행", ["--stub-llm"], "both", "canned", "oracle", 0, "evaluation"),
+    ("비과금·기본 실행", [], "both", "unused", "oracle", 0, "evaluation"),
+)
+
+
+def _apply_exit_code_scenario(
+    monkeypatch: pytest.MonkeyPatch, *, keys: str, m2: str, m3: str
+) -> None:
+    """실 API 호출 없이 매트릭스 한 줄을 세운다 — 소켓 차단 + 대역 주입만 쓴다."""
+    settings = {
+        "both": _l2_settings(),
+        "none": _l2_settings(live_keys=False),
+        "no-judge": _l2_settings(judge_key=False),
+    }[keys]
+    monkeypatch.setattr(evaluate, "get_settings", lambda: settings)
+    monkeypatch.setattr(evaluate, "database_unavailable_reason", lambda *, settings: None)
+
+    if m2 == "canned":
+        _canned_measurement_two(monkeypatch)
+    elif m2 == "boom":
+
+        def _m2_boom(*, cases: Any, args: Any, settings: Any) -> Any:
+            del cases, args, settings
+            raise psycopg.OperationalError("DB 컨테이너가 재기동했다")
+
+        monkeypatch.setattr(evaluate, "_run_measurement_two", _m2_boom)
+
+    if m3 == "oracle":
+        monkeypatch.setattr(evaluate, "build_judge", lambda settings: OracleJudge(JUDGE_FIXTURES))
+    elif m3 == "boom":
+
+        def _m3_boom(settings: Any) -> Any:
+            del settings
+            raise SystemExit("판정 SDK 가 죽었다")
+
+        monkeypatch.setattr(evaluate, "build_judge", _m3_boom)
+
+    _block_outbound_sockets(monkeypatch)
+
+
+@pytest.mark.parametrize(
+    ("label", "argv", "keys", "m2", "m3", "expected_code", "stem"),
+    _EXIT_CODE_MATRIX,
+    ids=[row[0] for row in _EXIT_CODE_MATRIX],
+)
+def test_종료_코드는_과금_실행의_측정3_미실행_한_규칙만_따른다(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    argv: list[str],
+    keys: str,
+    m2: str,
+    m3: str,
+    expected_code: int,
+    stem: str,
+) -> None:
+    """종료 코드 규칙이 갈리지 않는지 `--live` 조합 전체로 못박는다 (실 API 호출 0회).
+
+    규칙: **과금 실행(= `--live` 로 선검사를 통과해 측정 2 가 실측으로 돌 조건이었던 실행)에서
+    측정 3 이 미실행이면 1, 그 밖에는 0.** `--live` 없이 도는 평범한 실행에서 측정 3 이
+    "`--live` 아님" 사유로 미실행인 것은 정상이므로 0 이다.
+
+    어느 조합이든 **리포트는 반드시 쓰인다** — 실패를 트레이스백이 아니라 산출물과 종료
+    코드로 알리는 것이 이 하네스의 계약이다.
+    """
+    _apply_exit_code_scenario(monkeypatch, keys=keys, m2=m2, m3=m3)
+    resolved = [
+        str(tmp_path / "없는-판정-픽스처.jsonl") if item == _MISSING_FIXTURES else item
+        for item in argv
+    ]
+
+    assert evaluate.main([*resolved, "--out-dir", str(tmp_path)]) == expected_code, label
+
+    # 산출물은 어느 조합에서도 남는다.
+    assert (tmp_path / f"{stem}.md").exists(), label
+    payload = json.loads((tmp_path / f"{stem}.json").read_text(encoding="utf-8"))
+    assert payload["measurement_1_l1_gate_accuracy"]["llm_calls"] == 0, label
+    # 규칙 자체를 산출물에 대고 다시 확인한다 — 종료 코드와 리포트가 갈리면 안 된다.
+    billed = payload["conditions"]["measurement2_is_real"]
+    judged = payload["measurement_3_l2_judge_accuracy"]["executed"]
+    assert (expected_code == 1) == (billed and not judged), label
+    # 비과금 실행은 라이브 계열 이름을 받지 못한다(라이브 이름 ⇔ 실측, 양방향).
+    assert bool(list(tmp_path.glob("evaluation-live*"))) is billed, label
 
 
 def test_판정_픽스처를_읽지_못해도_측정1_산출물은_남는다(

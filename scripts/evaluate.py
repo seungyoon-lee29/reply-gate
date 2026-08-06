@@ -7,9 +7,18 @@
 
 **측정 1 은 항상 돈다** — LLM 을 호출하지 않으므로 키도 DB 도 필요 없다. 판정 픽스처
 파일이 없거나 라벨이 깨져 있어도 마찬가지다: 그 실패는 **측정 3 의 미실행 사유**로 강등되고
-측정 1·2 는 그대로 산출된다. 측정 3 이 예상 밖 예외로 중단돼도 같다 — 이미 과금이 끝난
-측정 2 산출물을 트레이스백과 함께 잃지 않으려면 리포트는 반드시 쓰여야 한다(중단은
-리포트의 미실행 사유와 종료 코드 1 로 알린다).
+측정 1·2 는 그대로 산출된다. **측정 2·3 이 예상 밖 예외로 중단돼도 같다** — 어느 쪽이 죽어도
+리포트는 반드시 쓰인다. 중단을 트레이스백으로 알리면 이미 과금이 끝난 산출물(골든셋 30건
+중 완주분)과 무료인 측정 1 산출물이 함께 사라지기 때문이다. 중단은 **리포트의 미실행
+사유**(예외 종류와 메시지를 그대로 담는다)와 종료 코드로만 알린다.
+
+**종료 코드 규칙은 하나다 — 과금 실행에서 측정 3 이 미실행이면 1, 그 밖에는 0.**
+여기서 "과금 실행"은 `--live` 로 선검사(키·DB)를 통과해 **측정 2 가 실측으로 돌 조건이었던**
+실행이다. 완주했든 도중에 중단됐든 같다: 측정 2 가 중단되면 측정 3 도 잇지 않으므로
+(Ctrl-C 를 삼키고 판정을 더 사면 안 된다) 그 실행도 이 규칙 하나로 1 이 된다. 판정 픽스처
+로드 실패로 측정 3 이 미실행인 것도 과금 실행이면 1 이다 — 골든셋 30건을 사고 판정 수치는
+못 낸 실행이 래퍼·CI 에 "성공"으로 읽히면 안 된다. 반면 `--live` 없이 도는 평범한 실행에서
+측정 3 이 "`--live` 아님" 사유로 미실행인 것은 **정상이므로 0** 이다.
 
 **측정 2·3 은 명시적 opt-in 이다.** 실제 실행은 과금되고 결과가 재실행마다 달라지므로
 기본값으로 돌리지 않는다. 실행하지 않았으면 리포트에 **미실행 사유가 그대로 남는다** —
@@ -40,7 +49,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import cast
+from typing import Final, cast
 
 import psycopg
 from psycopg.rows import DictRow
@@ -206,17 +215,40 @@ def _measurement_two_settings(*, args: argparse.Namespace, settings: Settings) -
     )
 
 
+#: 중단된 측정 2 의 실행 조건에 붙는 꼬리표. 실행 조건 항목은 "무엇으로 돌렸는가"만이 아니라
+#: **결과**도 적는 자리라(미실행이면 "미실행"이다), 중단도 구분되어 남아야 한다.
+_ABORTED_MARK: Final = " (측정 2 중단)"
+
+
+def _client_labels(*, args: argparse.Namespace, settings: Settings) -> tuple[str, str]:
+    """(생성 설명, 임베딩 설명) — 클라이언트를 만들지 않고도 정해진다.
+
+    측정 2 가 중단돼도 **무엇으로 돌리던 중이었는지**는 실행 조건에 남아야 한다: 과금된
+    실행이 어느 모델에 돈을 썼는지가 산출물에서 사라지면 중단 리포트를 읽을 수 없다.
+    """
+    if args.stub_llm:
+        return (
+            "결정론 대역 `evaluation.StubGenerationClient` (실제 모델 아님)",
+            f"결정론 대역 `testing.LexicalEmbeddingClient`"
+            f"({settings.embedding_dimensions}차원, 어휘 2-gram)",
+        )
+    return (
+        f"OpenAI `{settings.generation_model}` (effort={settings.generation_effort or '기본값'})",
+        f"OpenAI `{settings.embedding_model}` ({settings.embedding_dimensions}차원)",
+    )
+
+
 def _clients(
     *, args: argparse.Namespace, settings: Settings
 ) -> tuple[GenerationClient, EmbeddingClient, str, str]:
     """(생성 클라이언트, 임베딩 클라이언트, 생성 설명, 임베딩 설명)."""
+    generation_label, embedding_label = _client_labels(args=args, settings=settings)
     if args.stub_llm:
-        embedder = LexicalEmbeddingClient(dimensions=settings.embedding_dimensions)
         return (
             cast(GenerationClient, StubGenerationClient()),
-            embedder,
-            "결정론 대역 `evaluation.StubGenerationClient` (실제 모델 아님)",
-            f"결정론 대역 `testing.LexicalEmbeddingClient`({embedder.dimensions}차원, 어휘 2-gram)",
+            LexicalEmbeddingClient(dimensions=settings.embedding_dimensions),
+            generation_label,
+            embedding_label,
         )
     # 실제 실행 — 생성·임베딩 모두 OpenAI. 여기서만 실제 API 키를 쓴다.
     return (
@@ -226,20 +258,27 @@ def _clients(
             model=settings.embedding_model,
             dimensions=settings.embedding_dimensions,
         ),
-        f"OpenAI `{settings.generation_model}` (effort={settings.generation_effort or '기본값'})",
-        f"OpenAI `{settings.embedding_model}` ({settings.embedding_dimensions}차원)",
+        generation_label,
+        embedding_label,
     )
 
 
-def _judge_label(*, args: argparse.Namespace, settings: Settings, skip: str | None) -> str:
+def _judge_label(
+    *, args: argparse.Namespace, settings: Settings, skip: str | None, aborted: bool = False
+) -> str:
     """실행 조건에 남는 판정 모델 설명 — 대역 수치를 실제 수치로 읽지 않게 하는 기록이다."""
     if not settings.l2_enabled:
         return "L2 꺼짐 (판정 미실행)"
     if skip is not None:
         return "미실행"
-    if args.stub_llm:
-        return "결정론 대역 `testing.StubJudge` (실제 모델 아님)"
-    return f"Anthropic `{settings.judge_model}` (effort={settings.judge_effort or '기본값'})"
+    label = (
+        "결정론 대역 `testing.StubJudge` (실제 모델 아님)"
+        if args.stub_llm
+        else f"Anthropic `{settings.judge_model}` (effort={settings.judge_effort or '기본값'})"
+    )
+    # 측정 2 가 중단된 실행에서는 이 판정자가 **끝까지 돌지 않았다** — 세 항목(생성·임베딩·
+    # 판정)이 같은 꼬리표를 달아야 실행 조건만 읽고 완주한 실행으로 오해하지 않는다.
+    return f"{label}{_ABORTED_MARK}" if aborted else label
 
 
 def _run_measurement_two(
@@ -340,8 +379,6 @@ def _run_measurement_three(
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     settings = get_settings()
-    #: 산출물은 반드시 남긴다 — 중단은 리포트에 사유로 적고 종료 코드로만 알린다.
-    exit_code = 0
     # 키·DB 선검사는 **측정 시작 전**이다 — 도중에 발견하면 과금만 하고 산출물이 없다.
     skip = _skip_reason(args=args, settings=settings)
     judge_skip = _judge_skip_reason(args=args, settings=settings, skip=skip)
@@ -370,6 +407,10 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     run_settings = _measurement_two_settings(args=args, settings=settings)
+    # **과금 실행인가** — `--live` 로 선검사를 통과해 측정 2 가 실측으로 돌 조건이었던 실행.
+    # 리포트 이름(라이브 계열)과 종료 코드 규칙이 둘 다 이 하나의 값을 본다. 측정 2 가 도중에
+    # 중단돼도 이 값은 True 로 남는다: 이름은 이미 이 값으로 확정됐고(측정 시작 전 결정),
+    # 무엇보다 그 이름이 곧 "이 실행은 과금될 수 있었다"는 저장소에 남는 기록이다.
     measurement2_is_real = bool(args.live) and skip is None
 
     # 리포트 이름은 **측정을 시작하기 전에** 확정한다 — 여기서 거부될 실행이 과금(라이브
@@ -392,6 +433,7 @@ def main(argv: list[str] | None = None) -> int:
     accuracy = measure_gate_accuracy(fixtures)
 
     pipeline: PipelineAgreement | SkippedMeasurement
+    measurement2_aborted = False
     if skip is not None:
         print(f"측정 2 — 미실행: {skip}")
         pipeline = SkippedMeasurement(reason=skip)
@@ -399,9 +441,30 @@ def main(argv: list[str] | None = None) -> int:
         embedding_label = "미실행"
     else:
         print(f"측정 2 — 골든셋 {len(cases)}건 end-to-end")
-        pipeline, generation_label, embedding_label = _run_measurement_two(
-            cases=cases, args=args, settings=run_settings
-        )
+        try:
+            pipeline, generation_label, embedding_label = _run_measurement_two(
+                cases=cases, args=args, settings=run_settings
+            )
+        # `measure_pipeline_agreement` 는 인프라 예외(DB 재기동 등)를 그대로 터뜨리는 것이
+        # 설계다 — 그 예외가 여기서 main 밖으로 나가면 **이미 과금된 완주분과 무료인 측정 1
+        # 산출물까지** 트레이스백과 함께 사라진다. 측정 3 과 정확히 같은 실패 모양이라 같은
+        # 패턴으로 막는다. `BaseException` 까지 넓히는 이유와 재발생시키지 않는 이유는
+        # 아래 측정 3 가드의 주석과 같다.
+        except BaseException as error:
+            aborted = f"측정 2 가 중단됐다: {type(error).__name__}: {error}"
+            print(f"측정 2 — 중단: {aborted}")
+            pipeline = SkippedMeasurement(reason=aborted)
+            measurement2_aborted = True
+            attempted_generation, attempted_embedding = _client_labels(
+                args=args, settings=run_settings
+            )
+            generation_label = f"{attempted_generation}{_ABORTED_MARK}"
+            embedding_label = f"{attempted_embedding}{_ABORTED_MARK}"
+            # 측정 2 가 중단된 실행에서 측정 3 을 **이어서 돌리지 않는다**: 중단 사유가
+            # Ctrl-C 면 이어 도는 것이 곧 추가 과금이고, 인프라 고장이면 골든셋 수치 없이
+            # 판정 수치만 남은 리포트가 된다(두 측정의 실측 여부가 갈리면 안 된다).
+            if judge_skip is None:
+                judge_skip = f"측정 2 와 같은 사유로 미실행: {aborted}"
 
     judge_accuracy: JudgeAccuracy | SkippedMeasurement
     measurement3_is_real = False
@@ -412,22 +475,30 @@ def main(argv: list[str] | None = None) -> int:
         print(f"측정 3 — 판정 픽스처 {len(judge_fixtures)}건 (실제 판정 모델·과금)")
         try:
             judge_accuracy = _run_measurement_three(fixtures=judge_fixtures, settings=run_settings)
-        except (Exception, KeyboardInterrupt) as error:
-            # 여기까지 왔으면 측정 2 는 이미 과금이 끝났다. 측정 3 의 예상 밖 예외
-            # (SDK 스큐·자격 증명 오류·Ctrl-C 등)로 죽으면 골든셋 30건을 다시 사야 한다 —
-            # 미실행으로 강등하고 **사유에 예외 종류와 메시지를 그대로 남긴 뒤** 리포트를 쓴다.
+        # `BaseException` 까지 잡는다: `except (Exception, KeyboardInterrupt)` 는
+        # `SystemExit`(BaseException 직계)을 놓쳐, 판정 SDK 나 그 의존이 `sys.exit()` 를
+        # 부르면 리포트 없이 프로세스가 끝난다. **재발생시키지 않는다** — 여기까지 왔으면
+        # 측정 2 는 이미 과금이 끝났고, 그 산출물을 남기는 것이 종료 신호를 그대로
+        # 전달하는 것보다 우선이다(중단 사실은 미실행 사유와 종료 코드 1 이 들고 간다).
+        except BaseException as error:
             aborted = f"측정 3 이 중단됐다: {type(error).__name__}: {error}"
             print(f"측정 3 — 중단: {aborted}")
             judge_accuracy = SkippedMeasurement(reason=aborted)
-            exit_code = 1
         else:
             measurement3_is_real = True
+
+    # ── 종료 코드는 여기 한 곳에서만 정해진다 (규칙이 갈리지 않게) ──────────────
+    # **과금 실행에서 측정 3 이 미실행이면 1, 그 밖에는 0.** 사유가 무엇이든(픽스처 로드
+    # 실패·중단·측정 2 중단으로 인한 연쇄 미실행) 같다 — 골든셋 30건을 사고 판정 수치는 못
+    # 낸 실행이 종료 코드로는 성공으로 읽히면 안 되기 때문이다. `--live` 없이 도는 평범한
+    # 실행에서 측정 3 이 "`--live` 아님" 사유로 미실행인 것은 정상이므로 0 이다.
+    exit_code = 1 if measurement2_is_real and isinstance(judge_accuracy, SkippedMeasurement) else 0
 
     conditions = RunConditions(
         started_at=started_at,
         generation=generation_label,
         embedding=embedding_label,
-        judge=_judge_label(args=args, settings=settings, skip=skip),
+        judge=_judge_label(args=args, settings=settings, skip=skip, aborted=measurement2_aborted),
         similarity_threshold=run_settings.vector_similarity_threshold,
         top_k=run_settings.vector_top_k,
         l1_fixture_count=len(fixtures),
