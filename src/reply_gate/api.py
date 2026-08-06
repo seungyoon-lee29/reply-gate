@@ -16,7 +16,14 @@
 생성·임베딩 클라이언트는 **첫 호출 직전에** 만든다(`_LazyGenerationClient`). 의존성 해석
 시점에 만들면 API 키가 없는 환경에서 LLM 을 전혀 쓰지 않는 경로 — 조회 전용
 `GET /inquiries/{id}`, 접수 거부 422 — 까지 500 으로 무너진다. 자격 증명 부재는 업무
-판정이 아니므로 인계 사유(`llm_call_failed`)로 기록하지 않고 **설정 오류(503)** 로 끝낸다.
+판정이 아니므로 인계 사유(`llm_call_failed`)로 기록하지 않고 **설정 오류(503)** 로 끝낸다
+(`MissingCredentialsError` 의 정의는 `pipeline.py` 가 소유한다 — 파이프라인 내부의 지연
+클라이언트도 같은 예외를 던져야 이 핸들러가 잡는다).
+
+판정 키(`ANTHROPIC_API_KEY`)만 예외적으로 **eager** 다: L2 가 켜져 있으면
+`POST /inquiries` 는 처리에 진입하자마자 키를 선검사해 503 을 낸다(`_require_judge_credentials`).
+검증하지 못할 답변을 만들기 시작하지 않기 위해서다. 선검사는 **POST 경로에만** 걸고
+조회·422 경로는 건드리지 않는다.
 
 핸들러는 동기(`def`)다 — psycopg 는 동기 드라이버이고, FastAPI 가 스레드풀에서 돌린다.
 """
@@ -46,6 +53,7 @@ from reply_gate.llm import (
 )
 from reply_gate.pipeline import (
     InquiryPipeline,
+    MissingCredentialsError,
     ProcessedInquiry,
     ReceiptError,
     accept_inquiry,
@@ -212,15 +220,6 @@ class InquiryService:
         return load_inquiry(conn=self._app_conn, inquiry_id=inquiry_id)
 
 
-class MissingCredentialsError(RuntimeError):
-    """OpenAI 자격 증명이 없다 — **설정 오류**이지 인계 사유가 아니다.
-
-    `LLMCallError` 를 상속하지 않는 것이 핵심이다: 상속하면 근거 수집기가 이것을 잡아
-    `llm_call_failed` 인계로 기록해 버리고, 키를 안 넣고 돌린 실행이 평가 지표에
-    "전송 오류 인계"로 섞여 들어간다.
-    """
-
-
 def _require_api_key(settings: Settings) -> str:
     if not settings.openai_api_key:
         raise MissingCredentialsError(
@@ -324,9 +323,32 @@ def health() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
+def _require_judge_credentials() -> None:
+    """L2 가 켜져 있으면 판정 키를 **POST 처리 진입 시점에** 선검사한다.
+
+    지연 검사(L2 에 도달해서야 실패)로 두면 두 가지가 무너진다: 생성 토큰을 태운 뒤에야
+    503 이 나고, L1 이 2회 기각한 문의는 판정 키 없이도 정상 종결되어 "키 없으면 503"이
+    조건부 규칙이 된다. 검증하지 못할 답변을 만들기 시작하지 않는 것이 fail-closed 다.
+
+    **이 검사는 POST 경로에만 건다.** `get_service`(Depends)는 GET 라우트와 공유하므로
+    거기에 넣으면 판정 키가 없는 환경에서 조회 전용 경로까지 죽는다
+    (docs/engineering-notes.md "목만으로는 잡히지 않는 결함"). 접수 거부 422 도 판정 키와
+    무관하다 — 그 경로는 이 함수에 닿기 전에 끝난다.
+    """
+    settings = get_settings()
+    if settings.l2_enabled and not settings.anthropic_api_key:
+        raise MissingCredentialsError(
+            "ANTHROPIC_API_KEY 가 설정되지 않았다. L2 판정이 켜져 있으면 판정 없이 답변을 "
+            "내보내지 않는다 — `.env` 또는 환경 변수에 키를 넣거나 L2_ENABLED=false 로 "
+            "판정을 끄고 다시 실행한다."
+        )
+
+
 @app.post("/inquiries")
 def create_inquiry(payload: InquiryRequest, service: ServiceDep) -> InquiryResponse:
     """문의 접수 + 동기 처리. 접수 검증 실패는 이 함수에 닿기 전에 422 로 끝난다."""
+    # 처리 기록을 남기기 전에 끝낸다 — 설정 오류는 인계(`llm_call_failed`)가 아니다.
+    _require_judge_credentials()
     processed = service.process(content=payload.content, order_no=payload.order_no)
     return InquiryResponse.of(processed)
 

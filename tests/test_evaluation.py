@@ -756,12 +756,21 @@ def test_하네스가_골든셋_30건을_대역으로_끝까지_흘려_리포트
     ro_conn: psycopg.Connection[DictRow],
     tmp_path: Path,
 ) -> None:
-    """API 키가 없어도 배관은 끝까지 검증된다 — 키가 생기면 바로 돌아야 하기 때문이다."""
+    """API 키가 없어도 배관은 끝까지 검증된다 — 키가 생기면 바로 돌아야 하기 때문이다.
+
+    **L2 는 꺼서** 돌린다: 결정론 판정 대역이 아직 없어(하네스 확장 태스크 몫) 켜면 실제
+    판정 모델을 부르게 된다. L2 켜짐 대역 커버리지는 그 태스크가 복원한다.
+    """
     stub = StubGenerationClient()
     pipeline = build_pipeline(
         generation_client=cast(GenerationClient, stub),
         embedding_client=LexicalEmbeddingClient(dimensions=1536),
-        settings=Settings(vector_top_k=5, vector_similarity_threshold=0.05, sql_max_rows=50),
+        settings=Settings(
+            vector_top_k=5,
+            vector_similarity_threshold=0.05,
+            sql_max_rows=50,
+            l2_enabled=False,
+        ),
     )
 
     agreement = measure_pipeline_agreement(
@@ -803,12 +812,20 @@ def test_하네스가_골든셋_30건을_대역으로_끝까지_흘려_리포트
 def test_대역_LLM_은_미끼_조항에서_기각을_재현한다(
     app_conn: psycopg.Connection[DictRow], ro_conn: psycopg.Connection[DictRow]
 ) -> None:
-    """미끼 조항 문의 → 근거에 없는 번호 생성 → `pii_detected` 기각 → 재생성 통과."""
+    """미끼 조항 문의 → 근거에 없는 번호 생성 → `pii_detected` 기각 → 재생성 통과.
+
+    L1 층의 기각 재현이므로 **L2 는 꺼서** 사이클 1 동작으로 확인한다.
+    """
     stub = StubGenerationClient()
     pipeline = build_pipeline(
         generation_client=cast(GenerationClient, stub),
         embedding_client=LexicalEmbeddingClient(dimensions=1536),
-        settings=Settings(vector_top_k=5, vector_similarity_threshold=0.05, sql_max_rows=50),
+        settings=Settings(
+            vector_top_k=5,
+            vector_similarity_threshold=0.05,
+            sql_max_rows=50,
+            l2_enabled=False,
+        ),
     )
     bait = next(case for case in GOLDEN if case.id == "G16")
 

@@ -17,6 +17,10 @@
 
 `--stub-llm` 은 정책 청크를 **어휘 임베딩 대역**으로 다시 적재해야 하므로, 적재를
 트랜잭션 안에서 하고 끝나면 **롤백한다**. 공유 DB 의 실제 임베딩을 덮어쓰지 않는다.
+
+**알려진 일시 공백**: L2 판정(기본 켜짐)에는 아직 결정론 대역이 없어 `--stub-llm` 이
+외부 호출 0회를 지킬 수 없다. 그래서 `--stub-llm` + L2 켜짐은 조용히 사이클 1 동작으로
+낮춰 돌리지 않고 **명시적 오류로 멈춘다**(`_require_stub_judge_gap`).
 """
 
 from __future__ import annotations
@@ -118,6 +122,12 @@ def _skip_reason(*, args: argparse.Namespace, settings: Settings) -> str | None:
         )
     if args.live and not settings.openai_api_key:
         return "OPENAI_API_KEY 가 없다 — 측정 2 는 실제 생성 LLM 이 있어야 진짜 수치가 나온다"
+    if args.live and settings.l2_enabled and not settings.anthropic_api_key:
+        # 시작해 놓고 첫 판정 호출에서 죽으면 30건 중 일부만 과금하고 산출물은 없다.
+        return (
+            "ANTHROPIC_API_KEY 가 없다 — L2 판정이 켜져 있으면 판정 없이 답변을 확정하지 "
+            "않으므로 측정 2 를 시작하지 않는다 (판정을 빼고 재보려면 L2_ENABLED=false)"
+        )
     return database_unavailable_reason(settings=settings)
 
 
@@ -204,9 +214,28 @@ def _run_measurement_two(
     return agreement, generation_label, embedding_label
 
 
+def _require_stub_judge_gap(*, args: argparse.Namespace, settings: Settings) -> None:
+    """`--stub-llm` + L2 켜짐은 **지금 돌릴 수 없다** — 알려진 일시 공백이라 명시적으로 죽는다.
+
+    대역 실행은 외부 호출 0회여야 하는데 결정론 **판정** 대역이 아직 없다(하네스 확장
+    태스크 몫). 여기서 조용히 `l2_enabled=False` 로 낮춰 돌리면 리포트에는 대역 수치가
+    찍히지만 그 수치가 사이클 1 배관을 잰 것인지 L2 를 포함해 잰 것인지 알 수 없게 된다 —
+    "미실행 측정을 0 이나 빈 값으로 채우지 않는다"와 같은 이유로 멈춘다.
+    """
+    if args.stub_llm and settings.l2_enabled:
+        raise SystemExit(
+            "`--stub-llm` 은 지금 돌릴 수 없다: L2 판정이 켜져 있는데(기본 켜짐) 결정론 판정 "
+            "대역이 아직 없어 대역 실행이 실제 판정 모델을 부르게 된다. 이 공백은 하네스 확장 "
+            "태스크가 결정론 판정 대역과 함께 닫는다. 지금 배관만 확인하려면 L2_ENABLED=false "
+            "로 **명시**하고 다시 실행한다 (그 실행은 사이클 1 동작을 잰 값이다)."
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     settings = get_settings()
+    # 측정 1(무료)조차 시작하기 전에 죽인다 — 돌릴 수 없는 요청은 산출물을 남기지 않는다.
+    _require_stub_judge_gap(args=args, settings=settings)
 
     fixtures = load_l1_fixtures(args.l1_fixtures)
     cases = load_golden_set(args.golden_set)
