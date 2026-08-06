@@ -22,8 +22,10 @@ class Settings(BaseSettings):
     )
 
     # ── 외부 API 키 ─────────────────────────────────────────────────────────
-    # 이번 사이클 API 키는 OpenAI 1개 (생성·임베딩 공통) — docs/architecture.md "외부 의존".
+    # 생성(의도 해석·초안 생성·SQL 생성)·임베딩 공통 — docs/architecture.md "외부 의존".
     openai_api_key: str = ""
+    #: L2 판정(Anthropic) 전용. 비밀 — 환경 변수 또는 .env 에만 둔다.
+    anthropic_api_key: str = ""
 
     # ── Postgres 접속 ───────────────────────────────────────────────────────
     postgres_host: str = "localhost"
@@ -42,6 +44,17 @@ class Settings(BaseSettings):
     generation_effort: str | None = None
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 1536
+
+    # ── L2 판정 ─────────────────────────────────────────────────────────────
+    #: L2 판정 스위치 — 기본 켜짐.
+    l2_enabled: bool = True
+    #: 판정 모델 등급은 조정 가능 기본값.
+    judge_model: str = "claude-sonnet-5"
+    #: 판정 effort — 지정했을 때만 요청에 실린다. 미지정이면 모델 기본값을 따른다.
+    judge_effort: str | None = None
+    #: 판정 max_tokens — thinking+응답 합산 상한이므로 여유 있게 둔다
+    #: (thinking 설정 미전송 = adaptive thinking 켜짐이 모델 기본).
+    judge_max_output_tokens: int = 16000
 
     # ── 조정 가능 기본값 (docs/operations.md "환경 변수" 절) ────────────────────────
     vector_top_k: int = 5
