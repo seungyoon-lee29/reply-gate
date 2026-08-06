@@ -1,0 +1,1360 @@
+{
+  "targets": {
+    "decided_at": "2026-08-05",
+    "decision": "docs/tracking/decisions/0006-지표-목표치를-실측-뒤에-확정한다.md",
+    "metrics": [
+      {
+        "key": "detection_rate",
+        "label": "측정 1 구조적 오류 검출률",
+        "bound": 1.0,
+        "direction": "at_least",
+        "measured": 1.0,
+        "met": true,
+        "verdict": "달성"
+      },
+      {
+        "key": "false_positive_rate",
+        "label": "측정 1 정상 초안 오탐률",
+        "bound": 0.0,
+        "direction": "at_most",
+        "measured": 0.0,
+        "met": true,
+        "verdict": "달성"
+      },
+      {
+        "key": "match_rate",
+        "label": "측정 2 허용 결과 집합 대비 일치율",
+        "bound": 0.75,
+        "direction": "at_least",
+        "measured": 0.8666666666666667,
+        "met": true,
+        "verdict": "달성"
+      }
+    ]
+  },
+  "conditions": {
+    "started_at": "2026-08-06T16:46:45+00:00",
+    "generation": "OpenAI `gpt-5.6-terra` (effort=기본값)",
+    "embedding": "OpenAI `text-embedding-3-small` (1536차원)",
+    "judge": "Anthropic `claude-sonnet-5` (effort=기본값)",
+    "l2_enabled": true,
+    "similarity_threshold": 0.3,
+    "top_k": 5,
+    "l1_fixture_count": 27,
+    "golden_case_count": 30,
+    "judge_fixture_count": 11,
+    "l1_fixtures_path": "data/l1_fixtures.jsonl",
+    "golden_set_path": "data/golden_set.jsonl",
+    "judge_fixtures_path": "data/judge_fixtures.jsonl",
+    "api_key_present": true,
+    "judge_api_key_present": true,
+    "measurement2_is_real": true,
+    "measurement3_is_real": true
+  },
+  "measurement_1_l1_gate_accuracy": {
+    "deterministic": true,
+    "llm_calls": 0,
+    "total": 27,
+    "violation_total": 19,
+    "violation_detected": 19,
+    "detection_rate": 1.0,
+    "clean_total": 8,
+    "clean_false_positive": 0,
+    "false_positive_rate": 0.0,
+    "reason_set_exact_rate": 1.0,
+    "reason_breakdown": [
+      {
+        "reason": "schema_violation",
+        "expected_count": 9,
+        "detected_count": 9,
+        "detection_rate": 1.0,
+        "spurious_count": 0
+      },
+      {
+        "reason": "missing_citation",
+        "expected_count": 4,
+        "detected_count": 4,
+        "detection_rate": 1.0,
+        "spurious_count": 0
+      },
+      {
+        "reason": "invalid_citation",
+        "expected_count": 5,
+        "detected_count": 5,
+        "detection_rate": 1.0,
+        "spurious_count": 0
+      },
+      {
+        "reason": "pii_detected",
+        "expected_count": 6,
+        "detected_count": 6,
+        "detection_rate": 1.0,
+        "spurious_count": 0
+      }
+    ],
+    "outcomes": [
+      {
+        "fixture_id": "F01",
+        "category": "clean",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "matched": true
+      },
+      {
+        "fixture_id": "F02",
+        "category": "clean",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "matched": true
+      },
+      {
+        "fixture_id": "F03",
+        "category": "clean",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "matched": true
+      },
+      {
+        "fixture_id": "F04",
+        "category": "clean",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "matched": true
+      },
+      {
+        "fixture_id": "F05",
+        "category": "pii_echo",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "matched": true
+      },
+      {
+        "fixture_id": "F06",
+        "category": "pii_echo",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "matched": true
+      },
+      {
+        "fixture_id": "F07",
+        "category": "pii_echo",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "matched": true
+      },
+      {
+        "fixture_id": "F08",
+        "category": "clean",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "matched": true
+      },
+      {
+        "fixture_id": "F09",
+        "category": "schema_violation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation"
+        ],
+        "actual_reasons": [
+          "schema_violation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F10",
+        "category": "schema_violation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation"
+        ],
+        "actual_reasons": [
+          "schema_violation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F11",
+        "category": "schema_violation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation"
+        ],
+        "actual_reasons": [
+          "schema_violation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F12",
+        "category": "schema_violation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation"
+        ],
+        "actual_reasons": [
+          "schema_violation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F13",
+        "category": "schema_violation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation"
+        ],
+        "actual_reasons": [
+          "schema_violation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F14",
+        "category": "schema_violation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation"
+        ],
+        "actual_reasons": [
+          "schema_violation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F15",
+        "category": "schema_violation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation"
+        ],
+        "actual_reasons": [
+          "schema_violation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F16",
+        "category": "missing_citation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "missing_citation"
+        ],
+        "actual_reasons": [
+          "missing_citation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F17",
+        "category": "missing_citation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "missing_citation"
+        ],
+        "actual_reasons": [
+          "missing_citation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F18",
+        "category": "invalid_citation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "invalid_citation"
+        ],
+        "actual_reasons": [
+          "invalid_citation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F19",
+        "category": "invalid_citation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "invalid_citation"
+        ],
+        "actual_reasons": [
+          "invalid_citation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F20",
+        "category": "invalid_citation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "invalid_citation"
+        ],
+        "actual_reasons": [
+          "invalid_citation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F21",
+        "category": "pii_detected",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "pii_detected"
+        ],
+        "actual_reasons": [
+          "pii_detected"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F22",
+        "category": "pii_detected",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "pii_detected"
+        ],
+        "actual_reasons": [
+          "pii_detected"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F23",
+        "category": "pii_detected",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "pii_detected"
+        ],
+        "actual_reasons": [
+          "pii_detected"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F24",
+        "category": "pii_detected",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "pii_detected"
+        ],
+        "actual_reasons": [
+          "pii_detected"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F25",
+        "category": "combined",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation",
+          "pii_detected"
+        ],
+        "actual_reasons": [
+          "schema_violation",
+          "pii_detected"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F26",
+        "category": "combined",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "missing_citation",
+          "invalid_citation"
+        ],
+        "actual_reasons": [
+          "missing_citation",
+          "invalid_citation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F27",
+        "category": "combined",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation",
+          "missing_citation",
+          "invalid_citation",
+          "pii_detected"
+        ],
+        "actual_reasons": [
+          "schema_violation",
+          "missing_citation",
+          "invalid_citation",
+          "pii_detected"
+        ],
+        "matched": true
+      }
+    ]
+  },
+  "limits": {
+    "pii": "L1 은 패턴형 PII 만 검사한다. 이름·주소 등 비패턴형은 어느 층의 대상도 아니다.",
+    "content": "L1 은 내용의 진위를 검사하지 않는다 — 그 층은 L2 이고, 끄면 없다.",
+    "measurement_2": "확률 층이라 재실행하면 값이 달라진다. 일치율에 초안 전 인계 포함.",
+    "measurement_3": "확률 층이고 과금된다. 목표치는 미확정이라 달성 판정이 없다."
+  },
+  "deferred": [
+    "L1 필터링에 의한 L2 호출 감소율",
+    "RAG 검색 품질 단계별 개선표",
+    "비패턴형 개인정보(이름·주소) 검출"
+  ],
+  "measurement_2_pipeline_agreement": {
+    "executed": true,
+    "deterministic": false,
+    "includes_pre_draft_escalation": true,
+    "total": 30,
+    "matched": 26,
+    "match_rate": 0.8666666666666667,
+    "bait_total": 5,
+    "bait_reject_reproduced": 1,
+    "bait_reject_recall": 0.2,
+    "forbidden_watch_total": 1,
+    "forbidden_violations": 0,
+    "latency_p50_ms": 11060,
+    "latency_p95_ms": 42233,
+    "tokens": {
+      "generation_input_total": 37164,
+      "generation_output_total": 4599,
+      "embedding_total": 437,
+      "judge_input_total": 86539,
+      "judge_output_total": 19384,
+      "generation_per_inquiry": 1392.1,
+      "embedding_per_inquiry": 14.566666666666666,
+      "judge_per_inquiry": 3530.766666666667,
+      "total_per_inquiry": 4937.433333333333
+    },
+    "status_counts": {
+      "answered": 21,
+      "escalated": 9
+    },
+    "escalation_counts": {
+      "no_evidence": 1,
+      "rejected_twice": 4,
+      "missing_order_ref": 2,
+      "order_not_found": 2
+    },
+    "outcomes": [
+      {
+        "case_id": "G01",
+        "category": "normal",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "reject",
+          "pass"
+        ],
+        "reject_reasons": [
+          "contradictory_evidence"
+        ],
+        "latency_ms": 42233,
+        "input_tokens": 2063,
+        "output_tokens": 244,
+        "embedding_tokens": 33,
+        "judge_input_tokens": 6237,
+        "judge_output_tokens": 2881,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G02",
+        "category": "normal",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 20860,
+        "input_tokens": 1058,
+        "output_tokens": 266,
+        "embedding_tokens": 22,
+        "judge_input_tokens": 3368,
+        "judge_output_tokens": 1276,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G03",
+        "category": "normal",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 14148,
+        "input_tokens": 1034,
+        "output_tokens": 226,
+        "embedding_tokens": 16,
+        "judge_input_tokens": 3591,
+        "judge_output_tokens": 753,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G04",
+        "category": "normal",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 10958,
+        "input_tokens": 805,
+        "output_tokens": 121,
+        "embedding_tokens": 33,
+        "judge_input_tokens": 2802,
+        "judge_output_tokens": 361,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G05",
+        "category": "normal",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 10650,
+        "input_tokens": 1025,
+        "output_tokens": 98,
+        "embedding_tokens": 24,
+        "judge_input_tokens": 3028,
+        "judge_output_tokens": 350,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G06",
+        "category": "normal",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 11060,
+        "input_tokens": 1076,
+        "output_tokens": 183,
+        "embedding_tokens": 21,
+        "judge_input_tokens": 3394,
+        "judge_output_tokens": 392,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G07",
+        "category": "normal",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 10130,
+        "input_tokens": 695,
+        "output_tokens": 87,
+        "embedding_tokens": 18,
+        "judge_input_tokens": 2542,
+        "judge_output_tokens": 247,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G08",
+        "category": "normal",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 10119,
+        "input_tokens": 1061,
+        "output_tokens": 95,
+        "embedding_tokens": 22,
+        "judge_input_tokens": 3067,
+        "judge_output_tokens": 371,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G09",
+        "category": "normal",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 10660,
+        "input_tokens": 1440,
+        "output_tokens": 182,
+        "embedding_tokens": 0,
+        "judge_input_tokens": 2992,
+        "judge_output_tokens": 211,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G10",
+        "category": "normal",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 8918,
+        "input_tokens": 1433,
+        "output_tokens": 184,
+        "embedding_tokens": 0,
+        "judge_input_tokens": 2948,
+        "judge_output_tokens": 191,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G11",
+        "category": "normal",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 10631,
+        "input_tokens": 1411,
+        "output_tokens": 148,
+        "embedding_tokens": 0,
+        "judge_input_tokens": 2626,
+        "judge_output_tokens": 301,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G12",
+        "category": "normal",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 23468,
+        "input_tokens": 1824,
+        "output_tokens": 256,
+        "embedding_tokens": 18,
+        "judge_input_tokens": 3674,
+        "judge_output_tokens": 1404,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G13",
+        "category": "normal",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 10370,
+        "input_tokens": 1424,
+        "output_tokens": 138,
+        "embedding_tokens": 0,
+        "judge_input_tokens": 2600,
+        "judge_output_tokens": 147,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G14",
+        "category": "normal",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 14241,
+        "input_tokens": 1440,
+        "output_tokens": 244,
+        "embedding_tokens": 0,
+        "judge_input_tokens": 2982,
+        "judge_output_tokens": 623,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G15",
+        "category": "normal",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 14207,
+        "input_tokens": 1887,
+        "output_tokens": 214,
+        "embedding_tokens": 30,
+        "judge_input_tokens": 3646,
+        "judge_output_tokens": 521,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G16",
+        "category": "reject_bait",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 15150,
+        "input_tokens": 1034,
+        "output_tokens": 129,
+        "embedding_tokens": 15,
+        "judge_input_tokens": 3279,
+        "judge_output_tokens": 733,
+        "matched": false,
+        "mismatches": [
+          "기각을 기대했으나 어떤 시도도 기각되지 않았다"
+        ],
+        "error": null
+      },
+      {
+        "case_id": "G17",
+        "category": "reject_bait",
+        "status": "escalated",
+        "escalation_reason": "no_evidence",
+        "failed_stage": null,
+        "attempt_verdicts": [],
+        "reject_reasons": [],
+        "latency_ms": 1738,
+        "input_tokens": 216,
+        "output_tokens": 12,
+        "embedding_tokens": 26,
+        "judge_input_tokens": 0,
+        "judge_output_tokens": 0,
+        "matched": false,
+        "mismatches": [
+          "기각을 기대했으나 어떤 시도도 기각되지 않았다"
+        ],
+        "error": null
+      },
+      {
+        "case_id": "G18",
+        "category": "reject_bait",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "reject",
+          "pass"
+        ],
+        "reject_reasons": [
+          "contradictory_evidence"
+        ],
+        "latency_ms": 48330,
+        "input_tokens": 2119,
+        "output_tokens": 274,
+        "embedding_tokens": 28,
+        "judge_input_tokens": 6559,
+        "judge_output_tokens": 3008,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G19",
+        "category": "reject_bait",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 16699,
+        "input_tokens": 868,
+        "output_tokens": 157,
+        "embedding_tokens": 24,
+        "judge_input_tokens": 3020,
+        "judge_output_tokens": 944,
+        "matched": false,
+        "mismatches": [
+          "기각을 기대했으나 어떤 시도도 기각되지 않았다"
+        ],
+        "error": null
+      },
+      {
+        "case_id": "G20",
+        "category": "reject_bait",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 14620,
+        "input_tokens": 1034,
+        "output_tokens": 119,
+        "embedding_tokens": 25,
+        "judge_input_tokens": 3123,
+        "judge_output_tokens": 852,
+        "matched": false,
+        "mismatches": [
+          "기각을 기대했으나 어떤 시도도 기각되지 않았다"
+        ],
+        "error": null
+      },
+      {
+        "case_id": "G21",
+        "category": "no_evidence",
+        "status": "escalated",
+        "escalation_reason": "rejected_twice",
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "reject",
+          "reject"
+        ],
+        "reject_reasons": [
+          "unsupported_claim",
+          "schema_violation"
+        ],
+        "latency_ms": 18857,
+        "input_tokens": 2192,
+        "output_tokens": 211,
+        "embedding_tokens": 25,
+        "judge_input_tokens": 3473,
+        "judge_output_tokens": 1016,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G22",
+        "category": "no_evidence",
+        "status": "escalated",
+        "escalation_reason": "rejected_twice",
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "reject",
+          "reject"
+        ],
+        "reject_reasons": [
+          "missing_citation",
+          "unsupported_claim"
+        ],
+        "latency_ms": 16080,
+        "input_tokens": 1939,
+        "output_tokens": 138,
+        "embedding_tokens": 22,
+        "judge_input_tokens": 3400,
+        "judge_output_tokens": 706,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G23",
+        "category": "no_evidence",
+        "status": "escalated",
+        "escalation_reason": "rejected_twice",
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "reject",
+          "reject"
+        ],
+        "reject_reasons": [
+          "missing_citation",
+          "unsupported_claim"
+        ],
+        "latency_ms": 16609,
+        "input_tokens": 1755,
+        "output_tokens": 275,
+        "embedding_tokens": 20,
+        "judge_input_tokens": 3141,
+        "judge_output_tokens": 416,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G24",
+        "category": "no_evidence",
+        "status": "escalated",
+        "escalation_reason": "rejected_twice",
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "reject",
+          "reject"
+        ],
+        "reject_reasons": [
+          "missing_citation",
+          "unsupported_claim"
+        ],
+        "latency_ms": 12581,
+        "input_tokens": 1919,
+        "output_tokens": 131,
+        "embedding_tokens": 15,
+        "judge_input_tokens": 3380,
+        "judge_output_tokens": 507,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G25",
+        "category": "escalation",
+        "status": "escalated",
+        "escalation_reason": "missing_order_ref",
+        "failed_stage": null,
+        "attempt_verdicts": [],
+        "reject_reasons": [],
+        "latency_ms": 1450,
+        "input_tokens": 208,
+        "output_tokens": 12,
+        "embedding_tokens": 0,
+        "judge_input_tokens": 0,
+        "judge_output_tokens": 0,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G26",
+        "category": "escalation",
+        "status": "escalated",
+        "escalation_reason": "missing_order_ref",
+        "failed_stage": null,
+        "attempt_verdicts": [],
+        "reject_reasons": [],
+        "latency_ms": 2191,
+        "input_tokens": 212,
+        "output_tokens": 12,
+        "embedding_tokens": 0,
+        "judge_input_tokens": 0,
+        "judge_output_tokens": 0,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G27",
+        "category": "escalation",
+        "status": "escalated",
+        "escalation_reason": "order_not_found",
+        "failed_stage": null,
+        "attempt_verdicts": [],
+        "reject_reasons": [],
+        "latency_ms": 1780,
+        "input_tokens": 215,
+        "output_tokens": 12,
+        "embedding_tokens": 0,
+        "judge_input_tokens": 0,
+        "judge_output_tokens": 0,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G28",
+        "category": "escalation",
+        "status": "escalated",
+        "escalation_reason": "order_not_found",
+        "failed_stage": null,
+        "attempt_verdicts": [],
+        "reject_reasons": [],
+        "latency_ms": 1950,
+        "input_tokens": 211,
+        "output_tokens": 12,
+        "embedding_tokens": 0,
+        "judge_input_tokens": 0,
+        "judge_output_tokens": 0,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G29",
+        "category": "escalation",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "pass"
+        ],
+        "reject_reasons": [],
+        "latency_ms": 10957,
+        "input_tokens": 1370,
+        "output_tokens": 180,
+        "embedding_tokens": 0,
+        "judge_input_tokens": 2647,
+        "judge_output_tokens": 206,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      },
+      {
+        "case_id": "G30",
+        "category": "escalation",
+        "status": "answered",
+        "escalation_reason": null,
+        "failed_stage": null,
+        "attempt_verdicts": [
+          "reject",
+          "pass"
+        ],
+        "reject_reasons": [
+          "unsupported_claim"
+        ],
+        "latency_ms": 23040,
+        "input_tokens": 2196,
+        "output_tokens": 239,
+        "embedding_tokens": 0,
+        "judge_input_tokens": 5020,
+        "judge_output_tokens": 967,
+        "matched": true,
+        "mismatches": [],
+        "error": null
+      }
+    ]
+  },
+  "measurement_3_l2_judge_accuracy": {
+    "executed": true,
+    "is_real": true,
+    "deterministic": false,
+    "billed": true,
+    "target": null,
+    "target_note": "미확정 — 첫 실측 후 확정",
+    "total": 11,
+    "judged_total": 11,
+    "error_total": 0,
+    "violation_total": 6,
+    "violation_detected": 6,
+    "detection_rate": 1.0,
+    "clean_total": 5,
+    "clean_false_positive": 0,
+    "false_positive_rate": 0.0,
+    "reason_set_exact": 10,
+    "reason_set_exact_rate": 0.9090909090909091,
+    "claim_total": 19,
+    "claim_verdict_matched": 19,
+    "claim_verdict_match_rate": 1.0,
+    "contradiction_expected_total": 4,
+    "contradiction_matched_total": 3,
+    "contradiction_extra_total": 0,
+    "contradiction_recall": 0.75,
+    "tokens": {
+      "input_total": 28861,
+      "output_total": 5745,
+      "per_fixture": 3146.0
+    },
+    "reason_breakdown": [
+      {
+        "reason": "unsupported_claim",
+        "expected_count": 4,
+        "detected_count": 4,
+        "detection_rate": 1.0,
+        "spurious_count": 0
+      },
+      {
+        "reason": "contradictory_evidence",
+        "expected_count": 3,
+        "detected_count": 2,
+        "detection_rate": 0.6666666666666666,
+        "spurious_count": 0
+      }
+    ],
+    "outcomes": [
+      {
+        "fixture_id": "J01",
+        "category": "clean",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "claim_total": 2,
+        "claim_verdict_matched": 2,
+        "contradiction_expected": 0,
+        "contradiction_matched": 0,
+        "contradiction_extra": 0,
+        "input_tokens": 2608,
+        "output_tokens": 278,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J02",
+        "category": "clean",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "claim_total": 2,
+        "claim_verdict_matched": 2,
+        "contradiction_expected": 0,
+        "contradiction_matched": 0,
+        "contradiction_extra": 0,
+        "input_tokens": 2818,
+        "output_tokens": 272,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J03",
+        "category": "adjacent_citation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "unsupported_claim"
+        ],
+        "actual_reasons": [
+          "unsupported_claim"
+        ],
+        "claim_total": 1,
+        "claim_verdict_matched": 1,
+        "contradiction_expected": 0,
+        "contradiction_matched": 0,
+        "contradiction_extra": 0,
+        "input_tokens": 2378,
+        "output_tokens": 347,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J04",
+        "category": "direct_no_value",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "claim_total": 2,
+        "claim_verdict_matched": 2,
+        "contradiction_expected": 0,
+        "contradiction_matched": 0,
+        "contradiction_extra": 0,
+        "input_tokens": 2643,
+        "output_tokens": 765,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J05",
+        "category": "contradiction_unstated",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "contradictory_evidence"
+        ],
+        "actual_reasons": [
+          "contradictory_evidence"
+        ],
+        "claim_total": 1,
+        "claim_verdict_matched": 1,
+        "contradiction_expected": 1,
+        "contradiction_matched": 1,
+        "contradiction_extra": 0,
+        "input_tokens": 2545,
+        "output_tokens": 702,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J06",
+        "category": "contradiction_stated",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "claim_total": 1,
+        "claim_verdict_matched": 1,
+        "contradiction_expected": 1,
+        "contradiction_matched": 1,
+        "contradiction_extra": 0,
+        "input_tokens": 2741,
+        "output_tokens": 647,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J07",
+        "category": "contradiction_uncited",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "contradictory_evidence"
+        ],
+        "actual_reasons": [
+          "contradictory_evidence"
+        ],
+        "claim_total": 2,
+        "claim_verdict_matched": 2,
+        "contradiction_expected": 1,
+        "contradiction_matched": 1,
+        "contradiction_extra": 0,
+        "input_tokens": 2733,
+        "output_tokens": 847,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J08",
+        "category": "mixed",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "unsupported_claim"
+        ],
+        "actual_reasons": [
+          "unsupported_claim"
+        ],
+        "claim_total": 3,
+        "claim_verdict_matched": 3,
+        "contradiction_expected": 0,
+        "contradiction_matched": 0,
+        "contradiction_extra": 0,
+        "input_tokens": 2833,
+        "output_tokens": 525,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J09",
+        "category": "distorted_citation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "unsupported_claim"
+        ],
+        "actual_reasons": [
+          "unsupported_claim"
+        ],
+        "claim_total": 1,
+        "claim_verdict_matched": 1,
+        "contradiction_expected": 0,
+        "contradiction_matched": 0,
+        "contradiction_extra": 0,
+        "input_tokens": 2401,
+        "output_tokens": 234,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J10",
+        "category": "direct_no_value",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "claim_total": 2,
+        "claim_verdict_matched": 2,
+        "contradiction_expected": 0,
+        "contradiction_matched": 0,
+        "contradiction_extra": 0,
+        "input_tokens": 2556,
+        "output_tokens": 638,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J11",
+        "category": "combined",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "unsupported_claim",
+          "contradictory_evidence"
+        ],
+        "actual_reasons": [
+          "unsupported_claim"
+        ],
+        "claim_total": 2,
+        "claim_verdict_matched": 2,
+        "contradiction_expected": 1,
+        "contradiction_matched": 0,
+        "contradiction_extra": 0,
+        "input_tokens": 2605,
+        "output_tokens": 490,
+        "matched": false,
+        "error": null
+      }
+    ]
+  }
+}
