@@ -20,7 +20,11 @@
 * **형식 불일치**는 직전 산출과 사유를 피드백으로 실어 **코드가 1회만** 재시도하고,
   재실패하면 누적 토큰을 실은 `LLMFormatError` 를 위로 던진다 — 호출자가
   `llm_call_failed` 로 매핑한다.
-* **전송 오류**(`LLMCallError`)는 래퍼가 이미 1회 재시도했다 — 그대로 위로 전파한다.
+* **전송 오류**(`LLMCallError`)는 래퍼가 이미 1회 재시도했다 — 여기서 또 재시도하지 않고
+  위로 전파하되, **그때까지 누적된 토큰을 예외에 실어** 보낸다. 1회차가 200 으로 돌아와
+  과금된 뒤 2회차가 전송 오류로 죽는 조합에서 누적분을 버리면 파이프라인이 그 실비용을
+  되찾을 방법이 없다 — 처리 기록·API 응답이 판정 토큰을 싣게 되는 순간(뒤 태스크 몫)
+  그대로 0 으로 굳는다.
 
 판정 호출의 토큰(입력/출력)은 `JudgeOutcome` 에 그대로 노출한다 — 파이프라인이 생성
 토큰과 **분리 집계**해야 하므로(spec 5-3) 생성 합산에 섞지 않는다.
@@ -46,7 +50,7 @@ from reply_gate.contracts import (
     RejectReason,
     Verdict,
 )
-from reply_gate.llm import GenerationClient, JsonCompletion, LLMFormatError
+from reply_gate.llm import GenerationClient, JsonCompletion, LLMCallError, LLMFormatError
 
 __all__ = [
     "JUDGE_JSON_SCHEMA",
@@ -422,8 +426,9 @@ class Judge:
         """초안 1개를 수집 근거 전체와 대조해 판정한다.
 
         형식 불일치는 **코드가 1회만** 재시도하고, 재실패하면 누적 토큰을 실은
-        `LLMFormatError` 를 던진다. 전송 오류(`LLMCallError`)는 잡지 않고 그대로
-        전파한다 — 래퍼가 이미 재시도했으므로 여기서 또 재시도하면 상한이 깨진다.
+        `LLMFormatError` 를 던진다. 전송 오류(`LLMCallError`)는 재시도하지 않고 전파한다 —
+        래퍼가 이미 재시도했으므로 여기서 또 재시도하면 상한이 깨진다. 다만 **누적 토큰은
+        예외에 실어** 보낸다: 두 실패 모두 실비용이므로 호출자가 같은 방식으로 집계한다.
         """
         input_tokens = 0
         output_tokens = 0
@@ -445,6 +450,18 @@ class Judge:
                 error = exc.detail
                 previous_output = exc.raw_text or None
                 continue
+            except LLMCallError as exc:
+                # 재시도는 하지 않되 **앞선 시도에서 이미 과금된 토큰**을 버리지 않는다.
+                # 새 예외로 다시 던지는 것은 대역이 같은 예외 객체를 재사용해도 누적이
+                # 이중으로 실리지 않게 하기 위해서다(원인은 `from exc` 로 잇는다).
+                raise LLMCallError(
+                    stage=exc.stage,
+                    reason=exc.reason,
+                    attempts=exc.attempts,
+                    cause=exc.cause,
+                    input_tokens=input_tokens + exc.input_tokens,
+                    output_tokens=output_tokens + exc.output_tokens,
+                ) from exc
 
             input_tokens += completion.input_tokens
             output_tokens += completion.output_tokens

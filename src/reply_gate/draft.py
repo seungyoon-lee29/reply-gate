@@ -5,8 +5,10 @@
 여기서 고치거나 걸러내지 않는다. 그건 L1 의 일이고, 여기서 미리 막으면 게이트 지표가
 무의미해진다. 구조화 출력으로 스키마를 강제하되(생성 측 수단), L1 검사를 대체하지 않는다.
 
-재생성도 이 모듈이 담당한다: L1 기각 사유 목록을 피드백으로 붙여 **같은 근거로** 다시 생성한다
-(근거 재수집 없음). 재생성 1회 상한을 강제하는 것은 상위 루프(코드)다.
+재생성도 이 모듈이 담당한다: 기각 사유 목록(L1 4종 + L2 2종)과 **L2 판정 상세**(어느
+문장이 왜 뒷받침되지 않았는지, 어느 근거쌍이 모순인지)를 피드백으로 붙여 **같은 근거로**
+다시 생성한다(근거 재수집 없음). 재생성 1회 상한을 강제하는 것은 상위 루프(코드)다.
+피드백 형태는 SQL 검증기 선례를 따른다: **사유 코드 + 무엇을 어떻게 고칠지**.
 
 실패 정책은 docs/standards.md "재시도 상한"을 그대로 따른다.
 - 전송 오류: `llm.OpenAIGenerationClient` 가 이미 1회 재시도했다 — `LLMCallError` 는 그대로 위로
@@ -21,7 +23,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from reply_gate.contracts import DRAFT_JSON_SCHEMA, Evidence, RejectReason
+from reply_gate.contracts import (
+    DRAFT_JSON_SCHEMA,
+    Evidence,
+    JudgeResult,
+    RejectReason,
+    Verdict,
+)
 from reply_gate.llm import GenerationClient, LLMFormatError
 
 __all__ = [
@@ -76,6 +84,14 @@ _REJECT_FEEDBACK: dict[RejectReason, str] = {
     RejectReason.PII_DETECTED: (
         "근거에 없는 전화번호·이메일 같은 값이 답변에 있었다. 근거에 적힌 값만 쓴다."
     ),
+    RejectReason.UNSUPPORTED_CLAIM: (
+        "인용한 근거가 그 문장을 뒷받침하지 않았다. 각 문장을 그 주제를 실제로 다루는 근거로 "
+        "다시 딛고, 근거가 말하지 않는 내용은 단정하지 않는다."
+    ),
+    RejectReason.CONTRADICTORY_EVIDENCE: (
+        "근거끼리 서로 어긋나는데 초안이 그것을 밝히지 않았다. **모순을 명시하고 두 기준을 "
+        "모두 안내한다** — 한쪽만 골라 답하지 않는다."
+    ),
 }
 
 
@@ -98,27 +114,62 @@ def _format_reject_reasons(reasons: Sequence[RejectReason]) -> str:
     return "\n".join(lines)
 
 
+def _format_judge_detail(result: JudgeResult) -> str:
+    """L2 판정 상세 — **기각된 claim** 과 모순 근거쌍만 싣는다.
+
+    통과한 claim 의 설명까지 실으면 프롬프트가 길어지기만 하고 고칠 지점이 흐려진다.
+    """
+    lines: list[str] = []
+    rejected = [
+        judgment for judgment in result.claim_judgments if judgment.verdict is Verdict.REJECT
+    ]
+    if rejected:
+        lines.append("- 인용 근거가 뒷받침하지 않는다고 판정된 문장:")
+        lines.extend(
+            f'  - "{judgment.claim_text}" → {judgment.explanation}' for judgment in rejected
+        )
+    if result.contradictions:
+        lines.append("- 서로 어긋나는 근거쌍:")
+        lines.extend(
+            f"  - {item.evidence_id_a} ↔ {item.evidence_id_b}: {item.explanation}"
+            for item in result.contradictions
+        )
+    return "\n".join(lines)
+
+
 def build_draft_user_prompt(
     *,
     inquiry: str,
     evidence: Sequence[Evidence],
     reject_reasons: Sequence[RejectReason] = (),
+    judge_result: JudgeResult | None = None,
 ) -> str:
-    """문의 + 근거(+ 재생성이면 기각 사유)를 사용자 프롬프트로 조립한다.
+    """문의 + 근거(+ 재생성이면 기각 사유와 L2 판정 상세)를 사용자 프롬프트로 조립한다.
 
     `reject_reasons` 가 비어 있으면 최초 생성, 비어 있지 않으면 재생성이다. 두 경우 모두
     **같은 근거 집합**을 그대로 싣는다 — 근거 재수집은 이 모듈의 일이 아니다.
+
+    `judge_result` 는 직전 시도의 L2 판정이다(L2 가 실행되지 않았으면 `None`). 사유 코드는
+    무엇이 틀렸는지만 말하므로, claim 단위 상세가 있어야 재생성이 **어느 문장을** 고칠지
+    안다.
     """
     sections = [
         f"[문의]\n{inquiry}",
         f"[근거]\n{_format_evidence(evidence)}",
     ]
-    if reject_reasons:
-        sections.append(
-            "[직전 초안이 기각된 사유]\n"
-            f"{_format_reject_reasons(reject_reasons)}\n\n"
-            "위 근거를 그대로 다시 써서 초안을 새로 작성한다. 근거를 새로 찾거나 추가하지 않는다."
+    if reject_reasons or judge_result is not None:
+        block = ["[직전 초안이 기각된 사유]", _format_reject_reasons(reject_reasons)]
+        detail = "" if judge_result is None else _format_judge_detail(judge_result)
+        if detail:
+            block.extend(["", "[판정 세부 — 어느 문장이 왜]", detail])
+        block.extend(
+            [
+                "",
+                "위 근거를 그대로 다시 써서 초안을 새로 작성한다. "
+                "근거를 새로 찾거나 추가하지 않는다.",
+            ]
         )
+        sections.append("\n".join(block))
     return "\n\n".join(sections)
 
 
@@ -149,14 +200,18 @@ class DraftGenerator:
         inquiry: str,
         evidence: Sequence[Evidence],
         reject_reasons: Sequence[RejectReason] = (),
+        judge_result: JudgeResult | None = None,
     ) -> DraftGeneration:
-        """초안을 1회 생성한다. `reject_reasons` 를 주면 같은 근거로 재생성한다.
+        """초안을 1회 생성한다. 기각 사유·L2 상세를 주면 같은 근거로 재생성한다.
 
         전송 오류(`LLMCallError`)는 그대로 위로 던진다 — 호출자가 `llm_call_failed` 인계로
         매핑한다. 형식 불일치는 재시도하지 않고 원문을 원시 산출로 담아 돌려준다.
         """
         user = build_draft_user_prompt(
-            inquiry=inquiry, evidence=evidence, reject_reasons=reject_reasons
+            inquiry=inquiry,
+            evidence=evidence,
+            reject_reasons=reject_reasons,
+            judge_result=judge_result,
         )
         try:
             completion = self._client.complete_json(

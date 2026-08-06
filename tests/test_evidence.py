@@ -327,6 +327,76 @@ def test_의도_분류_전송_오류도_llm_call_failed() -> None:
     assert result.failed_stage == INTENT_STAGE
 
 
+def test_수집_전송_오류가_실은_과금_토큰도_수집_합산에_남는다() -> None:
+    """거절처럼 200 으로 돌아온 실패도 과금된다 — 수집 경로만 그 토큰을 버리면 안 된다.
+
+    "실행됐으나 실패한 호출의 토큰도 그대로 집계한다"(이번 사이클 스펙). 초안·판정 경로는
+    이미 집계하므로, 같은 거절이 어느 단계에서 났느냐로 실비용 기록이 갈리면 안 된다.
+    """
+    client = _client(
+        {
+            INTENT_STAGE: [
+                LLMCallError(
+                    stage=INTENT_STAGE,
+                    reason="refusal",
+                    attempts=1,
+                    input_tokens=9,
+                    output_tokens=4,
+                )
+            ]
+        }
+    )
+
+    result = _collector(client).collect(
+        inquiry_id=INQUIRY_ID,
+        content=INQUIRY,
+        order_no=None,
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    assert result.escalation_reason is EscalationReason.LLM_CALL_FAILED
+    assert (result.input_tokens, result.output_tokens) == (9, 4)
+
+
+def test_의도_형식_실패_뒤_전송_오류라도_과금된_토큰이_수집_합산에_남는다() -> None:
+    """의도 해석의 재시도 루프도 앞선 시도의 과금분을 실어 보낸다.
+
+    1회차가 200 으로 돌아왔지만 형식이 깨졌고(과금됨) 2회차가 거절로 죽으면, 1회차
+    토큰은 예외에 실리지 않는 한 사라진다 — `judge.Judge.judge` 와 같은 형태로 막는다.
+    """
+    client = _client(
+        {
+            INTENT_STAGE: [
+                LLMFormatError(
+                    stage=INTENT_STAGE,
+                    detail="형식 불일치",
+                    input_tokens=10,
+                    output_tokens=5,
+                ),
+                LLMCallError(
+                    stage=INTENT_STAGE,
+                    reason="refusal",
+                    attempts=1,
+                    input_tokens=9,
+                    output_tokens=4,
+                ),
+            ]
+        }
+    )
+
+    result = _collector(client).collect(
+        inquiry_id=INQUIRY_ID,
+        content=INQUIRY,
+        order_no=None,
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    assert result.escalation_reason is EscalationReason.LLM_CALL_FAILED
+    assert (result.input_tokens, result.output_tokens) == (19, 9)
+
+
 # ── 존재성 선검사 (DB 필요) ─────────────────────────────────────────────────
 
 

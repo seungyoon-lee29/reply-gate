@@ -49,6 +49,13 @@ class LLMCallError(RuntimeError):
     """전송 오류가 재시도 후에도 지속됨 → 인계 사유 `llm_call_failed`.
 
     `stage` 는 실패한 단계 이름이며 처리 기록에 그대로 남는다.
+
+    토큰(`input_tokens`/`output_tokens`)은 **이 실패까지 실제로 과금된 분**이고 기본값은
+    0 이다. 전송이 아예 성립하지 않은 실패(연결 오류·4xx)는 과금이 없어 0 이지만, 응답이
+    200 으로 돌아온 뒤 쓸 수 있는 산출이 없는 실패(거절)와 여러 번 호출한 뒤의 실패는
+    과금분이 있다 — 그것을 여기 싣지 않으면 호출자가 실비용을 0 으로 기록한다.
+    규칙은 **실행됐으나 실패한 호출의 토큰도 그대로 집계한다**이며, 이번 사이클 스펙이
+    출처다(문서에는 아직 계열 분리 규칙만 있다 — `docs/contracts.md` 의 `metrics.tokens`).
     """
 
     def __init__(
@@ -58,12 +65,16 @@ class LLMCallError(RuntimeError):
         reason: str,
         attempts: int,
         cause: BaseException | None = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
     ) -> None:
         super().__init__(f"LLM 호출 실패 (stage={stage}, reason={reason}, attempts={attempts})")
         self.stage = stage
         self.reason = reason
         self.attempts = attempts
         self.cause = cause
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
 
 
 class LLMFormatError(ValueError):
@@ -280,9 +291,16 @@ class OpenAIGenerationClient:
         output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
 
         # 안전 분류기가 거절하면 사용 가능한 산출이 없으므로 실패다.
+        # 응답은 200 으로 왔으므로 **토큰은 이미 과금됐다** — 실패에 실어 보낸다.
         refusal = _refusal_text(response)
         if refusal is not None:
-            raise LLMCallError(stage=stage, reason="refusal", attempts=1)
+            raise LLMCallError(
+                stage=stage,
+                reason="refusal",
+                attempts=1,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
 
         text = response.output_text or ""
         return _parse_json_completion(
@@ -375,8 +393,15 @@ class AnthropicGenerationClient:
 
         # 안전 분류기 거절은 HTTP 200 + stop_reason="refusal" 로 온다.
         # 사용 가능한 산출이 없으므로 실패다 (OpenAI 래퍼의 거절 처리와 동수준).
+        # 200 으로 온 응답이라 **입력 토큰은 이미 과금됐다** — 실패에 실어 보낸다.
         if getattr(response, "stop_reason", None) == "refusal":
-            raise LLMCallError(stage=stage, reason="refusal", attempts=1)
+            raise LLMCallError(
+                stage=stage,
+                reason="refusal",
+                attempts=1,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
 
         # adaptive thinking 이 켜져 있으면 text 블록 앞에 thinking 블록이 올 수 있다 —
         # 위치가 아니라 블록 타입으로 골라낸다.

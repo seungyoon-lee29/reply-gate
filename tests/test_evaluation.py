@@ -22,6 +22,7 @@ from typing import Any, cast
 import psycopg
 import pytest
 from psycopg.rows import DictRow
+from scripts import evaluate
 
 from reply_gate.config import Settings
 from reply_gate.contracts import (
@@ -736,6 +737,120 @@ def test_리포트는_사람용과_기계용_두_형식을_낸다(tmp_path: Path
     assert len(payload["measurement_1_l1_gate_accuracy"]["outcomes"]) == len(FIXTURES)
 
 
+# ── 실행 진입점의 가드 (scripts/evaluate.py — DB·LLM 없이 돈다) ──────────────
+#
+# 가드는 얇지만 **돌릴 수 없는 실행을 산출물 이전에 죽이는** 자리다. 여기가 새면
+# 무엇을 잰 것인지 알 수 없는 리포트가 남고, 라이브 리포트는 덮어쓸 수 없다.
+
+
+def _l2_settings(*, live_keys: bool = True, judge_key: bool = True) -> Settings:
+    key = "키가-아닌-테스트값"
+    return Settings(
+        l2_enabled=True,
+        openai_api_key=key if live_keys else "",
+        anthropic_api_key=key if judge_key else "",
+    )
+
+
+def _block_outbound_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """가드가 걷혀도 이 테스트가 실제 API 를 부르는 일이 없게 막는다 (측정 1 패턴과 같다)."""
+
+    def _blocked(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("가드가 막아야 할 실행이 외부 호출까지 갔다")
+
+    monkeypatch.setattr(socket.socket, "connect", _blocked)
+    monkeypatch.setattr(socket, "create_connection", _blocked)
+
+
+def test_stub_llm_은_L2_켜짐에서_산출물을_남기지_않고_멈춘다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """결정론 판정 대역이 없으므로 대역 실행이 실제 판정 모델을 부르게 된다 — 명시적으로 죽는다.
+
+    조용히 `l2_enabled=False` 로 낮춰 돌리면 대역 수치가 사이클 1 을 잰 것인지 L2 를
+    포함해 잰 것인지 알 수 없게 된다.
+    """
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings())
+    _block_outbound_sockets(monkeypatch)
+
+    with pytest.raises(SystemExit) as excinfo:
+        evaluate.main(["--stub-llm", "--out-dir", str(tmp_path)])
+
+    assert "결정론 판정" in str(excinfo.value)
+    # 측정 1(무료)조차 시작하기 전에 죽는다 — 리포트 파일이 남으면 안 된다.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_live_는_실측이_돌_조건에서만_L2_켜짐으로_멈춘다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """라이브 리포트는 덮어쓸 수 없다 — "L2 포함 여부 불명"인 실측이 영구히 남으면 안 된다.
+
+    가드가 발화하는 조건은 **실측 이름을 받을 실행**, 즉 키도 DB 도 갖춰져 측정 2 가
+    실제로 돌 때다. 그래서 여기서는 미실행 사유를 없애(`database_unavailable_reason`
+    → None) 실측이 돌 상태를 만든다.
+    """
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings())
+    monkeypatch.setattr(evaluate, "database_unavailable_reason", lambda *, settings: None)
+    _block_outbound_sockets(monkeypatch)
+
+    with pytest.raises(SystemExit) as excinfo:
+        evaluate.main(["--live", "--out-dir", str(tmp_path)])
+
+    message = str(excinfo.value)
+    assert "L2 판정이 켜져 있는데" in message
+    # 이 가드가 임시라는 사실이 오류 메시지에 남아야 뒤 태스크가 걷어낼 자리를 안다.
+    assert "하네스 확장 태스크" in message
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_키_없는_live_는_죽지_않고_측정1_과_미실행_사유를_남긴다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """키가 없으면 측정 2 는 미실행이라 실측 이름을 받지 못한다 — 막을 피해가 없다.
+
+    이때 가드가 죽이면 무료인 측정 1 산출물까지 잃는다. 리포트는 덮어쓸 수 있는
+    `evaluation` 계열로 남고, 측정 2 는 **미실행 + 사유**로 기록된다
+    (`scripts/AGENTS.md` 불변식 5).
+    """
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings(live_keys=False))
+    _block_outbound_sockets(monkeypatch)
+
+    assert evaluate.main(["--live", "--out-dir", str(tmp_path)]) == 0
+
+    payload = json.loads((tmp_path / "evaluation.json").read_text(encoding="utf-8"))
+    assert payload["measurement_2_pipeline_agreement"]["executed"] is False
+    assert "OPENAI_API_KEY" in payload["measurement_2_pipeline_agreement"]["skip_reason"]
+    # 측정 1 은 그대로 산출된다 — 무료 측정을 라이브 가드가 인질로 잡지 않는다.
+    assert payload["measurement_1_l1_gate_accuracy"]["llm_calls"] == 0
+    # 비실측이므로 라이브 이름 계열은 만들어지지 않는다.
+    assert not list(tmp_path.glob("evaluation-live*"))
+
+
+def test_판정_키가_없으면_측정2_를_시작하지_않는다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """시작해 놓고 첫 판정 호출에서 죽으면 30건 중 일부만 과금하고 산출물은 없다.
+
+    이 사유는 **CLI 경로에서 실제로 관측된다** — 라이브 가드가 먼저 죽이면 도달할 수 없는
+    죽은 분기가 되므로, 판정을 private 함수 직접 호출이 아니라 `main` 산출물로 확인한다.
+    """
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings(judge_key=False))
+    monkeypatch.setattr(evaluate, "database_unavailable_reason", lambda *, settings: "DB 사유")
+    _block_outbound_sockets(monkeypatch)
+
+    assert evaluate.main(["--live", "--out-dir", str(tmp_path)]) == 0
+
+    payload = json.loads((tmp_path / "evaluation.json").read_text(encoding="utf-8"))
+    assert "ANTHROPIC_API_KEY" in payload["measurement_2_pipeline_agreement"]["skip_reason"]
+
+    # 양성 대조 — L2 가 꺼져 있으면 판정 키 부재는 사유가 아니고 뒤 검사(DB)로 넘어간다.
+    args = evaluate.build_parser().parse_args(["--live"])
+    settings = _l2_settings(judge_key=False).model_copy(update={"l2_enabled": False})
+    assert evaluate._skip_reason(args=args, settings=settings) == "DB 사유"
+
+
 # ── 배관 전체 (대역 LLM + 시딩된 DB) ────────────────────────────────────────
 
 
@@ -756,12 +871,21 @@ def test_하네스가_골든셋_30건을_대역으로_끝까지_흘려_리포트
     ro_conn: psycopg.Connection[DictRow],
     tmp_path: Path,
 ) -> None:
-    """API 키가 없어도 배관은 끝까지 검증된다 — 키가 생기면 바로 돌아야 하기 때문이다."""
+    """API 키가 없어도 배관은 끝까지 검증된다 — 키가 생기면 바로 돌아야 하기 때문이다.
+
+    **L2 는 꺼서** 돌린다: 결정론 판정 대역이 아직 없어(하네스 확장 태스크 몫) 켜면 실제
+    판정 모델을 부르게 된다. L2 켜짐 대역 커버리지는 그 태스크가 복원한다.
+    """
     stub = StubGenerationClient()
     pipeline = build_pipeline(
         generation_client=cast(GenerationClient, stub),
         embedding_client=LexicalEmbeddingClient(dimensions=1536),
-        settings=Settings(vector_top_k=5, vector_similarity_threshold=0.05, sql_max_rows=50),
+        settings=Settings(
+            vector_top_k=5,
+            vector_similarity_threshold=0.05,
+            sql_max_rows=50,
+            l2_enabled=False,
+        ),
     )
 
     agreement = measure_pipeline_agreement(
@@ -803,12 +927,20 @@ def test_하네스가_골든셋_30건을_대역으로_끝까지_흘려_리포트
 def test_대역_LLM_은_미끼_조항에서_기각을_재현한다(
     app_conn: psycopg.Connection[DictRow], ro_conn: psycopg.Connection[DictRow]
 ) -> None:
-    """미끼 조항 문의 → 근거에 없는 번호 생성 → `pii_detected` 기각 → 재생성 통과."""
+    """미끼 조항 문의 → 근거에 없는 번호 생성 → `pii_detected` 기각 → 재생성 통과.
+
+    L1 층의 기각 재현이므로 **L2 는 꺼서** 사이클 1 동작으로 확인한다.
+    """
     stub = StubGenerationClient()
     pipeline = build_pipeline(
         generation_client=cast(GenerationClient, stub),
         embedding_client=LexicalEmbeddingClient(dimensions=1536),
-        settings=Settings(vector_top_k=5, vector_similarity_threshold=0.05, sql_max_rows=50),
+        settings=Settings(
+            vector_top_k=5,
+            vector_similarity_threshold=0.05,
+            sql_max_rows=50,
+            l2_enabled=False,
+        ),
     )
     bait = next(case for case in GOLDEN if case.id == "G16")
 

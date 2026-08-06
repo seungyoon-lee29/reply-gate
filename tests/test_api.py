@@ -7,6 +7,10 @@
 접수 검증(빈 내용·주문번호 형식)은 **파이프라인을 돌리지 않고** 422 로 끝난다 — 인계가
 아니다. 그 증거로 대역 서비스의 호출 기록이 비어 있는지 확인한다.
 
+자격 증명 부재는 **503 설정 오류**다(인계가 아니다). 판정 키(`ANTHROPIC_API_KEY`)는
+L2 가 켜져 있을 때 **POST 진입 시 선검사**한다 — 이 선검사가 조회·422 경로까지 번지면
+키 없는 환경에서 조회가 죽으므로, 그 경계를 여기서 못박는다.
+
 DB 가 필요한 테스트는 `db` 마커가 붙고, 쓰기는 전부 `app_conn` 트랜잭션 안에서만 일어나
 픽스처 롤백으로 되돌아간다.
 """
@@ -101,6 +105,23 @@ def recorder() -> Iterator[RecordingService]:
 def client() -> Iterator[TestClient]:
     with TestClient(app) as test_client:
         yield test_client
+
+
+def api_settings(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> Settings:
+    """`api.get_settings` 를 고정한다 — POST 선검사가 보는 설정이다.
+
+    선검사는 프로세스 설정(`.env`)을 읽으므로, 고정하지 않으면 로컬에 판정 키가 있느냐로
+    테스트 결과가 갈린다. 다른 값(DB 접속 등)은 평소대로 `.env` 에서 온다.
+    """
+    settings = Settings(**overrides)
+    monkeypatch.setattr("reply_gate.api.get_settings", lambda: settings)
+    return settings
+
+
+@pytest.fixture(autouse=True)
+def default_api_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
+    """기본값은 **L2 꺼짐** — 판정 키 경로를 보는 테스트가 각자 다시 주입한다."""
+    return api_settings(monkeypatch, l2_enabled=False)
 
 
 @contextmanager
@@ -365,8 +386,11 @@ def test_처리_기록이_DB_에_남는다(
 
 
 def keyless_pipeline() -> InquiryPipeline:
+    """생성 키도 판정 키도 없는 조립 — **스위치는 켜 둔다**(조립이 키를 요구하지 않아야 한다)."""
     settings = Settings(
         openai_api_key="",
+        anthropic_api_key="",
+        l2_enabled=True,
         vector_top_k=5,
         vector_similarity_threshold=0.0,
         sql_max_rows=50,
@@ -439,6 +463,91 @@ def test_API_키가_없으면_POST_는_503_이고_인계로_기록하지_않는�
     after = app_conn.execute("SELECT count(*) AS n FROM inquiries").fetchone()
     assert after is not None
     assert after["n"] == before["n"]
+
+
+# ── 판정 키가 없는 환경 (L2 켜짐 = POST 진입 선검사) ─────────────────────────
+#
+# lazy(L2 에 도달해서야 실패)로 하면 생성 토큰을 태운 뒤 503 이 나고, L1 이 2회 기각하면
+# 키 없이도 정상 종결되어 이 규칙이 조건부가 된다. 그래서 검사는 eager 다 — 단,
+# **POST 경로에만**: 조회·422 는 판정 키와 무관하다.
+
+
+def test_판정_키가_없으면_POST_는_503_이고_파이프라인이_돌지_않는다(
+    client: TestClient, recorder: RecordingService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api_settings(monkeypatch, l2_enabled=True, anthropic_api_key="")
+
+    response = client.post("/inquiries", json={"content": INQUIRY})
+
+    assert response.status_code == 503
+    assert "ANTHROPIC_API_KEY" in response.text
+    assert recorder.calls == []
+
+
+def test_판정_키가_없어도_접수_거부는_그대로_422다(
+    client: TestClient, recorder: RecordingService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """선검사가 422 경로까지 번지면 형식 오류가 설정 오류로 둔갑한다."""
+    api_settings(monkeypatch, l2_enabled=True, anthropic_api_key="")
+
+    response = client.post("/inquiries", json={"content": INQUIRY, "order_no": "12345"})
+
+    assert response.status_code == 422
+    assert recorder.calls == []
+
+
+def test_판정_키가_없어도_조회는_동작한다(
+    client: TestClient, recorder: RecordingService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`GET /inquiries/{id}` 는 DB 만 읽는다 — 판정 자격 증명과 무관해야 한다."""
+    api_settings(monkeypatch, l2_enabled=True, anthropic_api_key="")
+
+    response = client.get("/inquiries/3b0a5a1e-0000-4000-8000-000000000000")
+
+    assert response.status_code == 404
+    assert recorder.calls == [{"fetch": "3b0a5a1e-0000-4000-8000-000000000000"}]
+
+
+@pytest.mark.db
+def test_판정_키_부재_503_은_처리_기록을_남기지_않는다(
+    app_conn: psycopg.Connection[DictRow],
+    ro_conn: psycopg.Connection[DictRow],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """설정 오류는 `llm_call_failed` 인계가 아니다 — 기록으로 남으면 지표가 오염된다."""
+    api_settings(monkeypatch, l2_enabled=True, anthropic_api_key="")
+    before = app_conn.execute("SELECT count(*) AS n FROM inquiries").fetchone()
+    assert before is not None
+
+    # 대본이 빈 생성 대역 — 선검사가 뚫리면 파이프라인이 돌다가 실패해 이 테스트가 깨진다.
+    generation = scripted_client({})
+    with live_client(app_conn=app_conn, ro_conn=ro_conn, generation=generation) as test_client:
+        response = test_client.post("/inquiries", json={"content": INQUIRY})
+
+    assert response.status_code == 503
+    after = app_conn.execute("SELECT count(*) AS n FROM inquiries").fetchone()
+    assert after is not None
+    assert after["n"] == before["n"]
+
+
+@pytest.mark.db
+@pytest.mark.usefixtures("indexed_policies")
+def test_스위치가_꺼져_있으면_판정_키_없이도_POST_가_처리된다(
+    app_conn: psycopg.Connection[DictRow],
+    ro_conn: psycopg.Connection[DictRow],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """양성 대조 — 선검사는 스위치가 켜져 있을 때만 건다."""
+    api_settings(monkeypatch, l2_enabled=False, anthropic_api_key="")
+    generation = scripted_client(
+        {INTENT_STAGE: [intent_completion("policy")], DRAFT_STAGE: [citing_draft()]}
+    )
+
+    with live_client(app_conn=app_conn, ro_conn=ro_conn, generation=generation) as test_client:
+        response = test_client.post("/inquiries", json={"content": INQUIRY})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == InquiryStatus.ANSWERED.value
 
 
 # ── 커넥션 배선 자체 (목으로 덮이는 구간) ────────────────────────────────────
