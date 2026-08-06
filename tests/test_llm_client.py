@@ -6,12 +6,14 @@ import json
 from types import SimpleNamespace
 from typing import Any, cast
 
+import anthropic
 import httpx
 import openai
 import pytest
 
 from reply_gate.llm import (
     MAX_ATTEMPTS,
+    AnthropicGenerationClient,
     LLMCallError,
     LLMFormatError,
     OpenAIEmbeddingClient,
@@ -179,6 +181,159 @@ def test_빈_응답도_형식오류다() -> None:
 
     with pytest.raises(LLMFormatError):
         client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
+
+
+# ── Anthropic 판정 클라이언트 ────────────────────────────────────────────────
+
+
+def _anthropic_response(text: str, *, stop_reason: str = "end_turn") -> SimpleNamespace:
+    """Messages API 응답 대역.
+
+    adaptive thinking 이 모델 기본이라 text 블록 앞에 thinking 블록이 올 수 있다 —
+    래퍼가 블록 타입으로 골라내는지 검증하기 위해 정상 응답에도 항상 끼워 넣는다.
+    거절(stop_reason="refusal")은 content 가 비어 있다.
+    """
+    content: list[SimpleNamespace] = []
+    if stop_reason != "refusal":
+        content = [
+            SimpleNamespace(type="thinking", thinking=""),
+            SimpleNamespace(type="text", text=text),
+        ]
+    return SimpleNamespace(
+        content=content,
+        stop_reason=stop_reason,
+        usage=SimpleNamespace(input_tokens=11, output_tokens=7),
+    )
+
+
+def _anthropic_client(outcomes: list[Any]) -> tuple[AnthropicGenerationClient, _RecordingCalls]:
+    messages = _RecordingCalls(outcomes)
+    fake_sdk = cast(anthropic.Anthropic, SimpleNamespace(messages=messages))
+    client = AnthropicGenerationClient(api_key="test", model="claude-sonnet-5", client=fake_sdk)
+    return client, messages
+
+
+def _anthropic_connection_error() -> anthropic.APIConnectionError:
+    return anthropic.APIConnectionError(request=httpx.Request("POST", "https://example.invalid"))
+
+
+def _anthropic_status_error(status_code: int) -> anthropic.APIStatusError:
+    request = httpx.Request("POST", "https://example.invalid")
+    response = httpx.Response(status_code, request=request, json={"error": {"message": "x"}})
+    return anthropic.APIStatusError("boom", response=response, body=None)
+
+
+def test_anthropic_sdk_자동재시도를_끈다() -> None:
+    """Anthropic SDK 도 기본 2회 자동 재시도한다 — 래퍼가 단독 통제하도록 차단한다."""
+    client = AnthropicGenerationClient(api_key="test", model="claude-sonnet-5")
+    assert client._client.max_retries == 0
+
+
+def test_anthropic_정상_응답은_데이터와_토큰을_돌려준다() -> None:
+    client, messages = _anthropic_client([_anthropic_response(json.dumps({"verdict": "pass"}))])
+
+    result = client.complete_json(stage="judge", system="s", user="u", schema=SCHEMA)
+
+    assert result.data == {"verdict": "pass"}
+    assert (result.input_tokens, result.output_tokens) == (11, 7)
+    assert len(messages.calls) == 1
+
+    call = messages.calls[0]
+    # 결정론을 샘플링 파라미터로 보장하지 않는다 — Sonnet 5 는 기본값 아닌 값을 보내면 400.
+    assert not {"temperature", "top_p", "top_k"} & call.keys()
+    # thinking 설정 미전송 — 미전송은 '끔'이 아니라 adaptive thinking 켜짐이 모델 기본이다.
+    assert "thinking" not in call
+    # effort 는 지정했을 때만 (output_config 안에 실린다).
+    assert "effort" not in call["output_config"]
+    assert call["model"] == "claude-sonnet-5"
+    assert call["output_config"]["format"]["type"] == "json_schema"
+    assert call["output_config"]["format"]["schema"] is SCHEMA
+    # max_tokens 는 thinking+응답 합산 상한이므로 반드시 실린다.
+    assert call["max_tokens"] > 0
+    assert call["system"] == "s"
+    assert call["messages"] == [{"role": "user", "content": "u"}]
+
+
+def test_anthropic_effort_는_지정했을_때만_전달된다() -> None:
+    client, messages = _anthropic_client([_anthropic_response(json.dumps({"verdict": "pass"}))])
+
+    client.complete_json(stage="judge", system="s", user="u", schema=SCHEMA, effort="low")
+
+    assert messages.calls[0]["output_config"]["effort"] == "low"
+
+
+def test_anthropic_전송오류는_1회만_재시도한다() -> None:
+    client, messages = _anthropic_client(
+        [_anthropic_connection_error(), _anthropic_response(json.dumps({"verdict": "pass"}))]
+    )
+
+    result = client.complete_json(stage="judge", system="s", user="u", schema=SCHEMA)
+
+    assert result.data == {"verdict": "pass"}
+    assert len(messages.calls) == MAX_ATTEMPTS
+
+
+def test_anthropic_전송오류가_지속되면_인계용_예외를_던진다() -> None:
+    client, messages = _anthropic_client([_anthropic_connection_error()])
+
+    with pytest.raises(LLMCallError) as excinfo:
+        client.complete_json(stage="judge", system="s", user="u", schema=SCHEMA)
+
+    assert excinfo.value.stage == "judge"
+    assert excinfo.value.reason == "transport_error"
+    assert excinfo.value.attempts == MAX_ATTEMPTS
+    assert len(messages.calls) == MAX_ATTEMPTS
+
+
+def test_anthropic_5xx_는_전송오류로_재시도한다() -> None:
+    client, messages = _anthropic_client(
+        [_anthropic_status_error(503), _anthropic_response(json.dumps({"verdict": "fail"}))]
+    )
+
+    assert client.complete_json(stage="judge", system="s", user="u", schema=SCHEMA).data == {
+        "verdict": "fail"
+    }
+    assert len(messages.calls) == MAX_ATTEMPTS
+
+
+def test_anthropic_4xx_는_재시도하지_않고_즉시_실패한다() -> None:
+    client, messages = _anthropic_client([_anthropic_status_error(400)])
+
+    with pytest.raises(LLMCallError) as excinfo:
+        client.complete_json(stage="judge", system="s", user="u", schema=SCHEMA)
+
+    assert excinfo.value.reason == "api_error"
+    assert excinfo.value.attempts == 1
+    assert len(messages.calls) == 1
+
+
+def test_anthropic_거절_응답은_사용가능한_산출이_없으므로_실패다() -> None:
+    """안전 분류기 거절은 HTTP 200 + stop_reason="refusal" 로 온다 — 오류가 아니라 응답이다."""
+    client, _ = _anthropic_client([_anthropic_response("", stop_reason="refusal")])
+
+    with pytest.raises(LLMCallError) as excinfo:
+        client.complete_json(stage="judge", system="s", user="u", schema=SCHEMA)
+
+    assert excinfo.value.reason == "refusal"
+
+
+def test_anthropic_형식오류는_재시도하지_않고_호출자에게_위임한다() -> None:
+    client, messages = _anthropic_client([_anthropic_response("이건 JSON 이 아니다")])
+
+    with pytest.raises(LLMFormatError) as excinfo:
+        client.complete_json(stage="judge", system="s", user="u", schema=SCHEMA)
+
+    assert excinfo.value.stage == "judge"
+    assert len(messages.calls) == 1
+    assert excinfo.value.raw_text == "이건 JSON 이 아니다"
+    assert (excinfo.value.input_tokens, excinfo.value.output_tokens) == (11, 7)
+
+
+def test_anthropic_빈_응답도_형식오류다() -> None:
+    client, _ = _anthropic_client([_anthropic_response("   ")])
+
+    with pytest.raises(LLMFormatError):
+        client.complete_json(stage="judge", system="s", user="u", schema=SCHEMA)
 
 
 # ── 임베딩 ──────────────────────────────────────────────────────────────────
