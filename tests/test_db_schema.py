@@ -253,6 +253,39 @@ def _insert_inquiry(
     return str(row["id"])
 
 
+def _insert_attempt(
+    conn: psycopg.Connection[DictRow],
+    inquiry_id: str,
+    *,
+    verdict: str = "pass",
+    reject_reasons: list[str] | None = None,
+    l1_verdict: str | None = None,
+    l1_reject_reasons: list[str] | None = None,
+    l2_verdict: str | None = None,
+    l2_reject_reasons: list[str] | None = None,
+    claim_verdicts: Jsonb | None = None,
+    evidence_contradictions: Jsonb | None = None,
+) -> None:
+    conn.execute(
+        """INSERT INTO inquiry_attempts
+               (inquiry_id, attempt_no, verdict, reject_reasons, draft, l1_verdict,
+                l1_reject_reasons, l2_verdict, l2_reject_reasons, claim_verdicts,
+                evidence_contradictions)
+           VALUES (%s, 1, %s, %s, '{}'::jsonb, %s, %s, %s, %s, %s, %s)""",
+        (
+            inquiry_id,
+            verdict,
+            reject_reasons if reject_reasons is not None else [],
+            l1_verdict,
+            l1_reject_reasons,
+            l2_verdict,
+            l2_reject_reasons,
+            claim_verdicts,
+            evidence_contradictions,
+        ),
+    )
+
+
 def test_processing_record_round_trip(app_conn: psycopg.Connection[DictRow]) -> None:
     """문의 1건 + 시도 2건 + 근거 스냅샷 2건 + SQL 실패 1건이 그대로 저장·복원된다."""
     inquiry_id = _insert_inquiry(app_conn)
@@ -446,6 +479,143 @@ def test_unknown_reject_reason_is_rejected(app_conn: psycopg.Connection[DictRow]
                VALUES (%s, 1, 'reject', ARRAY['made_up_reason'], '{}'::jsonb)""",
             (inquiry_id,),
         )
+
+
+def test_layered_attempt_round_trip(app_conn: psycopg.Connection[DictRow]) -> None:
+    """L1 pass + L2 reject 를 층별 컬럼과 함께 저장하면 종합 사유는 두 층의 병합이다."""
+    inquiry_id = _insert_inquiry(app_conn)
+    _insert_attempt(
+        app_conn,
+        inquiry_id,
+        verdict="reject",
+        reject_reasons=["unsupported_claim"],
+        l1_verdict="pass",
+        l1_reject_reasons=[],
+        l2_verdict="reject",
+        l2_reject_reasons=["unsupported_claim"],
+        claim_verdicts=Jsonb([{"claim_index": 0, "verdict": "unsupported"}]),
+        evidence_contradictions=Jsonb([]),
+    )
+    row = app_conn.execute(
+        "SELECT * FROM inquiry_attempts WHERE inquiry_id = %s", (inquiry_id,)
+    ).fetchone()
+    assert row is not None
+    assert row["l1_verdict"] == "pass"
+    assert row["l2_reject_reasons"] == ["unsupported_claim"]
+    assert row["claim_verdicts"] == [{"claim_index": 0, "verdict": "unsupported"}]
+
+
+def test_attempt_without_layer_columns_leaves_them_null(
+    app_conn: psycopg.Connection[DictRow],
+) -> None:
+    """층별 컬럼을 모르는 적재 코드의 INSERT 는 그대로 통과하고 전부 NULL 로 남는다."""
+    inquiry_id = _insert_inquiry(app_conn)
+    app_conn.execute(
+        """INSERT INTO inquiry_attempts (inquiry_id, attempt_no, verdict, draft)
+           VALUES (%s, 1, 'pass', '{}'::jsonb)""",
+        (inquiry_id,),
+    )
+    row = app_conn.execute(
+        "SELECT * FROM inquiry_attempts WHERE inquiry_id = %s", (inquiry_id,)
+    ).fetchone()
+    assert row is not None
+    for column in (
+        "l1_verdict",
+        "l1_reject_reasons",
+        "l2_verdict",
+        "l2_reject_reasons",
+        "claim_verdicts",
+        "evidence_contradictions",
+    ):
+        assert row[column] is None
+
+
+@pytest.mark.parametrize(
+    "attempt_kwargs",
+    [
+        pytest.param(
+            {
+                "verdict": "reject",
+                "reject_reasons": ["pii_detected"],
+                "l1_verdict": "reject",
+                "l1_reject_reasons": ["pii_detected"],
+                "l2_verdict": "pass",
+                "l2_reject_reasons": [],
+            },
+            id="l1-reject-with-l2-verdict",
+        ),
+        pytest.param(
+            {"verdict": "pass", "l2_verdict": "pass", "l2_reject_reasons": []},
+            id="l2-verdict-without-l1-verdict",
+        ),
+        pytest.param(
+            {
+                "verdict": "pass",
+                "l1_verdict": "pass",
+                "l1_reject_reasons": [],
+                "claim_verdicts": Jsonb([]),
+            },
+            id="l2-null-with-claim-verdicts",
+        ),
+        pytest.param(
+            {
+                "verdict": "reject",
+                "reject_reasons": ["unsupported_claim"],
+                "l1_verdict": "pass",
+                "l1_reject_reasons": [],
+                "l2_reject_reasons": ["unsupported_claim"],
+            },
+            id="l2-null-with-l2-reasons",
+        ),
+        pytest.param(
+            {
+                "verdict": "pass",
+                "l1_verdict": "reject",
+                "l1_reject_reasons": ["pii_detected"],
+            },
+            id="overall-pass-with-l1-reject",
+        ),
+        pytest.param(
+            {
+                "verdict": "pass",
+                "l1_verdict": "pass",
+                "l1_reject_reasons": ["pii_detected"],
+            },
+            id="l1-pass-with-nonzero-reasons",
+        ),
+        pytest.param(
+            {"verdict": "pass", "l1_verdict": "pass"},
+            id="l1-verdict-without-reasons-array",
+        ),
+        pytest.param(
+            {
+                "verdict": "reject",
+                "reject_reasons": ["unsupported_claim"],
+                "l1_verdict": "reject",
+                "l1_reject_reasons": ["unsupported_claim"],
+            },
+            id="l2-reason-inside-l1-array",
+        ),
+        pytest.param(
+            {
+                "verdict": "reject",
+                "reject_reasons": ["pii_detected"],
+                "l1_verdict": "pass",
+                "l1_reject_reasons": [],
+                "l2_verdict": "reject",
+                "l2_reject_reasons": ["unsupported_claim"],
+            },
+            id="overall-reasons-not-layer-concat",
+        ),
+    ],
+)
+def test_contradictory_layer_states_are_rejected(
+    app_conn: psycopg.Connection[DictRow], attempt_kwargs: dict[str, Any]
+) -> None:
+    """층별 판정의 모순 상태는 DB CHECK 가 막는다 (NULL 스코프 포함)."""
+    inquiry_id = _insert_inquiry(app_conn)
+    with pytest.raises(psycopg.errors.CheckViolation):
+        _insert_attempt(app_conn, inquiry_id, **attempt_kwargs)
 
 
 def test_attempt_count_is_capped_at_two(app_conn: psycopg.Connection[DictRow]) -> None:
