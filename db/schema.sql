@@ -79,7 +79,7 @@ CREATE INDEX IF NOT EXISTS policy_chunks_embedding_idx
 
 -- ── 처리 기록 1 — 문의 ───────────────────────────────────────────────────────
 -- 평가 지표(p50/p95 지연, 건당 토큰 비용)의 원천이다 (docs/business-rules.md "엔티티와 관계").
--- 생성 계열 토큰과 임베딩 토큰을 **분리해서** 기록한다.
+-- 생성 계열 토큰·임베딩 토큰·판정(judge) 토큰을 **분리해서** 기록한다.
 CREATE TABLE IF NOT EXISTS inquiries (
     id                 uuid        NOT NULL DEFAULT gen_random_uuid(),
     -- 주문 테이블로의 FK 를 두지 않는다: 존재하지 않는 주문번호도 접수되어야
@@ -97,6 +97,10 @@ CREATE TABLE IF NOT EXISTS inquiries (
     input_tokens       integer     NOT NULL DEFAULT 0,
     output_tokens      integer     NOT NULL DEFAULT 0,
     embedding_tokens   integer     NOT NULL DEFAULT 0,
+    -- L2 판정(judge) 호출 토큰. 생성 토큰(input/output)과 섞으면 건당 비용에서 게이트
+    -- 비용을 분리해 말할 수 없으므로 별도 컬럼이다. 적재 코드가 채우기 전까지는 0 이다.
+    judge_input_tokens  integer    NOT NULL DEFAULT 0,
+    judge_output_tokens integer    NOT NULL DEFAULT 0,
     created_at         timestamptz NOT NULL DEFAULT now(),
 
     CONSTRAINT inquiries_pkey PRIMARY KEY (id),
@@ -124,6 +128,9 @@ CREATE TABLE IF NOT EXISTS inquiries (
     CONSTRAINT inquiries_latency_nonneg CHECK (latency_ms >= 0),
     CONSTRAINT inquiries_tokens_nonneg CHECK (
         input_tokens >= 0 AND output_tokens >= 0 AND embedding_tokens >= 0
+    ),
+    CONSTRAINT inquiries_judge_tokens_nonneg CHECK (
+        judge_input_tokens >= 0 AND judge_output_tokens >= 0
     )
 );
 
@@ -131,6 +138,7 @@ CREATE INDEX IF NOT EXISTS inquiries_created_at_idx ON inquiries (created_at);
 CREATE INDEX IF NOT EXISTS inquiries_status_idx ON inquiries (status);
 
 -- ── 처리 기록 2 — 시도 (초안 + 재생성 1회, 최대 2건) ─────────────────────────
+-- verdict/reject_reasons 는 층 통합 결과(종합)이고, l1_*/l2_* 가 층별 내역이다.
 CREATE TABLE IF NOT EXISTS inquiry_attempts (
     id              bigint      GENERATED ALWAYS AS IDENTITY,
     inquiry_id      uuid        NOT NULL,
@@ -139,6 +147,18 @@ CREATE TABLE IF NOT EXISTS inquiry_attempts (
     reject_reasons  text[]      NOT NULL DEFAULT '{}',
     -- L1 이 검사한 초안 원문. 재현·감사의 근거다.
     draft           jsonb       NOT NULL,
+    -- ── 층별 판정 — L1(규칙 게이트) / L2(판정 LLM) ──
+    -- L2 는 L1 통과분에만 실행된다. L2 미실행이면 l2_verdict 와 부속
+    -- (l2_reject_reasons·claim_verdicts·evidence_contradictions)은 전부 NULL 이다.
+    -- 적재 코드가 층별 컬럼을 채우기 전까지는 NULL 로 남으므로 전부 NULL 허용이다.
+    l1_verdict               text,
+    l1_reject_reasons        text[],
+    l2_verdict               text,
+    l2_reject_reasons        text[],
+    -- L2 의 claim 단위 판정 원문 (claim 별 지지 여부와 대조 근거).
+    claim_verdicts           jsonb,
+    -- L2 가 발견한 근거쌍 모순 목록.
+    evidence_contradictions  jsonb,
     created_at      timestamptz NOT NULL DEFAULT now(),
 
     CONSTRAINT inquiry_attempts_pkey PRIMARY KEY (id),
@@ -149,15 +169,75 @@ CREATE TABLE IF NOT EXISTS inquiry_attempts (
     CONSTRAINT inquiry_attempts_attempt_no_range CHECK (attempt_no BETWEEN 1 AND 2),
     -- `reply_gate.contracts.Verdict`
     CONSTRAINT inquiry_attempts_verdict_enum CHECK (verdict IN ('pass', 'reject')),
-    -- `reply_gate.contracts.RejectReason`
+    -- `reply_gate.contracts.RejectReason` — L1 사유 4종 + L2 사유 2종.
     CONSTRAINT inquiry_attempts_reject_reasons_enum CHECK (
         reject_reasons <@ ARRAY[
-            'schema_violation', 'missing_citation', 'invalid_citation', 'pii_detected'
+            'schema_violation', 'missing_citation', 'invalid_citation', 'pii_detected',
+            'unsupported_claim', 'contradictory_evidence'
         ]::text[]
     ),
     CONSTRAINT inquiry_attempts_reasons_match_verdict CHECK (
         (verdict = 'pass' AND cardinality(reject_reasons) = 0)
         OR (verdict = 'reject' AND cardinality(reject_reasons) > 0)
+    ),
+    -- ── 층별 판정 제약 ──
+    -- 주의: Postgres CHECK 는 결과가 NULL 이면 통과시킨다. 층별 컬럼은 적재 코드가 채우기
+    -- 전까지 NULL 이므로, 아래 제약들은 NULL 스코프를 명시한다 — 미기록(NULL) 행은 걸리지
+    -- 않고, 기록된 행은 정확히 걸린다.
+    CONSTRAINT inquiry_attempts_l1_verdict_enum CHECK (
+        l1_verdict IS NULL OR l1_verdict IN ('pass', 'reject')
+    ),
+    CONSTRAINT inquiry_attempts_l2_verdict_enum CHECK (
+        l2_verdict IS NULL OR l2_verdict IN ('pass', 'reject')
+    ),
+    -- 사유는 층을 넘지 못한다: L1 배열엔 L1 사유만, L2 배열엔 L2 사유만.
+    CONSTRAINT inquiry_attempts_l1_reject_reasons_enum CHECK (
+        l1_reject_reasons IS NULL OR l1_reject_reasons <@ ARRAY[
+            'schema_violation', 'missing_citation', 'invalid_citation', 'pii_detected'
+        ]::text[]
+    ),
+    CONSTRAINT inquiry_attempts_l2_reject_reasons_enum CHECK (
+        l2_reject_reasons IS NULL OR l2_reject_reasons <@ ARRAY[
+            'unsupported_claim', 'contradictory_evidence'
+        ]::text[]
+    ),
+    -- 층별 pass ⟺ 그 층 사유 0건. verdict 가 기록됐으면 사유 배열도 반드시 함께 있다
+    -- (IS NOT NULL 이 없으면 cardinality(NULL)=NULL 로 검사가 통과해 버린다).
+    CONSTRAINT inquiry_attempts_l1_reasons_match_verdict CHECK (
+        (l1_verdict IS NULL AND l1_reject_reasons IS NULL)
+        OR (l1_verdict = 'pass' AND l1_reject_reasons IS NOT NULL
+            AND cardinality(l1_reject_reasons) = 0)
+        OR (l1_verdict = 'reject' AND l1_reject_reasons IS NOT NULL
+            AND cardinality(l1_reject_reasons) > 0)
+    ),
+    CONSTRAINT inquiry_attempts_l2_reasons_match_verdict CHECK (
+        (l2_verdict IS NULL AND l2_reject_reasons IS NULL)
+        OR (l2_verdict = 'pass' AND l2_reject_reasons IS NOT NULL
+            AND cardinality(l2_reject_reasons) = 0)
+        OR (l2_verdict = 'reject' AND l2_reject_reasons IS NOT NULL
+            AND cardinality(l2_reject_reasons) > 0)
+    ),
+    -- L2 는 L1 통과분에만 실행된다 → L2 판정이 있으면 L1 은 반드시 pass 다.
+    -- "L1 reject 인데 L2 존재"와 "L1 미기록인데 L2 존재"를 함께 막는다.
+    CONSTRAINT inquiry_attempts_l2_requires_l1_pass CHECK (
+        l2_verdict IS NULL OR (l1_verdict IS NOT NULL AND l1_verdict = 'pass')
+    ),
+    -- L2 미실행(NULL)이면 부속도 전부 없어야 한다: 사유·claim 판정·모순쌍.
+    CONSTRAINT inquiry_attempts_l2_null_means_no_artifacts CHECK (
+        l2_verdict IS NOT NULL
+        OR (l2_reject_reasons IS NULL AND claim_verdicts IS NULL
+            AND evidence_contradictions IS NULL)
+    ),
+    -- 종합 pass 인데 어느 층이 reject 인 모순 상태 불가.
+    CONSTRAINT inquiry_attempts_pass_needs_no_layer_reject CHECK (
+        verdict <> 'pass'
+        OR (l1_verdict IS DISTINCT FROM 'reject' AND l2_verdict IS DISTINCT FROM 'reject')
+    ),
+    -- 종합 사유 = L1 사유 ∥ L2 사유. 층별 기록이 있으면 종합과 어긋난 상태가
+    -- 양방향으로 닫힌다 (예: 두 층 모두 pass 인데 종합 reject 인 행은 존재할 수 없다).
+    CONSTRAINT inquiry_attempts_reasons_compose_layers CHECK (
+        l1_reject_reasons IS NULL
+        OR reject_reasons = l1_reject_reasons || COALESCE(l2_reject_reasons, '{}'::text[])
     )
 );
 
@@ -165,7 +245,7 @@ CREATE INDEX IF NOT EXISTS inquiry_attempts_inquiry_idx ON inquiry_attempts (inq
 
 -- ── 처리 기록 3 — 근거 스냅샷 ────────────────────────────────────────────────
 -- SQL 근거는 **실행된 쿼리문과 결과 행 전체**를 영속화한다 (docs/contracts.md "답변 계약").
--- 감사·재현·차기 L2 claim 대조가 모두 이 스냅샷 위에 선다.
+-- 감사·재현·L2 claim 대조가 모두 이 스냅샷 위에 선다.
 CREATE TABLE IF NOT EXISTS inquiry_evidence (
     id             bigint      GENERATED ALWAYS AS IDENTITY,
     inquiry_id     uuid        NOT NULL,
