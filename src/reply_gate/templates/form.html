@@ -6,8 +6,13 @@
   <title>Reply-Gate — 근거 없는 답변을 기각하는 CS 답변 에이전트</title>
   <!--
     외부 리소스를 하나도 불러오지 않는다 (CDN·웹폰트·외부 스크립트 금지) — 오프라인에서 열려야 한다.
-    화면의 주인공은 예쁜 챗 UI 가 아니라 **판정 과정**이다: 시도별 pass/reject 와 기각 사유 코드가
-    답변보다 먼저·크게 보이도록 배치한다.
+    화면의 주인공은 예쁜 챗 UI 가 아니라 **판정 과정**이다: 시도별 종합 pass/reject 와 층별
+    (L1/L2) 배지, 기각 사유 코드, L2 의 claim 단위 판정과 근거쌍 모순이 답변보다 먼저·크게
+    보이도록 배치한다.
+
+    "L2 미실행"은 통과가 아니라 판정이 **없었다**는 뜻이다. 특히 L2 호출이 실패한 시도는 층
+    결합 정의상 종합 verdict 가 pass 인데 문의는 인계되므로("통과했는데 왜 인계?"), 그 시도를
+    미검증으로 따로 칠해 오독을 막는다 — 값은 응답 그대로 두고 표시만 구분한다.
   -->
   <style>
     :root {
@@ -21,6 +26,8 @@
       --reject-bg: #fdecea;
       --escalate: #8a4b00;
       --escalate-bg: #fdf1e0;
+      --skip: #4a5160;
+      --skip-bg: #e9ecf1;
     }
     * { box-sizing: border-box; }
     body {
@@ -81,6 +88,8 @@
     .badge-pass { background: var(--pass-bg); color: var(--pass); }
     .badge-reject { background: var(--reject-bg); color: var(--reject); }
     .badge-escalate { background: var(--escalate-bg); color: var(--escalate); }
+    /* 미실행 = 판정이 없었다. pass 와 같은 초록으로 칠하면 "통과"로 읽힌다. */
+    .badge-skip { background: var(--skip-bg); color: var(--skip); border: 1px dashed var(--skip); }
     #status-line { font-size: 1.05rem; font-weight: 700; margin: 0 0 .2rem; }
     #attempts { list-style: none; margin: 0; padding: 0; }
     #attempts li {
@@ -92,9 +101,33 @@
     }
     #attempts li.reject { border-left-color: var(--reject); background: var(--reject-bg); }
     #attempts li.pass { border-left-color: var(--pass); background: var(--pass-bg); }
+    /* 종합 pass 인데 L2 판정을 받지 못한 시도 — 값(badge)은 그대로 두고 바탕만 구분한다. */
+    #attempts li.unverified { border-left-color: var(--escalate); background: var(--escalate-bg); }
     .attempt-head { font-weight: 700; font-size: .9rem; }
     .reasons { list-style: none; margin: .35rem 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: .35rem; }
     .reasons li { margin: 0; padding: 0; border: 0; background: none; }
+    .layers { display: flex; flex-wrap: wrap; gap: .35rem; margin: .4rem 0 0; }
+    .layer-note { color: var(--muted); font-size: .82rem; margin: .35rem 0 0; }
+    .l2-detail {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: .35rem;
+      padding: .5rem .65rem;
+      margin: .5rem 0 0;
+    }
+    .l2-detail h3 { font-size: .82rem; margin: 0 0 .3rem; letter-spacing: .02em; }
+    .l2-detail h3 + .hint { margin: -.15rem 0 .35rem; }
+    .judgments, .contradictions { list-style: none; margin: 0 0 .6rem; padding: 0; }
+    .judgments li, .contradictions li {
+      margin: 0 0 .4rem;
+      padding: 0;
+      border: 0;
+      background: none;
+      font-size: .86rem;
+    }
+    .judgments li:last-child, .contradictions li:last-child { margin-bottom: 0; }
+    .contradictions .pair { font-weight: 700; }
+    .explanation { color: var(--muted); font-size: .82rem; }
     code, pre {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: .82rem;
@@ -124,7 +157,7 @@
   <h1>Reply-Gate</h1>
   <p class="lede">
     근거 없는 답변을 <strong>스스로 기각</strong>하는 이커머스 CS 답변 에이전트.
-    이 화면은 답변보다 <strong>판정 과정</strong>을 먼저 보여준다 — L1 게이트가 무엇을 왜 기각했는지.
+    이 화면은 답변보다 <strong>판정 과정</strong>을 먼저 보여준다 — <strong>어느 층이</strong> 무엇을 왜 기각했는지.
   </p>
 
   <form class="card" id="inquiry-form">
@@ -160,17 +193,21 @@
     </div>
 
     <section class="card" id="verdict-flow">
-      <h2>L1 게이트 판정 — 시도 이력</h2>
+      <h2>게이트 판정 — 시도별 층별 이력</h2>
       <p class="hint">
-        L1 은 <strong>LLM 호출 0회</strong>의 기계 검사다. 시도마다
-        <span class="badge badge-pass">pass</span> 통과 또는
-        <span class="badge badge-reject">reject</span> 기각(사유 코드 전부)이 찍힌다.
-        기각되면 사유 전체를 피드백으로 붙여 <strong>1회만</strong> 재생성하고, 재기각이면 인계로 끝난다 —
-        이 상한은 코드가 강제한다.
+        판정은 <strong>두 층</strong>이다. <strong>L1</strong> 은 <strong>LLM 호출 0회</strong>의 기계 검사(스키마·인용·PII)이고,
+        <strong>L2</strong> 는 L1 을 통과한 초안만 claim 단위로 근거와 대조하는 판정 LLM 이다.
+        시도마다 <strong>종합</strong> <span class="badge badge-pass">pass</span> /
+        <span class="badge badge-reject">reject</span> 와 층별 배지가 함께 찍힌다 —
+        종합 pass 는 "L1 pass 이고, L2 가 실행됐다면 L2 도 pass" 라는 뜻이다.
+        <span class="badge badge-skip">L2 미실행</span> 은 판정이 <strong>없었다</strong>는 뜻이지 통과가 아니다
+        (L1 기각 · 판정 층 꺼짐 · 판정 호출 실패 셋 중 하나다).
+        기각되면 사유 전체를(L2 라면 claim 단위 상세까지) 피드백으로 붙여 <strong>1회만</strong> 재생성하고,
+        재기각이면 인계로 끝난다 — 이 상한은 코드가 강제한다.
       </p>
       <ol id="attempts"></ol>
       <p class="hint" id="attempts-empty" hidden>
-        <span id="attempts-empty-text">초안 전 인계 — 초안 생성에 진입하지 않았다(L1 판정 없음).</span>
+        <span id="attempts-empty-text">초안 전 인계 — 초안 생성에 진입하지 않았다(층별 판정 없음).</span>
       </p>
     </section>
 
@@ -203,7 +240,8 @@
   </section>
 
   <footer>
-    노드별 [LLM]/[코드] 경계 — 접수·근거 수집·L1 게이트·종결은 코드, 의도 해석·SQL 생성·초안 생성은 LLM.
+    노드별 [LLM]/[코드] 경계 — 접수·근거 수집·L1 게이트·루프 종료·종결은 코드,
+    의도 해석·SQL 생성·초안 생성·L2 판정은 LLM.
   </footer>
 </main>
 
@@ -225,7 +263,110 @@
     return span;
   }
 
-  function renderAttempts(attempts, escalationReason) {
+  // L2 가 실행되지 않은 이유 3종. 응답에 "왜 안 돌았는지" 필드는 없으므로 관측 가능한
+  // 값으로 좁힌다: L1 이 기각했으면 L1 기각(L2 는 L1 통과분에만 돈다), L1 은 통과했는데
+  // 마지막 시도가 llm_call_failed 로 끝났으면 판정 호출 실패, 그 밖은 판정 층 꺼짐.
+  const L2_SKIP_NOTE = {
+    l1_reject: "L2 미실행 — L1 이 기각해 판정 LLM 을 부르지 않았다 (L2 는 L1 통과분에만 돈다).",
+    call_failed:
+      "L2 미실행 — 판정 호출이 재시도 후에도 실패했다. 층 결합 정의상 종합 verdict 는 pass 지만 " +
+      "이 답변은 의미 검증을 받지 못했다. 그래서 내보내지 않고 인계했다 (진실은 아래 인계 사유가 들고 있다).",
+    switched_off: "L2 미실행 — 판정 층이 꺼진 실행이다 (L1 단독 동작).",
+    unknown: "L2 미실행 — 층별 판정이 기록되지 않은 처리 기록이다.",
+  };
+
+  function l2SkipReason(attempt, payload, isLast) {
+    if (attempt.l1 === null) return "unknown";
+    if (attempt.l1.verdict === "reject") return "l1_reject";
+    if (isLast && payload.escalation_reason === "llm_call_failed") return "call_failed";
+    return "switched_off";
+  }
+
+  function layerBadge(label, layer) {
+    if (layer === null) return badge("skip", label + " 미실행");
+    return badge(layer.verdict === "reject" ? "reject" : "pass", label + " " + layer.verdict);
+  }
+
+  function renderReasonCodes(item, reasons) {
+    const list = document.createElement("ul");
+    list.className = "reasons";
+    reasons.forEach((reason) => {
+      const li = document.createElement("li");
+      const code = document.createElement("code");
+      code.className = "reason-code";
+      code.textContent = reason;
+      li.appendChild(code);
+      list.appendChild(li);
+    });
+    item.appendChild(list);
+  }
+
+  // 데모의 "왜 기각됐는지" 장면 — claim 단위 판정과 근거쌍 모순이 여기서 나온다.
+  function renderJudgeDetail(item, judge) {
+    const box = document.createElement("div");
+    box.className = "l2-detail";
+
+    const claimTitle = document.createElement("h3");
+    claimTitle.textContent = "L2 claim 단위 판정";
+    box.appendChild(claimTitle);
+
+    const judgments = document.createElement("ul");
+    judgments.className = "judgments";
+    if (judge.claim_judgments.length === 0) {
+      const empty = document.createElement("li");
+      empty.className = "explanation";
+      empty.textContent = "claim 판정 없음 (판정 대상 claim 이 없었다).";
+      judgments.appendChild(empty);
+    }
+    judge.claim_judgments.forEach((judgment) => {
+      const li = document.createElement("li");
+      li.appendChild(badge(judgment.verdict === "reject" ? "reject" : "pass", judgment.verdict));
+      li.appendChild(document.createTextNode(" " + judgment.claim_text));
+      const why = document.createElement("div");
+      why.className = "explanation";
+      why.textContent = judgment.explanation;
+      li.appendChild(why);
+      judgments.appendChild(li);
+    });
+    box.appendChild(judgments);
+
+    const pairTitle = document.createElement("h3");
+    pairTitle.textContent = "근거쌍 모순";
+    box.appendChild(pairTitle);
+    const pairHint = document.createElement("p");
+    pairHint.className = "hint";
+    pairHint.textContent =
+      "기록됐다고 곧 기각은 아니다 — 초안이 모순을 명시하고 두 기준을 모두 안내했으면 사유에 오르지 않는다.";
+    box.appendChild(pairHint);
+
+    const contradictions = document.createElement("ul");
+    contradictions.className = "contradictions";
+    if (judge.contradictions.length === 0) {
+      const empty = document.createElement("li");
+      empty.className = "explanation";
+      empty.textContent = "모순되는 근거쌍 없음.";
+      contradictions.appendChild(empty);
+    }
+    judge.contradictions.forEach((pair) => {
+      const li = document.createElement("li");
+      const ids = document.createElement("code");
+      ids.className = "pair";
+      ids.textContent = pair.evidence_id_a + " ↔ " + pair.evidence_id_b;
+      li.appendChild(ids);
+      const why = document.createElement("div");
+      why.className = "explanation";
+      why.textContent = pair.explanation;
+      li.appendChild(why);
+      contradictions.appendChild(li);
+    });
+    box.appendChild(contradictions);
+
+    item.appendChild(box);
+  }
+
+  function renderAttempts(payload) {
+    const attempts = payload.attempts;
+    const escalationReason = payload.escalation_reason;
     const list = el("attempts");
     clear(list);
     show("attempts-empty", attempts.length === 0);
@@ -239,33 +380,44 @@
     };
     if (attempts.length === 0) {
       const why = preDraftReason[escalationReason] || "초안 생성에 진입하지 않았다";
-      setText("attempts-empty-text", `초안 전 인계 — ${why}(L1 판정 없음).`);
+      setText("attempts-empty-text", `초안 전 인계 — ${why}(층별 판정 없음).`);
     }
     attempts.forEach((attempt, index) => {
       const rejected = attempt.verdict === "reject";
+      const isLast = index === attempts.length - 1;
+      const skipReason = attempt.l2 === null ? l2SkipReason(attempt, payload, isLast) : null;
       const item = document.createElement("li");
-      item.className = rejected ? "reject" : "pass";
+      // 종합 pass 인데 판정 호출이 실패한 시도는 초록으로 칠하지 않는다 — 값은 그대로 pass 로
+      // 찍되 "검증 못 함"이 눈에 먼저 들어와야 "통과했는데 왜 인계?"로 읽히지 않는다.
+      item.className = rejected ? "reject" : skipReason === "call_failed" ? "unverified" : "pass";
 
       const head = document.createElement("div");
       head.className = "attempt-head";
       const label = index === 0 ? "시도 1 — 최초 초안" : "시도 " + (index + 1) + " — 재생성";
       head.appendChild(document.createTextNode(label + " "));
+      head.appendChild(document.createTextNode("종합 "));
       head.appendChild(badge(rejected ? "reject" : "pass", attempt.verdict));
       item.appendChild(head);
 
+      const layers = document.createElement("div");
+      layers.className = "layers";
+      layers.appendChild(layerBadge("L1", attempt.l1));
+      layers.appendChild(layerBadge("L2", attempt.l2));
+      item.appendChild(layers);
+
       if (rejected) {
-        const reasons = document.createElement("ul");
-        reasons.className = "reasons";
-        attempt.reject_reasons.forEach((reason) => {
-          const li = document.createElement("li");
-          const code = document.createElement("code");
-          code.className = "reason-code";
-          code.textContent = reason;
-          li.appendChild(code);
-          reasons.appendChild(li);
-        });
-        item.appendChild(reasons);
+        renderReasonCodes(item, attempt.reject_reasons);
       }
+
+      if (attempt.l2 === null) {
+        const note = document.createElement("p");
+        note.className = "layer-note";
+        note.textContent = L2_SKIP_NOTE[skipReason];
+        item.appendChild(note);
+      } else {
+        renderJudgeDetail(item, attempt.l2);
+      }
+
       list.appendChild(item);
     });
   }
@@ -311,7 +463,7 @@
     );
     setText("inquiry-id-line", "문의 ID: " + payload.inquiry_id);
 
-    renderAttempts(payload.attempts, payload.escalation_reason);
+    renderAttempts(payload);
 
     show("escalation", escalated);
     setText("escalation-reason", payload.escalation_reason || "");
@@ -322,12 +474,14 @@
 
     renderCitations(payload.citations);
 
+    // 토큰은 계열별로 분리해 보여준다 — 생성과 판정은 provider·단가가 달라 합산이 무의미하다.
     const tokens = payload.metrics.tokens;
     setText(
       "metrics",
-      "지연 " + payload.metrics.latency_ms + " ms · 생성 토큰 입력 " +
+      "지연 " + payload.metrics.latency_ms + " ms (L2 판정 호출 포함) · 생성 토큰 입력 " +
         tokens.input + " / 출력 " + tokens.output +
-        " (임베딩 토큰은 처리 기록에 별도로 남는다)"
+        " · 판정 토큰 입력 " + tokens.judge_input + " / 출력 " + tokens.judge_output +
+        " (L2 미실행이면 0 · 임베딩 토큰은 처리 기록에만 별도로 남는다)"
     );
     setText("raw-json", JSON.stringify(payload, null, 2));
     show("result", true);
