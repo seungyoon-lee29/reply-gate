@@ -1023,6 +1023,11 @@ def load_judge_fixtures(path: Path = DEFAULT_JUDGE_FIXTURES_PATH) -> tuple[Judge
             raise ValueError(f"{fixture_id}: 근거가 하나도 없다")
         evidence_ids = {item.id for item in evidences}
         claims = _claims_from_json(row["claims"], fixture_id=fixture_id)
+        # 판정 계약은 claim 을 **텍스트로 식별한다**(`ClaimJudgment.claim_text`). 한 픽스처
+        # 안에 같은 텍스트가 두 번 있으면 판정 대조가 두 건을 한 판정으로 채점하는데
+        # `claim_total` 은 2 로 센다 — 라벨 쪽에서 막는다.
+        if len({claim.text for claim in claims}) != len(claims):
+            raise ValueError(f"{fixture_id}: 한 픽스처 안의 claim 텍스트는 유일해야 한다")
         for claim in claims:
             # L1 을 통과한 초안만 L2 입력이 된다 — 인용 없음·미해석 인용은 L1 이 잡는 결함이다.
             if not claim.citation_ids:
@@ -1081,6 +1086,8 @@ def evaluate_judge_fixture(*, fixture: JudgeFixture, judge: Judging) -> L2Outcom
         )
 
     result = outcome.result
+    # 판정 계약이 claim 을 텍스트로 식별하므로 대조도 텍스트로 접는다 — 한 픽스처 안
+    # claim 텍스트가 유일하다는 것은 로더(`load_judge_fixtures`)가 보장한다.
     verdict_by_text = {item.claim_text: item.verdict for item in result.claim_judgments}
     matched_claims = sum(
         1
@@ -1176,7 +1183,8 @@ class RunConditions:
     top_k: int
     l1_fixture_count: int
     golden_case_count: int
-    judge_fixture_count: int
+    #: 판정 픽스처 수. **로드하지 못했으면 `None`** — 미실행을 0 으로 채우지 않는다.
+    judge_fixture_count: int | None
     l1_fixtures_path: str
     golden_set_path: str
     judge_fixtures_path: str
@@ -1187,6 +1195,11 @@ class RunConditions:
     l2_enabled: bool
     #: 측정 2 수치가 실제 모델로 낸 값인가. 대역이면 False 이고 리포트가 그렇게 적는다.
     measurement2_is_real: bool
+    #: 측정 3 수치가 **실제 판정 모델**로 낸 값인가. 대역(`testing.StubJudge` 등)으로 낸
+    #: 값이면 False 이고, 그때 리포트의 `billed`·`deterministic` 과 확률층·과금 문구가
+    #: 전부 뒤집힌다 — 실행 조건의 판정 모델 문자열 한 줄만으로 구분하면 리포트가 스스로
+    #: "과금된 실측"이라고 거짓 신고할 수 있다.
+    measurement3_is_real: bool
 
 
 @dataclass(frozen=True)
@@ -1331,6 +1344,11 @@ def _int(value: int | None) -> str:
     return "측정 불가" if value is None else str(value)
 
 
+def _count(value: int | None) -> str:
+    """건수 — 세지 못했으면(로드 실패) **미실행**이라고 적는다. 0 으로 채우지 않는다."""
+    return "미실행" if value is None else f"{value}건"
+
+
 _LIMITS: Final = """\
 ## 한계 (과장하지 않는다)
 
@@ -1374,7 +1392,8 @@ def render_markdown(report: EvaluationReport) -> str:
         f"- 유사도 임계값: {conditions.similarity_threshold} / top k: {conditions.top_k}",
         f"- L1 픽스처: {conditions.l1_fixture_count}건 (`{conditions.l1_fixtures_path}`)",
         f"- 골든셋: {conditions.golden_case_count}건 (`{conditions.golden_set_path}`)",
-        f"- 판정 픽스처: {conditions.judge_fixture_count}건 (`{conditions.judge_fixtures_path}`)",
+        f"- 판정 픽스처: {_count(conditions.judge_fixture_count)} "
+        f"(`{conditions.judge_fixtures_path}`)",
         f"- OPENAI_API_KEY 설정 여부: {'설정됨' if conditions.api_key_present else '없음'}",
         f"- ANTHROPIC_API_KEY 설정 여부: "
         f"{'설정됨' if conditions.judge_api_key_present else '없음'}",
@@ -1476,9 +1495,10 @@ def _render_measurement_two(
         lines.extend(
             [
                 "> **경고 — 아래 수치는 실제 모델 수치가 아니다.** 결정론 대역(생성 대역 ·",
-                "> 어휘 임베딩)으로 하네스 배관만 검증한 실행이다. 일치율·기각 재현율·지연·",
-                "> 토큰 값을 제품 지표로 인용하면 안 된다. 실행 조건 절의 생성 LLM·임베딩",
-                "> 항목이 무엇으로 돌았는지를 함께 읽어야 한다.",
+                "> 어휘 임베딩 · **판정 대역**)으로 하네스 배관만 검증한 실행이다. 일치율·기각",
+                "> 재현율·지연·토큰 값을 제품 지표로 인용하면 안 된다 — **판정 계열 토큰도",
+                "> 대역이 만든 휴리스틱 값이라 합산까지 대역이다.** 실행 조건 절의 생성 LLM·",
+                "> 임베딩·판정 모델 항목이 무엇으로 돌았는지를 함께 읽어야 한다.",
                 "",
             ]
         )
@@ -1504,7 +1524,7 @@ def _render_measurement_two(
             "",
             "| 계열 | 합계 | 건당 |",
             "| --- | ---: | ---: |",
-            *_token_rows(pipeline),
+            *_token_rows(pipeline, conditions),
             "",
             "### 종결 분포",
             "",
@@ -1527,8 +1547,14 @@ def _render_measurement_two(
     return lines
 
 
-def _token_rows(pipeline: PipelineAgreement) -> list[str]:
-    """토큰 표의 본문 — 계열 셋(생성·임베딩·판정)을 끝까지 분리해서 적는다."""
+def _token_rows(pipeline: PipelineAgreement, conditions: RunConditions) -> list[str]:
+    """토큰 표의 본문 — 계열 셋(생성·임베딩·판정)을 끝까지 분리해서 적는다.
+
+    대역 실행에서는 **판정 행에 `(대역)` 을 붙인다**: `--stub-llm` 은 판정자까지 대역으로
+    갈아 끼우므로 이 행의 값은 대역의 휴리스틱 산출이고 합산에도 그대로 들어간다.
+    """
+    # 대역 실행이면 판정 계열도 대역이다 — 표만 보고 실제 판정 비용으로 읽으면 안 된다.
+    judge_mark = "" if conditions.measurement2_is_real else " (대역)"
 
     def per_inquiry(total: int) -> float | None:
         return None if pipeline.total == 0 else total / pipeline.total
@@ -1541,16 +1567,16 @@ def _token_rows(pipeline: PipelineAgreement) -> list[str]:
         ("생성 소계", generation_total, pipeline.generation_tokens_per_inquiry),
         ("임베딩", pipeline.embedding_tokens_total, pipeline.embedding_tokens_per_inquiry),
         (
-            "판정 입력",
+            f"판정 입력{judge_mark}",
             pipeline.judge_input_tokens_total,
             per_inquiry(pipeline.judge_input_tokens_total),
         ),
         (
-            "판정 출력",
+            f"판정 출력{judge_mark}",
             pipeline.judge_output_tokens_total,
             per_inquiry(pipeline.judge_output_tokens_total),
         ),
-        ("판정 소계", judge_total, pipeline.judge_tokens_per_inquiry),
+        (f"판정 소계{judge_mark}", judge_total, pipeline.judge_tokens_per_inquiry),
     ]
     lines = [f"| {label} | {total} | {_num(value)} |" for label, total, value in rows]
     lines.append(
@@ -1585,16 +1611,41 @@ def _render_measurement_three(
         )
         return lines
 
+    if not conditions.measurement3_is_real:
+        lines.extend(
+            [
+                "> **경고 — 아래 수치는 실제 판정 모델 수치가 아니다.** 결정론 판정 대역으로",
+                "> 배관만 검증한 실행이라 **과금되지 않았고 재실행해도 같은 값이 나온다**.",
+                "> 검출률·오탐률·사유 일치·판정 토큰을 판정 모델의 성능으로 인용하면 안 된다.",
+                "",
+            ]
+        )
+
     failed_note = f" / 판정 실패 {accuracy.error_total} — 분모 제외" if accuracy.error_total else ""
-    lines.extend(
+    nature_label = (
+        "실제 판정 모델(과금)" if conditions.measurement3_is_real else "대역(비과금·결정론)"
+    )
+    nature = (
         [
             "고정 claim 집합을 **판정기에 직접** 흘려 기대 판정과 대조했다(무엇으로 판정했는지는",
-            "아래 판정 모델 항목이 들고 있다). 측정 1 과 같은 모양의 수치지만 실제 모델 실행은",
+            "아래 판정 모델 항목이 들고 있다). 측정 1 과 같은 모양의 수치지만 이 실행은",
             "**확률 층이고 과금된다** — 재실행하면 값이 달라진다.",
+        ]
+        if conditions.measurement3_is_real
+        else [
+            "고정 claim 집합을 **판정기에 직접** 흘려 기대 판정과 대조했다(무엇으로 판정했는지는",
+            "아래 판정 모델 항목이 들고 있다). 이 실행은 **결정론 대역**으로 돌았다 —",
+            "**과금되지 않았고 재실행해도 같은 값**이며, 판정 모델의 정확도가 아니다.",
+        ]
+    )
+    lines.extend(
+        [
+            *nature,
             "목표치: **미확정** (첫 실측 뒤에 확정한다 — 미측정을 미달로도 달성으로도 적지",
             "않는 규칙과 같은 이유로, 경계가 없는 지표에 판정을 붙이지 않는다).",
             "",
             f"- 판정 모델: {conditions.judge}",
+            f"- 실측 여부: {nature_label}",
             f"- 픽스처 총수: **{accuracy.total}건** "
             f"(기각 기대 {accuracy.violation_total} / 통과 기대 {accuracy.clean_total}"
             f"{failed_note})",
@@ -1690,6 +1741,7 @@ def report_to_json(report: EvaluationReport) -> dict[str, Any]:
             "api_key_present": conditions.api_key_present,
             "judge_api_key_present": conditions.judge_api_key_present,
             "measurement2_is_real": conditions.measurement2_is_real,
+            "measurement3_is_real": conditions.measurement3_is_real,
         },
         "measurement_1_l1_gate_accuracy": {
             "deterministic": True,
@@ -1738,7 +1790,9 @@ def report_to_json(report: EvaluationReport) -> dict[str, Any]:
         ],
     }
     payload["measurement_2_pipeline_agreement"] = _measurement_two_json(report.pipeline)
-    payload["measurement_3_l2_judge_accuracy"] = _measurement_three_json(report.judge_accuracy)
+    payload["measurement_3_l2_judge_accuracy"] = _measurement_three_json(
+        report.judge_accuracy, conditions
+    )
     return payload
 
 
@@ -1798,13 +1852,19 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
     }
 
 
-def _measurement_three_json(accuracy: JudgeAccuracy | SkippedMeasurement) -> dict[str, Any]:
+def _measurement_three_json(
+    accuracy: JudgeAccuracy | SkippedMeasurement, conditions: RunConditions
+) -> dict[str, Any]:
     if isinstance(accuracy, SkippedMeasurement):
         return {"executed": False, "skip_reason": accuracy.reason}
+    # 대역으로 만든 수치를 "과금된 실측"이라고 적으면 리포트가 스스로 거짓 신고를 한다 —
+    # 세 플래그가 전부 실측 여부를 따른다(측정 2 의 `measurement2_is_real` 과 같은 처리).
+    is_real = conditions.measurement3_is_real
     return {
         "executed": True,
-        "deterministic": False,
-        "billed": True,
+        "is_real": is_real,
+        "deterministic": not is_real,
+        "billed": is_real,
         # 목표치는 첫 실측 뒤에 확정한다 — 경계가 없으므로 달성 여부도 없다(`null`).
         "target": None,
         "target_note": "미확정 — 첫 실측 후 확정",

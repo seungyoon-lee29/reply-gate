@@ -27,7 +27,7 @@ import pytest
 from psycopg.rows import DictRow
 from scripts import evaluate
 
-from reply_gate.config import Settings
+from reply_gate.config import Settings, get_settings
 from reply_gate.contracts import (
     Claim,
     ClaimJudgment,
@@ -161,7 +161,11 @@ def _case(
 
 
 def _conditions(
-    *, is_real: bool = False, l2_enabled: bool = True, judge: str = "결정론 대역"
+    *,
+    is_real: bool = False,
+    judge_is_real: bool = False,
+    l2_enabled: bool = True,
+    judge: str = "결정론 대역",
 ) -> RunConditions:
     return RunConditions(
         started_at=utc_now_iso(),
@@ -180,6 +184,7 @@ def _conditions(
         judge_api_key_present=False,
         l2_enabled=l2_enabled,
         measurement2_is_real=is_real,
+        measurement3_is_real=judge_is_real,
     )
 
 
@@ -716,6 +721,42 @@ def test_판정_픽스처의_claim_판정_라벨은_claim_전부와_대응해야
         load_judge_fixtures(path)
 
 
+def test_한_픽스처_안의_claim_텍스트가_중복이면_로드에서_막는다(tmp_path: Path) -> None:
+    """판정 계약이 claim 을 **텍스트로 식별**하므로 중복 텍스트는 라벨 쪽에서 막아야 한다.
+
+    막지 않으면 대조 딕셔너리가 두 claim 을 한 판정으로 접는데 `claim_total` 은 2 로 세어,
+    두 건이 같은 verdict 로 채점된다 — claim 단위 일치율이 조용히 거짓이 된다.
+    """
+    claim = {"text": "환불은 7일.", "citation_ids": ["policy:refund:2-1"]}
+    path = tmp_path / "dup.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "id": "J00",
+                "category": "clean",
+                "evidences": [
+                    {"id": "policy:refund:2-1", "source": "policy", "content": "환불은 7일."}
+                ],
+                "claims": [claim, dict(claim)],
+                "expected": {
+                    "verdict": "pass",
+                    "reject_reasons": [],
+                    "claim_judgments": [
+                        {"claim_text": "환불은 7일.", "verdict": "pass"},
+                        {"claim_text": "환불은 7일.", "verdict": "pass"},
+                    ],
+                    "contradictions": [],
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="유일"):
+        load_judge_fixtures(path)
+
+
 def test_측정3_은_기대대로_판정하면_검출률_100_오탐률_0_이다() -> None:
     accuracy = measure_judge_accuracy(fixtures=JUDGE_FIXTURES, judge=OracleJudge(JUDGE_FIXTURES))
 
@@ -807,15 +848,18 @@ def test_미실행_측정3_은_0_이_아니라_사유로_남는다() -> None:
     }
 
 
-def test_측정3_리포트는_확률층과_과금과_목표치_미확정을_적는다() -> None:
+def test_실측된_측정3_리포트는_확률층과_과금과_목표치_미확정을_적는다() -> None:
     """측정 1 과 같은 형태의 수치지만 **재현되지 않고 과금된다** — 리포트가 그 사실을 들고 있다."""
     accuracy = measure_judge_accuracy(fixtures=JUDGE_FIXTURES, judge=OracleJudge(JUDGE_FIXTURES))
-    report = _report(pipeline=SkippedMeasurement(reason="미요청"), judge=accuracy)
+    report = _report(
+        pipeline=SkippedMeasurement(reason="미요청"),
+        judge=accuracy,
+        conditions=_conditions(judge_is_real=True),
+    )
     markdown = render_markdown(report)
     payload = report_to_json(report)["measurement_3_l2_judge_accuracy"]
 
-    assert "확률 층" in markdown
-    assert "과금" in markdown
+    assert "확률 층이고 과금된다" in markdown
     assert "목표치: **미확정**" in markdown
     assert "L2 검출률: 100.0%" in markdown
     assert "L2 오탐률: 0.0%" in markdown
@@ -826,6 +870,7 @@ def test_측정3_리포트는_확률층과_과금과_목표치_미확정을_적�
         "match_rate",
     }
     assert payload["executed"] is True
+    assert payload["is_real"] is True
     assert payload["deterministic"] is False
     assert payload["billed"] is True
     assert payload["target"] is None
@@ -833,6 +878,33 @@ def test_측정3_리포트는_확률층과_과금과_목표치_미확정을_적�
     assert payload["false_positive_rate"] == 0.0
     assert len(payload["outcomes"]) == len(JUDGE_FIXTURES)
     assert payload["tokens"]["input_total"] > 0
+
+
+def test_대역으로_만든_측정3_은_과금된_실측으로_적히지_않는다() -> None:
+    """리포트가 스스로 "과금된 실측"이라고 거짓 신고할 수 있으면 이 제품의 유일한 주장이 무너진다.
+
+    같은 대역 산출물이라도 실측 플래그가 갈리면 JSON 의 `billed`·`deterministic` 과
+    마크다운의 확률층·과금 문구가 **통째로 뒤집혀야** 한다 — 구분이 실행 조건의 판정 모델
+    문자열 한 줄에만 있으면 형식만으로는 실측과 구분되지 않는다.
+    """
+    accuracy = measure_judge_accuracy(fixtures=JUDGE_FIXTURES, judge=StubJudge())
+    report = _report(
+        pipeline=SkippedMeasurement(reason="미요청"),
+        judge=accuracy,
+        conditions=_conditions(judge_is_real=False),
+    )
+    markdown = render_markdown(report)
+    payload = report_to_json(report)
+
+    assert "실제 판정 모델 수치가 아니다" in markdown
+    assert "과금되지 않았고 재실행해도 같은 값" in markdown
+    assert "확률 층이고 과금된다" not in markdown
+    judged = payload["measurement_3_l2_judge_accuracy"]
+    assert judged["executed"] is True
+    assert judged["is_real"] is False
+    assert judged["billed"] is False
+    assert judged["deterministic"] is True
+    assert payload["conditions"]["measurement3_is_real"] is False
 
 
 def test_리포트_토큰_표는_생성_임베딩_판정_세_계열을_적는다() -> None:
@@ -853,7 +925,7 @@ def test_리포트_토큰_표는_생성_임베딩_판정_세_계열을_적는다
         app_conn=_NO_CONN,
         readonly_conn=_NO_CONN,
     )
-    report = _report(pipeline=agreement)
+    report = _report(pipeline=agreement, conditions=_conditions(is_real=True))
     markdown = render_markdown(report)
     tokens = report_to_json(report)["measurement_2_pipeline_agreement"]["tokens"]
 
@@ -865,6 +937,13 @@ def test_리포트_토큰_표는_생성_임베딩_판정_세_계열을_적는다
     assert tokens["judge_output_total"] == 40
     assert tokens["judge_per_inquiry"] == 240.0
     assert tokens["total_per_inquiry"] == 400.0
+
+    # 대역 실행이면 같은 표의 판정 행이 대역임을 스스로 말한다 — `--stub-llm` 은 판정자까지
+    # 대역으로 갈아 끼우고 그 휴리스틱 값이 합산에까지 들어간다.
+    stub_markdown = render_markdown(_report(pipeline=agreement, conditions=_conditions()))
+    assert "| 판정 입력 (대역) | 200 |" in stub_markdown
+    assert "| 판정 소계 (대역) | 240 |" in stub_markdown
+    assert "| 판정 소계 | 240 |" not in stub_markdown
 
 
 def test_확정된_목표치가_리포트에_실린다() -> None:
@@ -1119,6 +1198,10 @@ def test_대역으로_돈_측정2_는_실제_수치가_아니라고_경고한다
     assert "실제 모델 수치가 아니다" not in real_markdown
     # 일치율은 초안 전 인계 포함임을 리포트가 명시해야 한다.
     assert "초안 전 인계 경로 포함" in stub_markdown
+    # `--stub-llm` 은 판정자까지 대역으로 갈아 끼운다 — 경고가 판정 대역을 열거하고,
+    # 안내 항목에 판정 모델이 들어가야 실행 조건 어디를 읽어야 하는지가 맞다.
+    assert "판정 대역" in stub_markdown
+    assert "임베딩·판정 모델 항목" in stub_markdown
 
 
 def test_리포트는_사람용과_기계용_두_형식을_낸다(tmp_path: Path) -> None:
@@ -1245,6 +1328,128 @@ def test_stub_llm_실행에서_측정3_은_미실행_사유로_남는다(
     assert "--live" in reason
 
 
+def _canned_measurement_two(monkeypatch: pytest.MonkeyPatch) -> None:
+    """측정 2 를 DB·실제 LLM 없이 "돌았다"로 만든다 — 여기서 보는 것은 측정 3 배선이다."""
+
+    def _fake(*, cases: Any, args: Any, settings: Any) -> Any:
+        del args, settings
+        agreement = measure_pipeline_agreement(
+            cases=[_case(case.id) for case in cases[:1]],
+            pipeline=ScriptedPipeline([_processed()]),
+            app_conn=_NO_CONN,
+            readonly_conn=_NO_CONN,
+        )
+        return agreement, "실제 생성(대체됨)", "실제 임베딩(대체됨)"
+
+    monkeypatch.setattr(evaluate, "_run_measurement_two", _fake)
+
+
+def test_live_실행은_측정3_을_실제로_돌려_l2_계열_산출물에_싣는다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**유일하게 과금되는 경로**의 회귀 방어 — 배선이 끊겨도 전체가 녹색이면 안 된다.
+
+    실 API 호출은 아웃바운드 소켓 차단으로 막고 판정자만 대역으로 갈아 끼운다. 측정 2 는
+    과금·DB 없이 "돌았다"로 대체해 L2 켜짐 실측 조건(= l2 계열 이름)을 만든다.
+    """
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings())
+    monkeypatch.setattr(evaluate, "database_unavailable_reason", lambda *, settings: None)
+    monkeypatch.setattr(evaluate, "build_judge", lambda settings: OracleJudge(JUDGE_FIXTURES))
+    _canned_measurement_two(monkeypatch)
+    _block_outbound_sockets(monkeypatch)
+
+    assert evaluate.main(["--live", "--out-dir", str(tmp_path)]) == 0
+
+    # L2 켜짐 실측이므로 l2 계열 이름으로 떨어진다.
+    json_path = tmp_path / "evaluation-live-l2-1.json"
+    assert json_path.exists()
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    judged = payload["measurement_3_l2_judge_accuracy"]
+    assert judged["executed"] is True
+    assert judged["total"] == len(JUDGE_FIXTURES)
+    assert judged["error_total"] == 0
+    assert judged["detection_rate"] == 1.0
+    assert payload["conditions"]["judge_fixture_count"] == len(JUDGE_FIXTURES)
+
+
+def test_측정3_의_예상_밖_예외는_이미_과금된_측정2_산출물을_날리지_않는다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """측정 2 가 끝난 뒤의 예외로 트레이스백을 내면 골든셋 30건을 다시 사야 한다.
+
+    `evaluate_judge_fixture` 가 잡는 것은 판정 형식·전송 오류뿐이라, SDK 스큐(TypeError)나
+    Ctrl-C 는 그대로 올라온다 — 미실행으로 강등하고 사유에 예외 종류와 메시지를 남긴 뒤
+    리포트는 **반드시** 쓴다.
+    """
+    for index, error in enumerate((TypeError("SDK 버전 스큐"), KeyboardInterrupt())):
+        out_dir = tmp_path / f"run{index}"
+
+        def _boom(settings: Any, error: BaseException = error) -> Any:
+            del settings
+            raise error
+
+        monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings())
+        monkeypatch.setattr(evaluate, "database_unavailable_reason", lambda *, settings: None)
+        monkeypatch.setattr(evaluate, "build_judge", _boom)
+        _canned_measurement_two(monkeypatch)
+        _block_outbound_sockets(monkeypatch)
+
+        # 산출물을 남기고 실패를 종료 코드로 알린다 — 조용한 성공이 아니다.
+        assert evaluate.main(["--live", "--out-dir", str(out_dir)]) == 1
+
+        payload = json.loads((out_dir / "evaluation-live-l2-1.json").read_text(encoding="utf-8"))
+        # 과금이 끝난 측정 2 는 그대로 남는다.
+        assert payload["measurement_2_pipeline_agreement"]["executed"] is True
+        judged = payload["measurement_3_l2_judge_accuracy"]
+        assert judged["executed"] is False
+        assert type(error).__name__ in judged["skip_reason"]
+
+
+def test_판정_픽스처를_읽지_못해도_측정1_산출물은_남는다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """측정 1 은 키도 DB 도 픽스처 파일도 없이 도는 무료 측정이다 — 인질로 잡히면 안 된다.
+
+    로드 실패(파일 부재·라벨 불일치)는 **측정 3 의 미실행 사유**로 강등되고, 픽스처 수는
+    0 이 아니라 미실행으로 적힌다.
+    """
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings())
+    _block_outbound_sockets(monkeypatch)
+    missing = tmp_path / "없는-판정-픽스처.jsonl"
+
+    assert (
+        evaluate.main(
+            ["--judge-fixtures", str(missing), "--out-dir", str(tmp_path)],
+        )
+        == 0
+    )
+
+    payload = json.loads((tmp_path / "evaluation.json").read_text(encoding="utf-8"))
+    assert payload["measurement_1_l1_gate_accuracy"]["detection_rate"] == 1.0
+    judged = payload["measurement_3_l2_judge_accuracy"]
+    assert judged["executed"] is False
+    assert "FileNotFoundError" in judged["skip_reason"]
+    # 세지 못한 픽스처 수를 0 으로 채우지 않는다.
+    assert payload["conditions"]["judge_fixture_count"] is None
+    assert "판정 픽스처: 미실행" in (tmp_path / "evaluation.md").read_text(encoding="utf-8")
+
+
+def test_라벨이_깨진_판정_픽스처도_측정1_산출물을_막지_않는다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`ValueError`(라벨 불일치)도 파일 부재와 같은 강등 경로를 탄다."""
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings())
+    _block_outbound_sockets(monkeypatch)
+    broken = tmp_path / "broken.jsonl"
+    broken.write_text("{ 이건 JSON 이 아니다\n", encoding="utf-8")
+
+    assert evaluate.main(["--judge-fixtures", str(broken), "--out-dir", str(tmp_path)]) == 0
+
+    payload = json.loads((tmp_path / "evaluation.json").read_text(encoding="utf-8"))
+    assert payload["measurement_1_l1_gate_accuracy"]["detection_rate"] == 1.0
+    assert "ValueError" in payload["measurement_3_l2_judge_accuracy"]["skip_reason"]
+
+
 # ── 배관 전체 (대역 LLM + 시딩된 DB) ────────────────────────────────────────
 
 
@@ -1357,3 +1562,36 @@ def test_대역_LLM_은_미끼_조항에서_기각을_재현한다(
     # L1 기각 시도는 L2 를 부르지 않는다 — 판정은 재생성 초안 1회뿐이다.
     assert len(stub_judge.calls) == 1
     assert outcome.judge_input_tokens > 0
+
+
+@pytest.mark.db
+@pytest.mark.usefixtures("seeded_order_count")
+def test_stub_llm_진입점이_실제_DB_에서_판정_대역까지_배선한다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--stub-llm` 의 **판정 대역 배선을 진입점 경로로** 밟는 유일한 테스트다.
+
+    이게 없으면 `evaluate.py` 의 `build_stub_pipeline` 을 `build_pipeline` 으로 바꿔도 전체가
+    녹색이고, 실제 `--stub-llm` 실행만 진짜 판정 모델을 부른다(= 과금). 여기서 못박는 것은
+    셋이다: 아웃바운드 소켓을 막은 채 완주하는가, 측정 2 가 실행되고 **판정 토큰이 실제로
+    쌓이는가**(판정 층이 배선됐다는 증거), 측정 3 은 `--live` 사유로 미실행인가.
+    """
+    settings = get_settings().model_copy(update={"l2_enabled": True})
+    monkeypatch.setattr(evaluate, "get_settings", lambda: settings)
+    _block_outbound_sockets(monkeypatch)
+
+    assert evaluate.main(["--stub-llm", "--out-dir", str(tmp_path)]) == 0
+
+    payload = json.loads((tmp_path / "evaluation.json").read_text(encoding="utf-8"))
+    agreement = payload["measurement_2_pipeline_agreement"]
+    assert agreement["executed"] is True
+    assert agreement["total"] == len(GOLDEN)
+    tokens = agreement["tokens"]
+    assert tokens["judge_input_total"] + tokens["judge_output_total"] > 0
+    judged = payload["measurement_3_l2_judge_accuracy"]
+    assert judged["executed"] is False
+    assert "--live" in judged["skip_reason"]
+    # 대역 실행은 실측이 아니다 — L2 를 켰어도 라이브 이름 계열은 만들어지지 않는다.
+    assert payload["conditions"]["l2_enabled"] is True
+    assert payload["conditions"]["measurement2_is_real"] is False
+    assert not list(tmp_path.glob("evaluation-live*"))

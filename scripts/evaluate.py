@@ -5,7 +5,11 @@
     uv run python -m scripts.evaluate --stub-llm      # 측정 2 를 결정론 대역으로 (배관 검증)
     uv run python -m scripts.evaluate --live          # 측정 2·3 을 실제 모델로 (과금·비결정론)
 
-**측정 1 은 항상 돈다** — LLM 을 호출하지 않으므로 키도 DB 도 필요 없다.
+**측정 1 은 항상 돈다** — LLM 을 호출하지 않으므로 키도 DB 도 필요 없다. 판정 픽스처
+파일이 없거나 라벨이 깨져 있어도 마찬가지다: 그 실패는 **측정 3 의 미실행 사유**로 강등되고
+측정 1·2 는 그대로 산출된다. 측정 3 이 예상 밖 예외로 중단돼도 같다 — 이미 과금이 끝난
+측정 2 산출물을 트레이스백과 함께 잃지 않으려면 리포트는 반드시 쓰여야 한다(중단은
+리포트의 미실행 사유와 종료 코드 1 로 알린다).
 
 **측정 2·3 은 명시적 opt-in 이다.** 실제 실행은 과금되고 결과가 재실행마다 달라지므로
 기본값으로 돌리지 않는다. 실행하지 않았으면 리포트에 **미실행 사유가 그대로 남는다** —
@@ -42,6 +46,7 @@ import psycopg
 from psycopg.rows import DictRow
 
 from reply_gate.config import Settings, get_settings
+from reply_gate.contracts import RejectReason
 from reply_gate.db import connect, database_unavailable_reason, readonly_connect
 from reply_gate.evaluation import (
     DEFAULT_GOLDEN_SET_PATH,
@@ -292,6 +297,10 @@ def _run_measurement_two(
     return agreement, generation_label, embedding_label
 
 
+def _reasons(reasons: tuple[RejectReason, ...]) -> str:
+    return "없음" if not reasons else "[" + ", ".join(reason.value for reason in reasons) + "]"
+
+
 def _run_measurement_three(
     *, fixtures: tuple[JudgeFixture, ...], settings: Settings
 ) -> JudgeAccuracy:
@@ -303,13 +312,26 @@ def _run_measurement_three(
     judge: Judging = build_judge(settings)
 
     def progress(outcome: L2Outcome) -> None:
-        if outcome.error is not None:
+        actual = outcome.actual_verdict
+        if outcome.error is not None or actual is None:
+            # 판정이 나오지 않은 건은 여기서 끝난다 — 아래 마크는 판정이 있는 건만 쓴다.
             print(f"  [FAIL] {outcome.fixture_id} 판정 실패: {outcome.error}")
             return
-        mark = "OK " if outcome.reasons_matched else "MISS"
-        actual = "판정 없음" if outcome.actual_verdict is None else outcome.actual_verdict.value
+        # 같은 줄이 찍는 것은 verdict 다. 사유만 어긋난 건을 `MISS` 로 찍으면 "기대 reject /
+        # 실제 reject" 옆에 실패 표시가 붙어, 리포트가 성공으로 세는 건을 콘솔이 뒤집는다.
+        if outcome.reasons_matched:
+            mark, detail = "OK  ", ""
+        elif outcome.verdict_matched:
+            mark = "사유"
+            detail = (
+                f" — 사유 불일치: 기대 {_reasons(outcome.expected_reasons)}"
+                f" / 실제 {_reasons(outcome.actual_reasons)}"
+            )
+        else:
+            mark, detail = "MISS", ""
         print(
-            f"  [{mark}] {outcome.fixture_id} 기대 {outcome.expected_verdict.value} / 실제 {actual}"
+            f"  [{mark}] {outcome.fixture_id} 기대 {outcome.expected_verdict.value} "
+            f"/ 실제 {actual.value}{detail}"
         )
 
     return measure_judge_accuracy(fixtures=fixtures, judge=judge, on_outcome=progress)
@@ -318,13 +340,34 @@ def _run_measurement_three(
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     settings = get_settings()
+    #: 산출물은 반드시 남긴다 — 중단은 리포트에 사유로 적고 종료 코드로만 알린다.
+    exit_code = 0
     # 키·DB 선검사는 **측정 시작 전**이다 — 도중에 발견하면 과금만 하고 산출물이 없다.
     skip = _skip_reason(args=args, settings=settings)
     judge_skip = _judge_skip_reason(args=args, settings=settings, skip=skip)
 
     fixtures = load_l1_fixtures(args.l1_fixtures)
     cases = load_golden_set(args.golden_set)
-    judge_fixtures = load_judge_fixtures(args.judge_fixtures)
+    # 판정 픽스처 로드 실패는 **측정 3 만** 접는다 — 키도 DB 도 필요 없는 측정 1 의 산출물을
+    # 판정 픽스처 파일이 인질로 잡으면, 무료 실행이 트레이스백으로 죽으면서 아무것도 안 남는다.
+    judge_fixtures: tuple[JudgeFixture, ...] = ()
+    judge_fixture_error: str | None = None
+    try:
+        judge_fixtures = load_judge_fixtures(args.judge_fixtures)
+    # `KeyboardInterrupt` 는 여기서 잡지 않는다 — 아직 아무것도 과금되지 않았고, 삼키면
+    # Ctrl-C 를 누른 실행이 그대로 측정 2(과금)로 넘어간다.
+    except Exception as error:
+        judge_fixture_error = (
+            f"판정 픽스처를 읽지 못했다 (`{display_path(args.judge_fixtures)}`): "
+            f"{type(error).__name__}: {error}"
+        )
+        print(f"경고 — {judge_fixture_error}")
+    if judge_fixture_error is not None:
+        # 이미 다른 사유로 미실행이어도 로드 실패는 함께 남긴다 — 사유 하나를 다른 사유가
+        # 덮으면 리포트만 보고는 픽스처 파일이 깨진 것을 알 수 없다.
+        judge_skip = (
+            judge_fixture_error if judge_skip is None else f"{judge_skip} / {judge_fixture_error}"
+        )
 
     run_settings = _measurement_two_settings(args=args, settings=settings)
     measurement2_is_real = bool(args.live) and skip is None
@@ -361,12 +404,24 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     judge_accuracy: JudgeAccuracy | SkippedMeasurement
+    measurement3_is_real = False
     if judge_skip is not None:
         print(f"측정 3 — 미실행: {judge_skip}")
         judge_accuracy = SkippedMeasurement(reason=judge_skip)
     else:
         print(f"측정 3 — 판정 픽스처 {len(judge_fixtures)}건 (실제 판정 모델·과금)")
-        judge_accuracy = _run_measurement_three(fixtures=judge_fixtures, settings=run_settings)
+        try:
+            judge_accuracy = _run_measurement_three(fixtures=judge_fixtures, settings=run_settings)
+        except (Exception, KeyboardInterrupt) as error:
+            # 여기까지 왔으면 측정 2 는 이미 과금이 끝났다. 측정 3 의 예상 밖 예외
+            # (SDK 스큐·자격 증명 오류·Ctrl-C 등)로 죽으면 골든셋 30건을 다시 사야 한다 —
+            # 미실행으로 강등하고 **사유에 예외 종류와 메시지를 그대로 남긴 뒤** 리포트를 쓴다.
+            aborted = f"측정 3 이 중단됐다: {type(error).__name__}: {error}"
+            print(f"측정 3 — 중단: {aborted}")
+            judge_accuracy = SkippedMeasurement(reason=aborted)
+            exit_code = 1
+        else:
+            measurement3_is_real = True
 
     conditions = RunConditions(
         started_at=started_at,
@@ -377,7 +432,8 @@ def main(argv: list[str] | None = None) -> int:
         top_k=run_settings.vector_top_k,
         l1_fixture_count=len(fixtures),
         golden_case_count=len(cases),
-        judge_fixture_count=len(judge_fixtures),
+        # 로드하지 못했으면 0 이 아니라 **미실행**이다.
+        judge_fixture_count=None if judge_fixture_error is not None else len(judge_fixtures),
         # 커밋되는 라이브 리포트에 로컬 절대 경로(사용자명 포함)를 남기지 않는다.
         l1_fixtures_path=display_path(args.l1_fixtures),
         golden_set_path=display_path(args.golden_set),
@@ -386,6 +442,9 @@ def main(argv: list[str] | None = None) -> int:
         judge_api_key_present=bool(settings.anthropic_api_key),
         l2_enabled=settings.l2_enabled,
         measurement2_is_real=measurement2_is_real,
+        # 진입점에서 측정 3 이 도는 조건은 `--live` + L2 켜짐 + 키뿐이다 — 완주했으면
+        # 실제 판정 모델로 낸 값이다(대역 판정은 `--stub-llm` 이고 그때는 돌지 않는다).
+        measurement3_is_real=measurement3_is_real,
     )
     report: EvaluationReport = build_report(
         conditions=conditions,
@@ -398,7 +457,7 @@ def main(argv: list[str] | None = None) -> int:
     _print_summary(report)
     _print_targets(report)
     print(f"\n리포트: {markdown_path}\n리포트(JSON): {json_path}")
-    return 0
+    return exit_code
 
 
 def _print_summary(report: EvaluationReport) -> None:
@@ -442,7 +501,10 @@ def _print_summary(report: EvaluationReport) -> None:
         f"({judged.clean_false_positive}/{judged.clean_total})"
         f"{f', 판정 실패 {judged.error_total}건' if judged.error_total else ''}"
     )
-    print("  ※ 측정 3 은 확률 층이고 목표치는 미확정이다 — 달성·미달 판정이 붙지 않는다.")
+    if report.conditions.measurement3_is_real:
+        print("  ※ 측정 3 은 확률 층이고 목표치는 미확정이다 — 달성·미달 판정이 붙지 않는다.")
+    else:
+        print("  ※ 위 측정 3 수치는 대역으로 낸 값이다 — 판정 모델의 정확도가 아니다.")
 
 
 def _print_targets(report: EvaluationReport) -> None:
