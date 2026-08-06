@@ -190,8 +190,8 @@ def _inspect_schema(raw_draft: object) -> _SchemaInspection:
     **`citation_ids` 최소 개수 제약을 여기에 넣지 않는다.** 넣으면 `missing_citation` 이
     영원히 발화하지 않아 사유 분리가 무너진다(docs/business-rules.md "L1 게이트 판정 규칙").
 
-    스키마에 없는 추가 키는 위반으로 보지 않는다 — 답변 계약은 다음 사이클 L2 가 이어받아
-    확장할 계약이고, 추가 키는 claim 이 근거를 딛고 섰는지와 무관하기 때문이다.
+    스키마에 없는 추가 키는 위반으로 보지 않는다 — 답변 계약은 L2 가 그대로 이어받는
+    계약이고, 추가 키는 claim 이 근거를 딛고 섰는지와 무관하기 때문이다.
     """
     if not isinstance(raw_draft, Mapping):
         return _SchemaInspection(ok=False, citation_lists=(), draft=None)

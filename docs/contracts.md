@@ -12,7 +12,10 @@ HTTP 엔드포인트 4개가 외부 표면의 전부다. 인증은 없다.
 
 ## `POST /inquiries` — 문의 접수 + 동기 처리
 
-요청 전체가 처리될 때까지 응답하지 않는다. 실측 지연 중앙값은 약 4.5초, 95백분위 약 9초다.
+요청 전체가 처리될 때까지 응답하지 않는다. **L2 판정이 꺼진 조건에서** 실측 지연 중앙값은
+약 4.5초, 95백분위 약 9초다. 지금은 L2 가 기본으로 켜져 있고 `latency_ms` 가 판정 호출까지
+포함하므로 이 수치는 **꺼짐 기준선**으로만 읽어야 한다 — L2 켜짐 지연은 아직 실측되지
+않았다(라이브 실측 후 확정).
 
 **요청**
 
@@ -25,40 +28,121 @@ HTTP 엔드포인트 4개가 외부 표면의 전부다. 인증은 없다.
 | `content` | ✅ | 빈 문자열·공백만은 거부 |
 | `order_no` | — | 주면 `ORD-YYYYMMDD-NNNN` 형식이어야 하고 날짜가 실재해야 한다. 빈 문자열·공백은 **미입력으로 취급**(HTML 폼이 빈 필드를 항상 보내기 때문) |
 
-**응답 200**
+**응답 200** — 아래는 **L1 기각 → 재생성 → L2 기각**으로 인계된 장면이다(`answered` 면
+`answer`/`claims` 가 채워지고 `escalation_reason` 이 `null` 이다).
 
 ```json
 {
   "inquiry_id": "58276c6f-870f-46ea-9675-467dace9f115",
-  "status": "answered",
-  "answer": "확정 답변 텍스트 — escalated 면 null",
-  "claims": [ { "text": "답변 문장 1개", "citation_ids": ["policy:support:4-1"] } ],
-  "citations": [ { "id": "policy:support:4-1", "source": "policy", "content": "조항 텍스트 또는 쿼리+결과 요약" } ],
-  "attempts": [ { "verdict": "reject", "reject_reasons": ["missing_citation"] },
-                { "verdict": "pass",   "reject_reasons": [] } ],
-  "escalation_reason": null,
-  "metrics": { "latency_ms": 4048, "tokens": { "input": 1032, "output": 96 } }
+  "status": "escalated",
+  "answer": null,
+  "claims": [],
+  "citations": [ { "id": "policy:support:4-1", "source": "policy", "content": "조항 텍스트 또는 쿼리+결과 요약" },
+                 { "id": "policy:shipping:1-2", "source": "policy", "content": "조항 텍스트" },
+                 { "id": "policy:shipping:3-1", "source": "policy", "content": "조항 텍스트" } ],
+  "attempts": [
+    { "verdict": "reject", "reject_reasons": ["missing_citation"],
+      "l1": { "verdict": "reject", "reject_reasons": ["missing_citation"] },
+      "l2": null },
+    { "verdict": "reject", "reject_reasons": ["unsupported_claim"],
+      "l1": { "verdict": "pass", "reject_reasons": [] },
+      "l2": { "verdict": "reject",
+              "reject_reasons": ["unsupported_claim"],
+              "claim_judgments": [ { "claim_text": "답변 문장 1개", "verdict": "reject",
+                                     "explanation": "인용 조항이 이 주제를 다루지 않는다" } ],
+              "contradictions": [ { "evidence_id_a": "policy:shipping:1-2",
+                                    "evidence_id_b": "policy:shipping:3-1",
+                                    "explanation": "같은 사안에 다른 기준을 말한다" } ] } }
+  ],
+  "escalation_reason": "rejected_twice",
+  "metrics": { "latency_ms": 8123,
+               "tokens": { "input": 1032, "output": 96,
+                           "judge_input": 2104, "judge_output": 188 } }
 }
 ```
 
 - `status` — `answered` | `escalated`
+- `answer` / `claims` — `answered` 면 확정 답변 텍스트와 claim 배열
+  (`{text, citation_ids}` — 아래 "답변 계약" 절과 같은 모양)이 실리고, `escalated` 면
+  각각 `null` 과 `[]` 이다. **이 셋은 함께 움직인다** — `answered` ⟺ `answer != null` ⟺
+  `escalation_reason == null` 이고, DB 도 같은 불변식을 CHECK 로 건다
+  (`inquiries_terminal_shape`)
 - `attempts` — 최대 2건. 초안 전 인계면 `[]`
 - `escalation_reason` — `no_evidence` | `missing_order_ref` | `order_not_found` | `sql_failed`
   | `llm_call_failed` | `rejected_twice`. `answered` 면 `null`
-- `reject_reasons` — `schema_violation` | `missing_citation` | `invalid_citation` | `pii_detected`
+- `reject_reasons` — L1 4종 `schema_violation` | `missing_citation` | `invalid_citation`
+  | `pii_detected` + L2 2종 `unsupported_claim` | `contradictory_evidence`.
+  최상위 `attempts[].reject_reasons` 는 **종합**(두 층 사유의 합집합)이고 순서는 고정이다
+  (L1 4종 먼저, L2 2종 뒤 — `contracts.COMBINED_REASON_ORDER`)
+- `attempts[].l1` / `attempts[].l2` — **층별 내역**. 종합(`verdict`/`reject_reasons`)과 함께
+  실린다. 자세한 규칙은 아래 "층별 판정 키" 절
 - `citations[].source` — `policy` | `sql`
 - **초안 전 인계라도 그 시점까지 수집된 근거는 `citations` 에 담긴다**(감사 목적)
-- `metrics.tokens` — **생성 LLM 호출의 합산이다. 임베딩 토큰은 포함하지 않는다.**
-  임베딩 토큰은 처리 기록(`inquiries.embedding_tokens`)에만 별도로 남는다
-- `metrics.latency_ms` — 파이프라인 처리의 벽시계 시간. 처리 기록 저장은 포함하지 않는다
+- `metrics.tokens` — 계열별로 분리한다. 규칙은 아래 "토큰 집계 경계" 절
+- `metrics.latency_ms` — 파이프라인 처리의 벽시계 시간. **L2 판정 호출을 포함**하고
+  처리 기록 저장은 포함하지 않는다
+
+### 층별 판정 키 — `attempts[].l1` / `attempts[].l2`
+
+`verdict`/`reject_reasons` 는 기존 키이고 의미도 그대로 **종합**이다: 종합 `pass` ⟺ L1 이
+pass 이고 **L2 가 실행됐다면** L2 도 pass. 층별 내역은 두 키로 따로 실린다.
+
+| 키 | 모양 | `null` 이 되는 때 |
+|---|---|---|
+| `l1` | `{verdict, reject_reasons}` | 층별 컬럼이 없던 시절의 처리 기록을 복원한 경우뿐이다 — 현재 파이프라인이 만드는 시도에는 항상 있다 |
+| `l2` | `{verdict, reject_reasons, claim_judgments, contradictions}` | **셋** — ① L1 이 기각(L2 는 L1 통과분에만 돈다) ② L2 스위치 꺼짐 ③ L2 판정 호출 실패 |
+
+- **키는 사라지지 않는다.** 미실행은 키 부재가 아니라 `null` 이다(공통 규약).
+- **`l2: null` 은 "통과"가 아니라 "판정이 없었다"** 이다. 특히 ③ 판정 호출 실패 시도는
+  층 결합 정의상 **종합 `verdict` 가 `pass` 인데 문의는 인계된다** — 그 시도의 진실은
+  `escalation_reason: "llm_call_failed"` 가 들고 있다. 종합 verdict 만 보고 통과로 읽으면 안 된다.
+- `l2.claim_judgments` 는 **그 시도 초안의** claim **전부**(통과한 claim 포함)와 **1:1 로
+  대응한다**. 각 항목은 `{claim_text, verdict, explanation}` 이고, `claim_text` 는 답변
+  계약의 claim 에 별도 ID 가 없어 text 로 가리키는 참조다.
+  **짝짓기는 `claim_text` 로 한다 — 배열 위치는 계약이 아니다.** fail-closed 검증기가
+  강제하는 것은 초안 claim 집합과의 완전 대응과 중복 없음까지이고(`judge._parse_claim_judgments`),
+  배열 순서는 프롬프트가 요청할 뿐 거부 사유가 아니다. 위치로 짝지으면 "어느 문장이 왜
+  기각됐는지"가 다른 claim 에 붙을 수 있다.
+- 인계된 문의는 최상위 `claims` 가 `[]` 여도 이 배열은 **기각된 초안의** claim 을 담는다 —
+  두 배열을 서로 짝지으면 안 된다.
+- `l2.contradictions` 는 **근거쌍 단위** 기록 `{evidence_id_a, evidence_id_b, explanation}` 이다.
+  **여기 나오는 ID 는 반드시 같은 응답의 `citations` 안에 있다** — `citations` 는 인용된 근거가
+  아니라 **수집 근거 전체**이고, fail-closed 파싱이 모순 쌍의 ID 를 그 집합으로 검증한다
+  (`judge._parse_contradictions`). 초안이 인용하지 않은 근거의 모순도 잡히므로, 그 ID 가
+  `claims[].citation_ids` 에는 없을 수 있다 — `citations` 밖일 수는 없다.
+  **기록됐다고 곧 기각은 아니다** — 초안이 모순을 명시하고 두 기준을 모두 안내했으면
+  `reject_reasons` 에 오르지 않고 기록만 남는다.
+- `claim_judgments`/`contradictions` 가 **빈 배열**인 것과 `l2` 자체가 `null` 인 것은 다른
+  상태다. 전자는 "판정했고 해당 없음", 후자는 "판정이 없었다"이다.
+
+### 토큰 집계 경계
+
+토큰은 **계열별로 분리**한다 — provider 와 단가가 달라 섞으면 건당 비용 지표가 무너진다.
+
+| 키 | 무엇을 세나 | 경계 |
+|---|---|---|
+| `metrics.tokens.input` / `.output` | **생성 LLM 합산** — 의도 해석 + SQL 생성 + 초안 생성 | 임베딩·판정 토큰을 여기 섞지 않는다 |
+| `metrics.tokens.judge_input` / `.judge_output` | **L2 판정 모델 토큰** | 생성 합산과 별도 키 쌍이다. **L2 미실행이면 0** |
+| 임베딩 토큰 | 문의 임베딩·정책 인덱싱 | **응답에 싣지 않는다.** 처리 기록(`inquiries.embedding_tokens`)에만 남는다 |
+
+- **실행됐으나 실패한 호출의 토큰도 그대로 집계한다.** 전송 오류로 죽기 전에 200 으로
+  돌아온 호출, 안전 분류기 거절(HTTP 200), 형식 불일치로 버려진 산출 — 전부 실비용이므로
+  0 으로 접지 않는다. 판정 호출이 실패해 `l2` 가 `null` 인 시도에도 `judge_input`/
+  `judge_output` 은 0 이 아닐 수 있다.
+- `judge_*` 가 0 인 것은 "판정이 공짜였다"가 아니라 **판정을 부르지 않았다**는 뜻이다.
 
 **오류**
 
 | 코드 | 조건 |
 |---|---|
 | 422 | `content` 누락/빈 값, `order_no` 형식 오류. **파이프라인에 진입하지 않는다** — 형식 오류는 인계가 아니다 |
-| 503 | `OPENAI_API_KEY` 미설정. 설정 오류이므로 `llm_call_failed` 로 집계하지 않고 처리 기록도 남기지 않는다 |
+| 503 | `OPENAI_API_KEY` 미설정, 또는 **L2 가 켜져 있는데 `ANTHROPIC_API_KEY` 미설정**. 설정 오류이므로 `llm_call_failed` 로 집계하지 않고 처리 기록도 남기지 않는다 |
 | 500 | DB 오류. 인계 사유로 변환하지 않고 전파한다 |
+
+판정 키 선검사는 **`POST /inquiries` 경로 전용**이다. 처리에 진입하자마자 보므로 생성
+토큰을 태우기 전에 503 이 난다 — 검증하지 못할 답변을 만들기 시작하지 않는 것이
+fail-closed 다. `GET` 라우트와 접수 거부 422 는 판정 키가 없어도 그대로 산다(선검사가
+`Depends` 가 아니라 POST 핸들러 안에 있다).
 
 ## `GET /inquiries/{id}` — 처리 기록 조회
 
@@ -73,9 +157,17 @@ HTTP 엔드포인트 4개가 외부 표면의 전부다. 인증은 없다.
 
 ## `GET /` — 웹 폼
 
-한 장짜리 HTML. 대시보드가 아니다. **판정 과정이 답변보다 먼저·크게** 보이도록 구성돼 있다:
-최종 상태 → 시도별 `pass`/`reject` 배지와 기각 사유 코드 → 인계 사유 → 확정 답변 → 근거 목록
-→ 지표 → 원본 JSON.
+한 장짜리 HTML. 대시보드가 아니다. **판정 과정이 답변보다 먼저·크게** 보이도록 구성돼 있고,
+**어느 층이** 무엇을 왜 기각했는지가 화면의 주인공이다. 표시 순서:
+
+최종 상태 → 시도별 **종합** `pass`/`reject` 배지 + **층별 배지**(`L1 pass` / `L2 reject` /
+`L2 미실행`) → 기각 사유 코드 → **L2 의 claim 단위 판정**(claim 문장별 pass/reject + 설명)
+→ **근거쌍 모순**(모순 쌍 ID + 설명, 기각이 아니어도 기록되면 표시) → 인계 사유 →
+확정 답변 → 근거 목록 → 지표(지연은 L2 포함, 토큰은 생성·판정 분리 표기) → 원본 JSON.
+
+`L2 미실행` 배지에는 이유가 함께 붙는다(L1 기각 · 판정 층 꺼짐 · 판정 호출 실패).
+**응답에 실패 단계 필드가 없어 화면이 관측값으로 추론한다** — 한계는
+`docs/tracking/findings.md` 에 적어 두었다.
 
 문의 ID 로 저장된 기록을 다시 그리는 조회 입력이 함께 있다.
 
@@ -90,10 +182,12 @@ HTTP 엔드포인트 4개가 외부 표면의 전부다. 인증은 없다.
 
 **DB 를 확인하지 않는다.** 프로세스가 살아 있는지만 본다 — 의존성 헬스가 필요하면 확장 대상이다.
 
-## 답변 계약 (내부 → 다음 사이클 입력)
+## 답변 계약 (내부)
 
 초안 생성 LLM 의 구조화 출력이자 L1 검사의 대상이며, **의미 수준 검증(L2)이 그대로 이어받는
-계약**이다. `claims` / `citation_ids` 구조와 근거 ID 체계를 편의로 바꾸지 않는다.
+계약**이다 — L2 는 이 `claims` 배열을 그대로 판정 단위로 쓰고, `citation_ids` 가 가리키는
+근거 원문이 뒷받침 판정의 입력이 된다. `claims` / `citation_ids` 구조와 근거 ID 체계를
+편의로 바꾸지 않는다.
 
 ```json
 { "claims": [ { "text": "<답변 문장 1개>", "citation_ids": ["<근거 ID>"] } ] }

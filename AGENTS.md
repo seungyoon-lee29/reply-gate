@@ -30,7 +30,7 @@
 ├── scripts/
 │   └── AGENTS.md                  → 실행 진입점의 범위와 불변식
 ├── db/                            → 스키마 DDL, 컨테이너 초기화, 주문 픽스처
-└── data/                          → 정책 문서, 골든셋, L1 픽스처
+└── data/                          → 정책 문서, 골든셋, L1·L2 판정 픽스처
 ```
 
 ## 절대 깨지 않는 것
@@ -41,10 +41,12 @@
 2. **text-to-SQL 안전장치 3종은 생략 불가.** read-only 계정 · 스키마 화이트리스트 · 쿼리 검증.
    조회 범위는 프롬프트가 아니라 **코드가 AST 로 강제한다.**
 3. **루프 종료·데이터 접근·권한은 코드가 통제한다.** LLM 은 의도 분류 라벨·SQL 문자열·초안
-   JSON 까지만 만든다.
+   JSON·**L2 판정 JSON** 까지만 만든다. 판정 JSON 도 산출물일 뿐이다 — 그것을 재생성·인계·
+   종결로 옮기는 것도, 해석되지 않는 산출을 거부하는 것도(fail-closed) 코드다.
 4. **비밀은 어디에도 평문 금지.**
 5. **평가용으로 심은 장치를 제거하지 않는다.** 정책 문서의 미끼·모호·상충 조항, 기각 유발
-   골든셋 문의, L1 픽스처. 제거하면 기각 장면이 재현되지 않는다.
+   골든셋 문의, L1 픽스처, **L2 판정 픽스처**(`data/judge_fixtures.jsonl` — 측정 3 의 유일한
+   입력). 제거하면 기각 장면이 재현되지 않는다.
 
 전체 규칙은 `docs/standards.md` 에 있다.
 
@@ -58,8 +60,9 @@
 |---|---|
 | SQL 검증기(`sql_guard.py`) | `docs/engineering-notes.md` 의 "실제로 뚫렸던 경로" 3건 + `docs/tracking/decisions/0005` |
 | L1 게이트(`gate.py`) | `docs/business-rules.md` 의 PII 규칙 + `docs/engineering-notes.md` 의 오탐 사례 |
+| L2 판정(`judge.py`) | `docs/business-rules.md` 의 "L2 판정 규칙" + `docs/tracking/decisions/0007` |
 | 인계 사유·상태 전이 | `docs/business-rules.md` 의 사유 6종 표와 `both` 우선순위 규칙 |
-| 응답 스키마·API | `docs/contracts.md` (키 존재 규칙과 토큰 집계 경계) |
+| 응답 스키마·API | `docs/contracts.md` 의 "공통 규약"(키 존재 규칙)·"층별 판정 키"·"토큰 집계 경계" |
 | 스키마 변경 | `docs/engineering-notes.md` 의 "볼륨째 지워야 한다" + `docs/operations.md` 4단계 |
 | 평가·지표 | `docs/tracking/status.md` 의 첫 실측값 + `scripts/AGENTS.md` 의 리포트 불변식 |
 | 벡터 검색·임베딩 | `docs/engineering-notes.md` 의 pgvector 캐스트 + 대역 수치 주의 |

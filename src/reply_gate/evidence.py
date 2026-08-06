@@ -277,6 +277,18 @@ def classify_intent(
             error = exc.detail
             previous_output = exc.raw_text or None
             continue
+        except LLMCallError as exc:
+            # 재시도는 하지 않되 **앞선 시도에서 이미 과금된 토큰**을 버리지 않는다
+            # (`judge.Judge.judge` 와 같은 형태). 새 예외로 다시 던지는 것은 대역이
+            # 같은 예외 객체를 재사용해도 누적이 이중으로 실리지 않게 하기 위해서다.
+            raise LLMCallError(
+                stage=exc.stage,
+                reason=exc.reason,
+                attempts=exc.attempts,
+                cause=exc.cause,
+                input_tokens=input_tokens + exc.input_tokens,
+                output_tokens=output_tokens + exc.output_tokens,
+            ) from exc
 
         input_tokens += completion.input_tokens
         output_tokens += completion.output_tokens
@@ -603,6 +615,11 @@ class EvidenceCollector:
                     )
         except LLMCallError as exc:
             # 전송 오류는 래퍼가 이미 1회 재시도했다 — 어느 단계에서 왔든 llm_call_failed.
+            # 실패까지 실제로 과금된 토큰(예: 200 으로 돌아온 거절 응답의 usage)은 예외에
+            # 실려 온다 — 초안·판정 경로와 같은 규칙으로 원장에 더한 뒤 종결한다. 여기서만
+            # 버리면 같은 거절이 어느 단계에서 났느냐에 따라 실비용 기록이 갈린다.
+            ledger.input_tokens += exc.input_tokens
+            ledger.output_tokens += exc.output_tokens
             return self._finish(
                 ledger,
                 intent=intent,

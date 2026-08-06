@@ -10,7 +10,16 @@ from typing import Any, cast
 
 import pytest
 
-from reply_gate.contracts import DRAFT_JSON_SCHEMA, Evidence, EvidenceSource, RejectReason
+from reply_gate.contracts import (
+    DRAFT_JSON_SCHEMA,
+    ClaimJudgment,
+    Evidence,
+    EvidenceContradiction,
+    EvidenceSource,
+    JudgeResult,
+    RejectReason,
+    Verdict,
+)
 from reply_gate.draft import (
     DRAFT_STAGE,
     DRAFT_SYSTEM_PROMPT,
@@ -110,6 +119,90 @@ def test_최초_프롬프트에는_기각사유_절이_없다() -> None:
 
     for reason in RejectReason:
         assert reason.value not in prompt
+
+
+# ── L2 상세 피드백 ──────────────────────────────────────────────────────────
+
+L2_REJECTED_CLAIM = "해외 배송 소요 기간은 안내가 어렵습니다."
+
+L2_RESULT = JudgeResult(
+    verdict=Verdict.REJECT,
+    reject_reasons=(RejectReason.UNSUPPORTED_CLAIM, RejectReason.CONTRADICTORY_EVIDENCE),
+    claim_judgments=(
+        ClaimJudgment(
+            claim_text=L2_REJECTED_CLAIM,
+            verdict=Verdict.REJECT,
+            explanation="국내 배송 조항은 해외 배송 주제를 다루지 않는다.",
+        ),
+        ClaimJudgment(
+            claim_text="주문하신 상품은 배송중입니다.",
+            verdict=Verdict.PASS,
+            explanation="조회 결과가 그대로 뒷받침한다.",
+        ),
+    ),
+    contradictions=(
+        EvidenceContradiction(
+            evidence_id_a=EVIDENCE[0].id,
+            evidence_id_b=EVIDENCE[1].id,
+            explanation="배송 기간이 3일과 5일로 상충한다.",
+        ),
+    ),
+)
+
+
+def test_재생성_프롬프트는_L2_상세를_claim_단위로_싣는다() -> None:
+    """사유 코드만으로는 '어느 문장이 왜' 를 알 수 없다 — 재생성이 같은 실수를 반복한다."""
+    prompt = build_draft_user_prompt(
+        inquiry=INQUIRY,
+        evidence=EVIDENCE,
+        reject_reasons=L2_RESULT.reject_reasons,
+        judge_result=L2_RESULT,
+    )
+
+    assert RejectReason.UNSUPPORTED_CLAIM.value in prompt
+    assert L2_REJECTED_CLAIM in prompt
+    assert "국내 배송 조항은 해외 배송 주제를 다루지 않는다." in prompt
+    # 통과한 claim 의 설명까지 실어 프롬프트를 부풀리지 않는다.
+    assert "조회 결과가 그대로 뒷받침한다." not in prompt
+
+
+def test_모순_기각_피드백은_두_기준을_모두_안내하라고_지시한다() -> None:
+    """같은 근거로 재생성하는 불변식 안에서 구제 가능한 유일한 방향이다."""
+    prompt = build_draft_user_prompt(
+        inquiry=INQUIRY,
+        evidence=EVIDENCE,
+        reject_reasons=(RejectReason.CONTRADICTORY_EVIDENCE,),
+        judge_result=L2_RESULT,
+    )
+
+    assert "모순을 명시" in prompt
+    assert "두 기준을 모두 안내" in prompt
+    assert f"{EVIDENCE[0].id}" in prompt and f"{EVIDENCE[1].id}" in prompt
+    assert "배송 기간이 3일과 5일로 상충한다." in prompt
+
+
+def test_L2_상세가_없으면_L1_기각_피드백은_그대로다() -> None:
+    with_detail = build_draft_user_prompt(
+        inquiry=INQUIRY, evidence=EVIDENCE, reject_reasons=(RejectReason.MISSING_CITATION,)
+    )
+
+    assert "판정 세부" not in with_detail
+    assert RejectReason.MISSING_CITATION.value in with_detail
+
+
+def test_generate_는_L2_상세를_프롬프트로_넘긴다() -> None:
+    generator, recorder = _generator(
+        [JsonCompletion(data=VALID_DRAFT, input_tokens=0, output_tokens=0)]
+    )
+
+    generator.generate(
+        inquiry=INQUIRY,
+        evidence=EVIDENCE,
+        reject_reasons=L2_RESULT.reject_reasons,
+        judge_result=L2_RESULT,
+    )
+
+    assert L2_REJECTED_CLAIM in recorder.calls[0]["user"]
 
 
 # ── 생성 ────────────────────────────────────────────────────────────────────

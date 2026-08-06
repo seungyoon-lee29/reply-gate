@@ -7,8 +7,18 @@
 
 응답 스키마의 계약은 **모든 키가 항상 존재한다** 이다: `answer`·`escalation_reason` 은
 해당 없을 때 null, `claims`·`citations`·`attempts` 는 해당 없을 때 빈 배열. 초안 전
-인계라도 그때까지 수집된 근거는 `citations` 에 남는다(감사 목적). `metrics.tokens` 는
-**생성 LLM 합산**이고 임베딩 토큰은 여기 섞지 않는다 — 처리 기록에만 별도 필드로 남는다.
+인계라도 그때까지 수집된 근거는 `citations` 에 남는다(감사 목적).
+
+`attempts[]` 는 **종합 판정과 층별 판정을 함께** 싣는다: `verdict`/`reject_reasons` 는
+기존 키 그대로 종합이고(값 집합에만 L2 사유 2종이 더해졌다), `l1`/`l2` 가 층별 내역이다.
+`l2` 는 **미실행이면 `null`** 이고(L1 reject · 스위치 꺼짐 · L2 호출 실패) 키는 사라지지
+않는다 — `null` 은 "통과"가 아니라 "판정이 없었다"는 뜻이며, 그 시도의 진실은 인계 사유가
+들고 있다.
+
+`metrics.tokens` 의 `input`/`output` 은 **생성 LLM 합산**이고 임베딩·판정 토큰을 여기
+섞지 않는다. 판정 토큰은 `judge_input`/`judge_output` 으로 **분리 신설**한다(L2 미실행이면
+0) — provider 와 단가가 달라 생성 합산에 섞으면 건당 비용 지표가 무너진다. 임베딩 토큰은
+지금도 응답에 싣지 않고 처리 기록에만 남는다.
 
 접수 검증(내용 필수·주문번호 형식)은 **파이프라인에 들어가기 전에** 422 로 끝난다.
 형식이 틀린 주문번호는 인계가 아니라 요청 오류다.
@@ -16,7 +26,14 @@
 생성·임베딩 클라이언트는 **첫 호출 직전에** 만든다(`_LazyGenerationClient`). 의존성 해석
 시점에 만들면 API 키가 없는 환경에서 LLM 을 전혀 쓰지 않는 경로 — 조회 전용
 `GET /inquiries/{id}`, 접수 거부 422 — 까지 500 으로 무너진다. 자격 증명 부재는 업무
-판정이 아니므로 인계 사유(`llm_call_failed`)로 기록하지 않고 **설정 오류(503)** 로 끝낸다.
+판정이 아니므로 인계 사유(`llm_call_failed`)로 기록하지 않고 **설정 오류(503)** 로 끝낸다
+(`MissingCredentialsError` 의 정의는 `pipeline.py` 가 소유한다 — 파이프라인 내부의 지연
+클라이언트도 같은 예외를 던져야 이 핸들러가 잡는다).
+
+판정 키(`ANTHROPIC_API_KEY`)만 예외적으로 **eager** 다: L2 가 켜져 있으면
+`POST /inquiries` 는 처리에 진입하자마자 키를 선검사해 503 을 낸다(`_require_judge_credentials`).
+검증하지 못할 답변을 만들기 시작하지 않기 위해서다. 선검사는 **POST 경로에만** 걸고
+조회·422 경로는 건드리지 않는다.
 
 핸들러는 동기(`def`)다 — psycopg 는 동기 드라이버이고, FastAPI 가 스레드풀에서 돌린다.
 """
@@ -35,6 +52,7 @@ from psycopg.rows import DictRow
 from pydantic import BaseModel, Field, model_validator
 
 from reply_gate.config import Settings, get_settings
+from reply_gate.contracts import GateResult, JudgeResult
 from reply_gate.db import connect, readonly_connect
 from reply_gate.llm import (
     EmbeddingClient,
@@ -45,7 +63,9 @@ from reply_gate.llm import (
     OpenAIGenerationClient,
 )
 from reply_gate.pipeline import (
+    AttemptRecord,
     InquiryPipeline,
+    MissingCredentialsError,
     ProcessedInquiry,
     ReceiptError,
     accept_inquiry,
@@ -114,23 +134,146 @@ class CitationOut(BaseModel):
     content: str
 
 
-class AttemptOut(BaseModel):
+class ClaimJudgmentOut(BaseModel):
+    """L2 가 claim 1개에 내린 판정. 데모의 "왜 기각됐는지" 장면이 여기서 나온다.
+
+    `claim_text` 는 판정 대상 claim 의 text 참조다 — 답변 계약의 claim 에는 별도 ID 가
+    없으므로 text 로 가리킨다(`contracts.ClaimJudgment` 와 같은 규칙).
+    """
+
+    claim_text: str
+    verdict: str
+    explanation: str
+
+
+class ContradictionOut(BaseModel):
+    """L2 가 찾은 근거쌍 모순 1건.
+
+    모순은 **근거쌍 단위**라 특정 claim 에 귀속되지 않을 수 있어 claim 판정과 별도 배열이다.
+    기록됐다고 곧 기각은 아니다 — 초안이 모순을 명시하고 두 기준을 모두 안내했으면
+    `reject_reasons` 에 오르지 않고 기록만 남는다.
+    """
+
+    evidence_id_a: str
+    evidence_id_b: str
+    explanation: str
+
+
+class GateOut(BaseModel):
+    """시도 1건의 **L1 층** 판정 — 기계 검사(LLM 호출 0회)의 결과."""
+
     verdict: str
     reject_reasons: list[str]
 
 
+class JudgeOut(BaseModel):
+    """시도 1건의 **L2 층** 판정 — 층 판정 + claim 단위 판정 + 근거쌍 모순."""
+
+    verdict: str
+    reject_reasons: list[str]
+    claim_judgments: list[ClaimJudgmentOut]
+    contradictions: list[ContradictionOut]
+
+
+class AttemptOut(BaseModel):
+    """초안 1건에 대한 판정. **종합과 층별을 함께** 싣는다.
+
+    `verdict`/`reject_reasons` 는 기존 키이고 의미도 그대로 **종합**이다(값 집합에만
+    L2 사유 2종이 더해졌다): 종합 pass ⟺ L1 pass 이고 L2 가 실행됐다면 L2 도 pass.
+
+    `l1`/`l2` 는 층별 내역이며 **미실행은 `null`, 키는 항상 존재**한다. `l2` 가 `null` 인
+    경우는 셋이다 — L1 reject(L2 는 L1 통과분에만 돈다) · 스위치 꺼짐 · L2 호출 실패.
+    셋 다 "통과"가 아니라 "판정이 없었다"이므로, 종합 verdict 만 보고 통과로 읽으면 안
+    된다(L2 호출 실패 시도는 층 결합 정의상 종합 pass 인데 문의는 인계된다).
+    `l1` 이 `null` 인 것은 층별 컬럼이 없던 시절의 처리 기록을 복원한 경우뿐이다.
+    """
+
+    verdict: str
+    reject_reasons: list[str]
+    l1: GateOut | None
+    l2: JudgeOut | None
+
+
 class TokensOut(BaseModel):
+    """토큰은 **계열별로 분리**한다 — provider 와 단가가 다르기 때문이다.
+
+    `input`/`output` 은 기존 키·기존 의미 그대로 **생성 LLM 합산**이다(의도 해석 + SQL
+    생성 + 초안 생성). `judge_input`/`judge_output` 은 판정 모델 토큰으로 **분리 신설**한
+    키이며 **L2 미실행이면 0** 이다. 판정 토큰을 생성 합산에 섞으면 건당 비용 지표가
+    무너진다 — 임베딩 토큰을 섞지 않는 것과 같은 이유다(임베딩은 지금도 응답에 싣지 않고
+    처리 기록에만 남는다).
+    """
+
     input: int
     output: int
+    judge_input: int
+    judge_output: int
 
 
 class MetricsOut(BaseModel):
+    """`latency_ms` 는 파이프라인 벽시계 시간이다 — **L2 호출을 포함**하고 처리 기록
+    저장은 포함하지 않는다."""
+
     latency_ms: int
     tokens: TokensOut
 
 
+def _gate_out(result: GateResult | None) -> GateOut | None:
+    """L1 층 내역 → 응답. 층별 내역이 없는 기록(복원 경로)은 `None` 으로 남긴다."""
+    if result is None:
+        return None
+    return GateOut(
+        verdict=result.verdict.value,
+        reject_reasons=[reason.value for reason in result.reject_reasons],
+    )
+
+
+def _judge_out(result: JudgeResult | None) -> JudgeOut | None:
+    """L2 층 내역 → 응답. **미실행이면 `None`** 이고 키는 그대로 남는다.
+
+    claim 판정·모순쌍이 0건인 것과 L2 가 아예 돌지 않은 것은 다른 상태다 — 전자는 빈
+    배열, 후자는 `null` 이다. 저장 층도 같은 구분을 지킨다(`records._l2_columns`).
+    """
+    if result is None:
+        return None
+    return JudgeOut(
+        verdict=result.verdict.value,
+        reject_reasons=[reason.value for reason in result.reject_reasons],
+        claim_judgments=[
+            ClaimJudgmentOut(
+                claim_text=judgment.claim_text,
+                verdict=judgment.verdict.value,
+                explanation=judgment.explanation,
+            )
+            for judgment in result.claim_judgments
+        ],
+        contradictions=[
+            ContradictionOut(
+                evidence_id_a=contradiction.evidence_id_a,
+                evidence_id_b=contradiction.evidence_id_b,
+                explanation=contradiction.explanation,
+            )
+            for contradiction in result.contradictions
+        ],
+    )
+
+
+def _attempt_out(attempt: AttemptRecord) -> AttemptOut:
+    return AttemptOut(
+        verdict=attempt.verdict.value,
+        reject_reasons=[reason.value for reason in attempt.reject_reasons],
+        l1=_gate_out(attempt.l1_result),
+        l2=_judge_out(attempt.l2_result),
+    )
+
+
 class InquiryResponse(BaseModel):
-    """docs/contracts.md "공통 규약" 의 공통 골격. 값이 없을 때도 키는 사라지지 않는다."""
+    """docs/contracts.md "공통 규약" 의 공통 골격. 값이 없을 때도 키는 사라지지 않는다.
+
+    `POST /inquiries` 와 `GET /inquiries/{id}` 가 **같은 조립기**를 쓴다 — 조회는 저장된
+    기록에서 복원한 `ProcessedInquiry` 를 넣을 뿐이라 층별 판정·판정 토큰까지 같은 모양으로
+    다시 나온다.
+    """
 
     inquiry_id: str
     status: str
@@ -155,19 +298,18 @@ class InquiryResponse(BaseModel):
                 CitationOut(id=item.id, source=item.source.value, content=item.content)
                 for item in processed.evidence
             ],
-            attempts=[
-                AttemptOut(
-                    verdict=attempt.verdict.value,
-                    reject_reasons=[reason.value for reason in attempt.reject_reasons],
-                )
-                for attempt in processed.attempts
-            ],
+            attempts=[_attempt_out(attempt) for attempt in processed.attempts],
             escalation_reason=(
                 None if processed.escalation_reason is None else processed.escalation_reason.value
             ),
             metrics=MetricsOut(
                 latency_ms=processed.latency_ms,
-                tokens=TokensOut(input=processed.input_tokens, output=processed.output_tokens),
+                tokens=TokensOut(
+                    input=processed.input_tokens,
+                    output=processed.output_tokens,
+                    judge_input=processed.judge_input_tokens,
+                    judge_output=processed.judge_output_tokens,
+                ),
             ),
         )
 
@@ -210,15 +352,6 @@ class InquiryService:
 
     def fetch(self, inquiry_id: str) -> ProcessedInquiry | None:
         return load_inquiry(conn=self._app_conn, inquiry_id=inquiry_id)
-
-
-class MissingCredentialsError(RuntimeError):
-    """OpenAI 자격 증명이 없다 — **설정 오류**이지 인계 사유가 아니다.
-
-    `LLMCallError` 를 상속하지 않는 것이 핵심이다: 상속하면 근거 수집기가 이것을 잡아
-    `llm_call_failed` 인계로 기록해 버리고, 키를 안 넣고 돌린 실행이 평가 지표에
-    "전송 오류 인계"로 섞여 들어간다.
-    """
 
 
 def _require_api_key(settings: Settings) -> str:
@@ -324,9 +457,32 @@ def health() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
+def _require_judge_credentials() -> None:
+    """L2 가 켜져 있으면 판정 키를 **POST 처리 진입 시점에** 선검사한다.
+
+    지연 검사(L2 에 도달해서야 실패)로 두면 두 가지가 무너진다: 생성 토큰을 태운 뒤에야
+    503 이 나고, L1 이 2회 기각한 문의는 판정 키 없이도 정상 종결되어 "키 없으면 503"이
+    조건부 규칙이 된다. 검증하지 못할 답변을 만들기 시작하지 않는 것이 fail-closed 다.
+
+    **이 검사는 POST 경로에만 건다.** `get_service`(Depends)는 GET 라우트와 공유하므로
+    거기에 넣으면 판정 키가 없는 환경에서 조회 전용 경로까지 죽는다
+    (docs/engineering-notes.md "목만으로는 잡히지 않는 결함"). 접수 거부 422 도 판정 키와
+    무관하다 — 그 경로는 이 함수에 닿기 전에 끝난다.
+    """
+    settings = get_settings()
+    if settings.l2_enabled and not settings.anthropic_api_key:
+        raise MissingCredentialsError(
+            "ANTHROPIC_API_KEY 가 설정되지 않았다. L2 판정이 켜져 있으면 판정 없이 답변을 "
+            "내보내지 않는다 — `.env` 또는 환경 변수에 키를 넣거나 L2_ENABLED=false 로 "
+            "판정을 끄고 다시 실행한다."
+        )
+
+
 @app.post("/inquiries")
 def create_inquiry(payload: InquiryRequest, service: ServiceDep) -> InquiryResponse:
     """문의 접수 + 동기 처리. 접수 검증 실패는 이 함수에 닿기 전에 422 로 끝난다."""
+    # 처리 기록을 남기기 전에 끝낸다 — 설정 오류는 인계(`llm_call_failed`)가 아니다.
+    _require_judge_credentials()
     processed = service.process(content=payload.content, order_no=payload.order_no)
     return InquiryResponse.of(processed)
 
