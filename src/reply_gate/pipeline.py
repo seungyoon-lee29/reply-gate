@@ -314,7 +314,8 @@ def _combine(
     fail-closed 는 배선 실수에도 성립해야 하므로 조용히 통과시키지 않고 죽는다.
 
     호출부는 둘이다: 정상 종결 경로(L2 를 돌렸어야 하면 `True`)와 `_judge_failure`
-    (L2 호출이 실패해 판정이 없는 것이 **스펙이 정한 동작**이므로 `False`).
+    (L2 호출이 실패해 판정이 없는 것은 docs/contracts.md "층별 판정 키" 가 정한 동작
+    ③ 이므로 `False`).
     """
     if l2_expected and l2_result is None:
         raise PipelineWiringError(
@@ -418,7 +419,7 @@ class InquiryPipeline:
             started=started,
         )
 
-    # ── 5~7단계: 초안 생성 → L1 → 종결 ──────────────────────────────────────
+    # ── 5~7단계: 초안 생성 → L1 → L2 → 종결 ─────────────────────────────────
 
     @dataclass(frozen=True)
     class _LoopOutcome:
@@ -553,7 +554,8 @@ class InquiryPipeline:
         더 돌리지 않는다: 인프라 실패는 초안을 고쳐서 나아지는 것이 아니다.
 
         `l2_expected=False` 를 **명시**한다: 여기서 판정이 없는 것은 배선 실수가 아니라
-        스펙이 정한 동작이라, fail-open 차단 검사에 걸리면 안 된다.
+        docs/contracts.md "층별 판정 키" 가 `l2: null` 로 규정한 동작이라, fail-open 차단
+        검사에 걸리면 안 된다.
         """
         verdict, reasons = _combine(l1_result, None, l2_expected=False)
         tally.attempts.append(
@@ -608,7 +610,8 @@ class InquiryPipeline:
             input_tokens=tally.input_tokens,
             output_tokens=tally.output_tokens,
             embedding_tokens=collection.embedding_tokens,
-            # 판정 토큰은 생성 합산과 **분리**해서 싣는다 (spec 5-3). L2 미실행이면 0 이다.
+            # 판정 토큰은 생성 합산과 **분리**해서 싣는다
+            # (docs/contracts.md "토큰 집계 경계"). L2 미실행이면 0 이다.
             judge_input_tokens=tally.judge_input_tokens,
             judge_output_tokens=tally.judge_output_tokens,
         )

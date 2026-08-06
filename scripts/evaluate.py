@@ -12,13 +12,18 @@
 중 완주분)과 무료인 측정 1 산출물이 함께 사라지기 때문이다. 중단은 **리포트의 미실행
 사유**(예외 종류와 메시지를 그대로 담는다)와 종료 코드로만 알린다.
 
-**종료 코드 규칙은 하나다 — 과금 실행에서 측정 3 이 미실행이면 1, 그 밖에는 0.**
-여기서 "과금 실행"은 `--live` 로 선검사(키·DB)를 통과해 **측정 2 가 실측으로 돌 조건이었던**
-실행이다. 완주했든 도중에 중단됐든 같다: 측정 2 가 중단되면 측정 3 도 잇지 않으므로
-(Ctrl-C 를 삼키고 판정을 더 사면 안 된다) 그 실행도 이 규칙 하나로 1 이 된다. 판정 픽스처
-로드 실패로 측정 3 이 미실행인 것도 과금 실행이면 1 이다 — 골든셋 30건을 사고 판정 수치는
-못 낸 실행이 래퍼·CI 에 "성공"으로 읽히면 안 된다. 반면 `--live` 없이 도는 평범한 실행에서
-측정 3 이 "`--live` 아님" 사유로 미실행인 것은 **정상이므로 0** 이다.
+**종료 코드가 1 이 되는 경우는 둘뿐이다 — ① 측정 3 이 돌 조건이었는데 미실행,
+② 사용자 중단(Ctrl-C). 그 밖에는 0.**
+①의 "돌 조건"은 `--live` 로 선검사(키·DB)를 통과해 **측정 2 가 실측으로 돌 조건이었고**
+**L2 도 켜져 있던** 실행이다. 완주했든 도중에 중단됐든 같다: 측정 2 가 중단되면 측정 3 도
+잇지 않으므로(추가 과금을 하면 안 된다) 그 실행도 1 이 된다. 판정 픽스처 로드 실패로
+측정 3 이 미실행인 것도 마찬가지다 — 골든셋 30건을 사고 판정 수치는 못 낸 실행이 래퍼·CI 에
+"성공"으로 읽히면 안 된다.
+②는 **과금 여부와 무관하다**: `--stub-llm`·기본 실행에서 Ctrl-C 를 눌러도 1 이다. 리포트는
+그대로 쓰되(과금분 보존) 중단 사실을 종료 코드가 들고 간다.
+반면 **`--live` 없이 도는 평범한 실행**에서 측정 3 이 "`--live` 아님" 사유로 미실행인 것과,
+**L2 꺼짐 기준선 실행**(`L2_ENABLED=false`)에서 측정 3 이 설계상 안 도는 것은 **정상이므로
+0** 이다 — 목표치를 전부 달성한 꺼짐 기준선이 실패로 읽히면 안 된다.
 
 **측정 2·3 은 명시적 opt-in 이다.** 실제 실행은 과금되고 결과가 재실행마다 달라지므로
 기본값으로 돌리지 않는다. 실행하지 않았으면 리포트에 **미실행 사유가 그대로 남는다** —
@@ -434,6 +439,8 @@ def main(argv: list[str] | None = None) -> int:
 
     pipeline: PipelineAgreement | SkippedMeasurement
     measurement2_aborted = False
+    #: 사용자 중단(Ctrl-C)이 있었는가. 과금 여부와 무관하게 종료 코드로 알린다.
+    interrupted = False
     if skip is not None:
         print(f"측정 2 — 미실행: {skip}")
         pipeline = SkippedMeasurement(reason=skip)
@@ -455,6 +462,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"측정 2 — 중단: {aborted}")
             pipeline = SkippedMeasurement(reason=aborted)
             measurement2_aborted = True
+            interrupted = interrupted or isinstance(error, KeyboardInterrupt)
             attempted_generation, attempted_embedding = _client_labels(
                 args=args, settings=run_settings
             )
@@ -484,15 +492,23 @@ def main(argv: list[str] | None = None) -> int:
             aborted = f"측정 3 이 중단됐다: {type(error).__name__}: {error}"
             print(f"측정 3 — 중단: {aborted}")
             judge_accuracy = SkippedMeasurement(reason=aborted)
+            interrupted = interrupted or isinstance(error, KeyboardInterrupt)
         else:
             measurement3_is_real = True
 
     # ── 종료 코드는 여기 한 곳에서만 정해진다 (규칙이 갈리지 않게) ──────────────
-    # **과금 실행에서 측정 3 이 미실행이면 1, 그 밖에는 0.** 사유가 무엇이든(픽스처 로드
-    # 실패·중단·측정 2 중단으로 인한 연쇄 미실행) 같다 — 골든셋 30건을 사고 판정 수치는 못
-    # 낸 실행이 종료 코드로는 성공으로 읽히면 안 되기 때문이다. `--live` 없이 도는 평범한
-    # 실행에서 측정 3 이 "`--live` 아님" 사유로 미실행인 것은 정상이므로 0 이다.
-    exit_code = 1 if measurement2_is_real and isinstance(judge_accuracy, SkippedMeasurement) else 0
+    # 1 이 되는 경우는 둘뿐이다.
+    #   ① **측정 3 이 돌 조건이었는데 미실행** — 즉 과금 실행(`--live` + 선검사 통과)이고
+    #      L2 도 켜져 있었는데 판정 수치가 안 나온 경우. 사유가 무엇이든(픽스처 로드 실패·
+    #      중단·측정 2 중단으로 인한 연쇄 미실행) 같다 — 골든셋 30건을 사고 판정 수치는 못
+    #      낸 실행이 종료 코드로는 성공으로 읽히면 안 되기 때문이다.
+    #   ② **사용자 중단(Ctrl-C)** — 과금 여부와 무관하다. 산출물은 남기되(과금분 보존),
+    #      중단된 실행이 성공으로 읽히면 안 된다.
+    # 반대로 **L2 꺼짐 기준선에서 측정 3 이 안 도는 것은 설계상 정상이라 0** 이다.
+    # `--live` 없이 도는 평범한 실행에서 "`--live` 아님" 사유로 미실행인 것도 마찬가지다.
+    measurement3_was_due = measurement2_is_real and settings.l2_enabled
+    measurement3_missing = measurement3_was_due and isinstance(judge_accuracy, SkippedMeasurement)
+    exit_code = 1 if interrupted or measurement3_missing else 0
 
     conditions = RunConditions(
         started_at=started_at,

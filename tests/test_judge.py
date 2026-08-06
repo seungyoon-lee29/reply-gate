@@ -202,7 +202,8 @@ def test_모순을_명시하고_두_기준을_안내한_초안은_통과한다()
 
     assert outcome.result.verdict is Verdict.PASS
     assert outcome.result.reject_reasons == ()
-    # 모순 기록은 남는다 — 통과와 모순 기록은 양립한다 (spec 4-5).
+    # 모순 기록은 남는다 — 통과와 모순 기록은 양립한다
+    # (docs/business-rules.md "모순 판정 — 근거쌍 단위").
     assert len(outcome.result.contradictions) == 1
 
 
@@ -225,7 +226,8 @@ def test_양성_대조_정상_초안은_전부_통과한다() -> None:
     assert outcome.result.reject_reasons == ()
     assert outcome.result.contradictions == ()
     assert [j.verdict for j in outcome.result.claim_judgments] == [Verdict.PASS, Verdict.PASS]
-    # claim 이 여럿이어도 판정 호출은 시도당 1회 배치다 (spec 4-1).
+    # claim 이 여럿이어도 판정 호출은 시도당 1회 배치다
+    # (docs/business-rules.md "L2 판정 규칙").
     assert len(recorder.calls) == 1
 
 
@@ -250,7 +252,10 @@ def test_뒷받침_절에는_claim_이_인용한_근거만_실린다() -> None:
 
 
 def test_미인용_근거만으로_이뤄진_모순도_검출된다() -> None:
-    """모순 입력이 수집 근거 전체라야 미인용 쌍의 모순이 잡힌다 (spec 4-5)."""
+    """모순 입력이 수집 근거 전체라야 미인용 쌍의 모순이 잡힌다.
+
+    docs/business-rules.md "모순 판정 — 근거쌍 단위".
+    """
     draft = _draft(("주문하신 상품은 현재 배송중입니다.", (SQL_STATUS.id,)))
     payload = _all_pass_payload(draft)
     payload["contradictions"] = [
@@ -357,7 +362,8 @@ def test_전송_오류는_재시도_없이_그대로_전파된다() -> None:
 def test_형식_실패_뒤_전송_오류는_누적_토큰을_실어_전파한다() -> None:
     """1회차가 200 으로 과금된 뒤 2회차가 전송 오류로 죽는 조합 — 누적분을 버리지 않는다.
 
-    규칙은 "실행됐으나 실패한 호출의 토큰도 그대로 집계한다"(이번 사이클 스펙)이다.
+    규칙은 "실행됐으나 실패한 호출의 토큰도 그대로 집계한다"(docs/contracts.md
+    "토큰 집계 경계")이다.
     여기서 버리면 실제로 과금된 판정 호출의 값이 파이프라인 밖으로 나가지 못해, 처리
     기록·API 응답이 판정 토큰을 싣는 뒤 태스크 시점에 실비용이 0 으로 굳는다.
     """
@@ -476,6 +482,19 @@ def _break_unknown_claim_text(payload: dict[str, Any]) -> None:
     )
 
 
+def _break_duplicate_claim_judgment(payload: dict[str, Any]) -> None:
+    """같은 claim 을 두 번 판정한 산출 — 집합 대응 검사만으로는 통과해버린다.
+
+    짝짓기는 `claim_text` 로 한다(docs/contracts.md "층별 판정 키"). 같은 text 가 두 번
+    실리면 어느 판정이 그 문장의 것인지 정할 수 없고, 두 판정이 엇갈리면(pass/reject)
+    "어느 문장이 왜 기각됐는지"가 화면과 재생성 피드백에서 갈린다.
+    """
+    duplicate = dict(payload["claim_judgments"][0])
+    duplicate["verdict"] = "pass"
+    duplicate["explanation"] = "같은 문장에 대한 두 번째 판정."
+    payload["claim_judgments"].append(duplicate)
+
+
 def _break_unknown_verdict_value(payload: dict[str, Any]) -> None:
     payload["claim_judgments"][0]["verdict"] = "maybe"
 
@@ -496,6 +515,7 @@ def _break_missing_required_key(payload: dict[str, Any]) -> None:
         _break_self_contradiction,
         _break_missing_claim_judgment,
         _break_unknown_claim_text,
+        _break_duplicate_claim_judgment,
         _break_unknown_verdict_value,
         _break_missing_required_key,
     ],
@@ -518,7 +538,7 @@ def test_정합성이_깨진_판정_산출은_거부된다(mutate: Any) -> None:
 
 
 def test_판정_토큰이_결과에_그대로_노출된다() -> None:
-    """파이프라인이 생성 토큰과 분리 집계하는 전제 (spec 5-3)."""
+    """파이프라인이 생성 토큰과 분리 집계하는 전제 (docs/contracts.md "토큰 집계 경계")."""
     draft = _draft(("해외 배송 요금은 정책에 기재되어 있지 않습니다.", (OVERSEAS_ABSENT.id,)))
     judge, _ = _judge([_completion(_all_pass_payload(draft), input_tokens=321, output_tokens=87)])
 
@@ -572,7 +592,8 @@ def test_판정_스키마의_사유_enum_은_L2_2종뿐이다() -> None:
 
 def test_시스템_프롬프트는_의미_정책_4분면을_담는다() -> None:
     # 주제 인접 인용 기각 / 정면 조항의 "없다" 통과 / 모순 명시 + 두 기준 안내 통과 /
-    # 비명시 기각 — spec 4-4·4-5 의 의미 정책이 지시로 옮겨져 있어야 한다.
+    # 비명시 기각 — docs/business-rules.md "뒷받침 판정 — claim 단위"·"모순 판정 —
+    # 근거쌍 단위" 의 의미 정책이 지시로 옮겨져 있어야 한다.
     assert "주제 인접 인용은 기각" in JUDGE_SYSTEM_PROMPT
     assert "정면으로 다루" in JUDGE_SYSTEM_PROMPT
     assert "기재되어 있지 않다" in JUDGE_SYSTEM_PROMPT

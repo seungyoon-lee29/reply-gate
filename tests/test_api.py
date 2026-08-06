@@ -7,7 +7,8 @@
 `attempts[]` 는 **종합 판정(기존 키)과 층별 판정(`l1`/`l2`)을 함께** 싣는다. `l2` 는
 미실행이면 `null` 이고 키는 사라지지 않는다 — 미실행 3종(L1 reject · 스위치 꺼짐 ·
 L2 호출 실패)을 각각 확인한다. 특히 **L2 호출 실패 시도**는 층 결합 정의상 종합 verdict 가
-`pass` 인데 문의는 인계되므로(spec 4-7), 응답이 "판정이 없었다"를 `l2: null` 로 드러내지
+`pass` 인데 문의는 인계되므로(docs/contracts.md "층별 판정 키"), 응답이 "판정이 없었다"를
+`l2: null` 로 드러내지
 못하면 화면이 "통과했는데 왜 인계?"로 읽힌다.
 
 `metrics.tokens` 의 `input`/`output` 은 **생성 LLM 합산**으로 의미가 불변이고, 판정 토큰은
@@ -346,7 +347,10 @@ def test_웹_폼의_판정_제목은_층_중립이다(client: TestClient) -> Non
 
 
 def test_웹_폼은_층_구분과_L2_상세를_표시한다(client: TestClient) -> None:
-    """spec 5-3 — 층 배지·claim 단위 판정·근거쌍 모순이 화면에 있어야 한다."""
+    """층 배지·claim 단위 판정·근거쌍 모순이 화면에 있어야 한다.
+
+    docs/contracts.md "층별 판정 키"·"토큰 집계 경계".
+    """
     html = client.get("/").text
 
     assert "L2 미실행" in html  # 층 배지 — 미실행은 통과가 아니다
@@ -358,7 +362,8 @@ def test_웹_폼은_층_구분과_L2_상세를_표시한다(client: TestClient) 
 
 
 def test_웹_폼은_L2_호출_실패_시도를_통과로_읽히게_두지_않는다(client: TestClient) -> None:
-    """종합 verdict 는 pass 인데 문의는 인계되는 경우(spec 4-7) — 값은 그대로 두고
+    """종합 verdict 는 pass 인데 문의는 인계되는 경우(docs/contracts.md
+    "층별 판정 키") — 값은 그대로 두고
     "판정이 없었다"를 화면이 따로 말해야 "통과했는데 왜 인계?"로 읽히지 않는다."""
     html = client.get("/").text
 
@@ -605,7 +610,7 @@ def test_처리_기록이_DB_에_남는다(
     assert row["latency_ms"] >= 0
 
 
-# ── 층 구분과 L2 상세 (spec 5-3) ────────────────────────────────────────────
+# ── 층 구분과 L2 상세 (docs/contracts.md "층별 판정 키") ─────────────────────
 
 
 @pytest.mark.db
@@ -681,7 +686,8 @@ def test_L2_기각_응답도_GET_으로_같은_골격이_다시_나온다(
 def test_L2_호출이_실패한_시도는_종합_pass_인데_L2_가_null_이다(
     app_conn: psycopg.Connection[DictRow], ro_conn: psycopg.Connection[DictRow]
 ) -> None:
-    """spec 4-7 이 정한 동작 — 값은 바꾸지 않는다. 대신 `l2: null` 이 "판정이 없었다"를
+    """docs/contracts.md "층별 판정 키" 가 정한 동작 — 값은 바꾸지 않는다.
+    대신 `l2: null` 이 "판정이 없었다"를
     드러내야 화면이 "통과했는데 왜 인계?"로 읽히지 않는다."""
     generation = scripted_client(
         {INTENT_STAGE: [intent_completion("policy")], DRAFT_STAGE: [citing_draft()]}

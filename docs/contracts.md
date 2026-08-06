@@ -37,7 +37,9 @@ HTTP 엔드포인트 4개가 외부 표면의 전부다. 인증은 없다.
   "status": "escalated",
   "answer": null,
   "claims": [],
-  "citations": [ { "id": "policy:support:4-1", "source": "policy", "content": "조항 텍스트 또는 쿼리+결과 요약" } ],
+  "citations": [ { "id": "policy:support:4-1", "source": "policy", "content": "조항 텍스트 또는 쿼리+결과 요약" },
+                 { "id": "policy:shipping:1-2", "source": "policy", "content": "조항 텍스트" },
+                 { "id": "policy:shipping:3-1", "source": "policy", "content": "조항 텍스트" } ],
   "attempts": [
     { "verdict": "reject", "reject_reasons": ["missing_citation"],
       "l1": { "verdict": "reject", "reject_reasons": ["missing_citation"] },
@@ -104,6 +106,10 @@ pass 이고 **L2 가 실행됐다면** L2 도 pass. 층별 내역은 두 키로 
 - 인계된 문의는 최상위 `claims` 가 `[]` 여도 이 배열은 **기각된 초안의** claim 을 담는다 —
   두 배열을 서로 짝지으면 안 된다.
 - `l2.contradictions` 는 **근거쌍 단위** 기록 `{evidence_id_a, evidence_id_b, explanation}` 이다.
+  **여기 나오는 ID 는 반드시 같은 응답의 `citations` 안에 있다** — `citations` 는 인용된 근거가
+  아니라 **수집 근거 전체**이고, fail-closed 파싱이 모순 쌍의 ID 를 그 집합으로 검증한다
+  (`judge._parse_contradictions`). 초안이 인용하지 않은 근거의 모순도 잡히므로, 그 ID 가
+  `claims[].citation_ids` 에는 없을 수 있다 — `citations` 밖일 수는 없다.
   **기록됐다고 곧 기각은 아니다** — 초안이 모순을 명시하고 두 기준을 모두 안내했으면
   `reject_reasons` 에 오르지 않고 기록만 남는다.
 - `claim_judgments`/`contradictions` 가 **빈 배열**인 것과 `l2` 자체가 `null` 인 것은 다른

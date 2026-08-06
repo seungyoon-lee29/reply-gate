@@ -4,13 +4,14 @@
 "초안 1개 + 근거"를 받아 **시도당 1회 배치 판정**하는 클래스만 제공한다 — 재생성 초안을
 다시 판정해 문의당 최대 2회가 되는 것은 호출 횟수를 통제하는 파이프라인의 몫이다.
 배치인 이유는 기능 근거다: 모순 감지가 claim·근거 교차 시야를 요구하므로 claim 별
-개별 호출로 쪼갤 수 없다 (spec 4-1).
+개별 호출로 쪼갤 수 없다 (docs/business-rules.md "L2 판정 규칙").
 
-입력 조립은 두 절로 나뉜다 (spec 4-3):
+입력 조립은 두 절로 나뉜다 (docs/business-rules.md "뒷받침 판정 — claim 단위"·
+"모순 판정 — 근거쌍 단위"):
 
 * **뒷받침 판정용** — 각 claim 의 text + 그 claim 이 **인용한** 근거의 `evidence_text`.
 * **모순 감지용** — 이번 문의의 **수집 근거 전체**(인용 여부 무관)의 `evidence_text`.
-  상충 쌍이 한쪽만 인용됐거나 아예 인용되지 않아도 검출돼야 하기 때문이다 (spec 4-5).
+  상충 쌍이 한쪽만 인용됐거나 아예 인용되지 않아도 검출돼야 하기 때문이다.
 
 판정 사유는 L2 2종(`unsupported_claim`·`contradictory_evidence`)이 전부다.
 `unsupported_claim` 은 **근거-주장 정합만** 본다 — 문의-답변 관련성은 판정 범위 밖이다.
@@ -27,7 +28,7 @@
   그대로 0 으로 굳는다.
 
 판정 호출의 토큰(입력/출력)은 `JudgeOutcome` 에 그대로 노출한다 — 파이프라인이 생성
-토큰과 **분리 집계**해야 하므로(spec 5-3) 생성 합산에 섞지 않는다.
+토큰과 **분리 집계**해야 하므로(docs/contracts.md "토큰 집계 경계") 생성 합산에 섞지 않는다.
 
 해석하지 못한 산출은 통과가 아니라 거부다(fail-closed): 사유 2종 밖 값, 판정값 밖 값,
 수집 근거에 없는 ID 의 모순 쌍, verdict·사유·세부 배열이 서로 어긋나는 산출은 전부
@@ -63,7 +64,10 @@ __all__ = [
     "build_judge_user_prompt",
 ]
 
-#: 처리 기록·비용 산출·`llm_call_failed` 의 failed_stage 에 남는 단계 이름.
+#: 판정 모듈이 LLM 래퍼에 넘기는 단계 이름 — `LLMCallError`/`LLMFormatError` 의 `stage`
+#: 로만 남는다. **처리 기록의 failed_stage 는 이 값이 아니다**: 파이프라인이 판정 실패를
+#: `llm_call_failed` 로 매핑할 때 층을 가리키는 `pipeline.L2_JUDGE_STAGE`(`"l2_judge"`)
+#: 를 적는다 (docs/standards.md "재시도 상한" 의 L2 두 행).
 JUDGE_STAGE: Final = "judge"
 
 #: 판정: 최초 호출 + 형식 불일치 재시도 1회 (docs/standards.md "재시도 상한").
@@ -118,7 +122,8 @@ JUDGE_JSON_SCHEMA: Final[dict[str, Any]] = {
     "additionalProperties": False,
 }
 
-#: 판정 시스템 프롬프트 — spec 4-4·4-5 의 의미 정책을 지시로 옮긴 것.
+#: 판정 시스템 프롬프트 — docs/business-rules.md "뒷받침 판정 — claim 단위"·
+#: "모순 판정 — 근거쌍 단위" 의 의미 정책을 지시로 옮긴 것.
 #: 이 정책이 제품 서사의 심장이다: 주제 인접 인용 기각 / 정면 조항의 "없다" 통과 /
 #: 모순 비명시 기각 / 모순 명시 + 두 기준 안내 통과.
 JUDGE_SYSTEM_PROMPT: Final = """\
@@ -374,7 +379,7 @@ class JudgeOutcome:
     """판정 1회분(형식 불일치 재시도 포함)의 결과 + 판정 토큰.
 
     토큰은 이 판정 호출에서 쓴 전부(재시도 포함 합산)다 — 파이프라인은 이 값을 생성
-    토큰과 **분리 집계**한다(spec 5-3). 생성 합산에 섞으면 안 된다.
+    토큰과 **분리 집계**한다(docs/contracts.md "토큰 집계 경계"). 생성 합산에 섞으면 안 된다.
     """
 
     result: JudgeResult

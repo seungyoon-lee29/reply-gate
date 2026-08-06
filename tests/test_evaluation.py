@@ -1221,10 +1221,12 @@ def test_리포트는_사람용과_기계용_두_형식을_낸다(tmp_path: Path
 # 무엇을 잰 것인지 알 수 없는 리포트가 남고, 라이브 리포트는 덮어쓸 수 없다.
 
 
-def _l2_settings(*, live_keys: bool = True, judge_key: bool = True) -> Settings:
+def _l2_settings(
+    *, live_keys: bool = True, judge_key: bool = True, l2_enabled: bool = True
+) -> Settings:
     key = "키가-아닌-테스트값"
     return Settings(
-        l2_enabled=True,
+        l2_enabled=l2_enabled,
         openai_api_key=key if live_keys else "",
         anthropic_api_key=key if judge_key else "",
     )
@@ -1471,6 +1473,37 @@ def test_측정2_의_예상_밖_예외도_리포트를_남기고_측정3_을_잇
     assert "측정 2 중단" in payload["conditions"]["judge"]
 
 
+def test_비과금_대역_실행의_Ctrl_C_도_종료_코드가_0_이_아니다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """중단은 사용자가 알아야 하는 사실이다 — 과금 실행이 아니어도 성공으로 읽히면 안 된다.
+
+    중단 강등(`except BaseException`)이 산출물을 남기려고 예외를 삼키므로, 종료 코드까지
+    0 이면 `--stub-llm` 실행의 Ctrl-C 가 아무 흔적 없는 성공이 된다. 산출물은 그대로
+    남기되(과금분 보존) 중단 사실은 종료 코드가 들고 간다.
+    """
+    label = "--stub-llm"
+    argv = ["--stub-llm"]
+
+    def _interrupt(*, cases: Any, args: Any, settings: Any) -> Any:
+        del cases, args, settings
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings())
+    monkeypatch.setattr(evaluate, "database_unavailable_reason", lambda *, settings: None)
+    monkeypatch.setattr(evaluate, "_run_measurement_two", _interrupt)
+    _block_outbound_sockets(monkeypatch)
+
+    assert evaluate.main([*argv, "--out-dir", str(tmp_path)]) != 0, label
+
+    # 산출물은 남는다 — 실패를 트레이스백이 아니라 리포트와 종료 코드로 알린다.
+    payload = json.loads((tmp_path / "evaluation.json").read_text(encoding="utf-8"))
+    assert payload["measurement_1_l1_gate_accuracy"]["detection_rate"] == 1.0
+    assert "KeyboardInterrupt" in payload["measurement_2_pipeline_agreement"]["skip_reason"]
+    # 비과금이므로 라이브 계열 이름은 받지 못한다.
+    assert not list(tmp_path.glob("evaluation-live*")), label
+
+
 def test_과금_실행에서_판정_픽스처_로드_실패는_종료_코드_1_이다(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1503,7 +1536,8 @@ def test_과금_실행에서_판정_픽스처_로드_실패는_종료_코드_1_�
 #: 매트릭스 안에서 "tmp_path 아래의 없는 파일"을 가리키는 자리표시자.
 _MISSING_FIXTURES = "<없는-판정-픽스처>"
 
-#: `--live` 조합의 종료 코드 — 규칙은 하나다: **과금 실행에서 측정 3 이 미실행이면 1**.
+#: `--live` 조합의 종료 코드 — **측정 3 이 돌 조건(과금 실행 + L2 켜짐)이었는데 미실행이면 1**.
+#: L2 꺼짐 기준선은 측정 3 이 설계상 안 도는 것이므로 과금 실행이어도 0 이다.
 #: (설명, argv, 키, 측정 2, 측정 3, 기대 종료 코드, 리포트 stem)
 _EXIT_CODE_MATRIX: tuple[tuple[str, list[str], str, str, str, int, str], ...] = (
     ("과금·측정 2·3 완주", ["--live"], "both", "canned", "oracle", 0, "evaluation-live-l2-1"),
@@ -1518,6 +1552,8 @@ _EXIT_CODE_MATRIX: tuple[tuple[str, list[str], str, str, str, int, str], ...] = 
         "evaluation-live-l2-1",
     ),
     ("과금·측정 2 중단", ["--live"], "both", "boom", "oracle", 1, "evaluation-live-l2-1"),
+    # L2 꺼짐 기준선: 측정 2 는 실측(과금)이지만 측정 3 은 설계상 미실행이다 — 정상이므로 0.
+    ("과금·L2 꺼짐 기준선", ["--live"], "l2-off", "canned", "oracle", 0, "evaluation-live"),
     ("비과금·생성 키 없음", ["--live"], "none", "unused", "oracle", 0, "evaluation"),
     ("비과금·판정 키 없음", ["--live"], "no-judge", "unused", "oracle", 0, "evaluation"),
     ("비과금·대역 실행", ["--stub-llm"], "both", "canned", "oracle", 0, "evaluation"),
@@ -1533,6 +1569,7 @@ def _apply_exit_code_scenario(
         "both": _l2_settings(),
         "none": _l2_settings(live_keys=False),
         "no-judge": _l2_settings(judge_key=False),
+        "l2-off": _l2_settings(l2_enabled=False),
     }[keys]
     monkeypatch.setattr(evaluate, "get_settings", lambda: settings)
     monkeypatch.setattr(evaluate, "database_unavailable_reason", lambda *, settings: None)
@@ -1565,7 +1602,7 @@ def _apply_exit_code_scenario(
     _EXIT_CODE_MATRIX,
     ids=[row[0] for row in _EXIT_CODE_MATRIX],
 )
-def test_종료_코드는_과금_실행의_측정3_미실행_한_규칙만_따른다(
+def test_종료_코드는_측정3_이_돌_조건이었는데_미실행일_때만_1_이다(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     label: str,
@@ -1578,9 +1615,10 @@ def test_종료_코드는_과금_실행의_측정3_미실행_한_규칙만_따�
 ) -> None:
     """종료 코드 규칙이 갈리지 않는지 `--live` 조합 전체로 못박는다 (실 API 호출 0회).
 
-    규칙: **과금 실행(= `--live` 로 선검사를 통과해 측정 2 가 실측으로 돌 조건이었던 실행)에서
-    측정 3 이 미실행이면 1, 그 밖에는 0.** `--live` 없이 도는 평범한 실행에서 측정 3 이
-    "`--live` 아님" 사유로 미실행인 것은 정상이므로 0 이다.
+    규칙: **측정 3 이 돌 조건(= `--live` 로 선검사를 통과해 측정 2 가 실측으로 돌 조건이었고
+    L2 도 켜져 있던 실행)이었는데 미실행이면 1, 그 밖에는 0.** `--live` 없이 도는 평범한
+    실행에서 측정 3 이 "`--live` 아님" 사유로 미실행인 것도, **L2 꺼짐 기준선에서 측정 3 이
+    설계상 안 도는 것**도 정상이므로 0 이다.
 
     어느 조합이든 **리포트는 반드시 쓰인다** — 실패를 트레이스백이 아니라 산출물과 종료
     코드로 알리는 것이 이 하네스의 계약이다.
@@ -1599,8 +1637,9 @@ def test_종료_코드는_과금_실행의_측정3_미실행_한_규칙만_따�
     assert payload["measurement_1_l1_gate_accuracy"]["llm_calls"] == 0, label
     # 규칙 자체를 산출물에 대고 다시 확인한다 — 종료 코드와 리포트가 갈리면 안 된다.
     billed = payload["conditions"]["measurement2_is_real"]
+    l2_on = payload["conditions"]["l2_enabled"]
     judged = payload["measurement_3_l2_judge_accuracy"]["executed"]
-    assert (expected_code == 1) == (billed and not judged), label
+    assert (expected_code == 1) == (billed and l2_on and not judged), label
     # 비과금 실행은 라이브 계열 이름을 받지 못한다(라이브 이름 ⇔ 실측, 양방향).
     assert bool(list(tmp_path.glob("evaluation-live*"))) is billed, label
 
