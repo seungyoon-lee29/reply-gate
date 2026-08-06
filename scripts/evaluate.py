@@ -1,56 +1,76 @@
-"""평가 하네스 실행 — 측정 1(L1 픽스처)과 측정 2(골든셋 end-to-end)를 돌려 리포트를 낸다.
+"""평가 하네스 실행 — 측정 1(L1 픽스처)·측정 2(골든셋 end-to-end)·측정 3(판정 픽스처)을
+돌려 리포트를 낸다.
 
-    uv run python -m scripts.evaluate                 # 측정 1 만 (측정 2 는 미실행 사유 기록)
+    uv run python -m scripts.evaluate                 # 측정 1 만 (측정 2·3 은 미실행 사유 기록)
     uv run python -m scripts.evaluate --stub-llm      # 측정 2 를 결정론 대역으로 (배관 검증)
-    uv run python -m scripts.evaluate --live          # 측정 2 를 실제 OpenAI 로 (과금·비결정론)
+    uv run python -m scripts.evaluate --live          # 측정 2·3 을 실제 모델로 (과금·비결정론)
 
-**측정 1 은 항상 돈다** — LLM 을 호출하지 않으므로 키도 DB 도 필요 없다.
+**측정 1 은 항상 돈다** — LLM 을 호출하지 않으므로 키도 DB 도 필요 없다. 판정 픽스처
+파일이 없거나 라벨이 깨져 있어도 마찬가지다: 그 실패는 **측정 3 의 미실행 사유**로 강등되고
+측정 1·2 는 그대로 산출된다. **측정 2·3 이 예상 밖 예외로 중단돼도 같다** — 어느 쪽이 죽어도
+리포트는 반드시 쓰인다. 중단을 트레이스백으로 알리면 이미 과금이 끝난 산출물(골든셋 30건
+중 완주분)과 무료인 측정 1 산출물이 함께 사라지기 때문이다. 중단은 **리포트의 미실행
+사유**(예외 종류와 메시지를 그대로 담는다)와 종료 코드로만 알린다.
 
-**측정 2 는 명시적 opt-in 이다.** 실제 실행은 과금되고 결과가 재실행마다 달라지므로
+**종료 코드 규칙은 하나다 — 과금 실행에서 측정 3 이 미실행이면 1, 그 밖에는 0.**
+여기서 "과금 실행"은 `--live` 로 선검사(키·DB)를 통과해 **측정 2 가 실측으로 돌 조건이었던**
+실행이다. 완주했든 도중에 중단됐든 같다: 측정 2 가 중단되면 측정 3 도 잇지 않으므로
+(Ctrl-C 를 삼키고 판정을 더 사면 안 된다) 그 실행도 이 규칙 하나로 1 이 된다. 판정 픽스처
+로드 실패로 측정 3 이 미실행인 것도 과금 실행이면 1 이다 — 골든셋 30건을 사고 판정 수치는
+못 낸 실행이 래퍼·CI 에 "성공"으로 읽히면 안 된다. 반면 `--live` 없이 도는 평범한 실행에서
+측정 3 이 "`--live` 아님" 사유로 미실행인 것은 **정상이므로 0** 이다.
+
+**측정 2·3 은 명시적 opt-in 이다.** 실제 실행은 과금되고 결과가 재실행마다 달라지므로
 기본값으로 돌리지 않는다. 실행하지 않았으면 리포트에 **미실행 사유가 그대로 남는다** —
 조용히 0 이나 빈 값을 채워 "돌았다"처럼 보이게 하지 않는다.
 
-**리포트 이름 규칙은 양방향이다: 라이브 이름 ⇔ 실측** (`evaluation.resolve_report_stem`).
-실측(과금) 실행만 `evaluation-live*` 에 쓸 수 있고, 실측은 그 이름에만 쓸 수 있으며,
-이미 있는 라이브 리포트는 덮어쓸 수 없다. `--live` 를 줬어도 키·DB 문제로 측정 2 가
-미실행이면 비실측이므로 기본 이름은 `evaluation` 으로 떨어진다. 검사는 측정 시작 전이다.
+**측정 3 은 `--live` + L2 켜짐에서만 돈다.** 판정 모델을 실제로 부르는 확률 층이라
+대역으로는 낼 수 없는 수치이고, L2 꺼짐 기준선 실행에서 돌면 "꺼짐 기준선"이 판정 비용을
+쓰는 이상한 실행이 된다. 그리고 **측정 2 와 실행 조건을 공유한다**: 과금 산출물이
+덮어쓸 수 있는 이름에 남지 않으려면 둘의 실측 여부가 갈리면 안 된다.
+
+**키 선검사는 측정 시작 전이다.** `--live` + L2 켜짐이면 `OPENAI_API_KEY` 와
+`ANTHROPIC_API_KEY` 를 **둘 다** 본다. 판정 키 부재를 측정 도중 발견하면 과금만 하고
+산출물 없이 죽는다. 판정 키가 없으면 측정 2·3 을 **모두** 건너뛴다 — L2 를 꺼서 측정 2 만
+돌리는 **강등 실행은 금지**다(기준선과 실행 조건이 오염된다).
+
+**리포트 이름 규칙은 두 겹이고 둘 다 양방향이다** (`evaluation.resolve_report_stem`):
+라이브 이름 ⇔ 실측, 그리고 **L2 켜짐 실측 ⇔ `evaluation-live-l2` 접두**. 실측(과금)
+실행만 `evaluation-live*` 에 쓸 수 있고, 이미 있는 라이브 리포트는 덮어쓸 수 없다.
+`--live` 를 줬어도 키·DB 문제로 측정 2 가 미실행이면 비실측이므로 기본 이름은
+`evaluation` 으로 떨어진다. 검사는 측정 시작 전이다.
 
 `--stub-llm` 은 정책 청크를 **어휘 임베딩 대역**으로 다시 적재해야 하므로, 적재를
 트랜잭션 안에서 하고 끝나면 **롤백한다**. 공유 DB 의 실제 임베딩을 덮어쓰지 않는다.
-
-**알려진 일시 공백**: L2 판정(기본 켜짐)에는 아직 결정론 대역이 없어 `--stub-llm` 이
-외부 호출 0회를 지킬 수 없다. 그래서 `--stub-llm` + L2 켜짐은 조용히 사이클 1 동작으로
-낮춰 돌리지 않고 **명시적 오류로 멈춘다**(`_require_stub_judge_gap`).
-
-같은 이유로 `--live` + L2 켜짐도 지금은 멈춘다(`_require_live_judge_gap`) — 단
-**측정 2 가 실제로 돌 조건일 때만**이다: 리포트에 L2 켜짐 여부도 판정 모델도 남지 않고
-이름 계열도 사이클 1 실측과 같아, 덮어쓸 수 없는 라이브 산출물이 "L2 포함 여부 불명"인
-채로 영구히 남기 때문이다. 키·DB 가 없어 측정 2 가 미실행이면 리포트는 실측 이름을 받지
-못하고(덮어쓸 수 있는 `evaluation` 계열) 그 피해가 성립하지 않으므로 막지 않는다 —
-측정 1 결과와 "측정 2 미실행 + 사유"를 담은 리포트가 그대로 남는다. 두 가드 모두 하네스
-확장 태스크가 걷어낸다.
+판정도 결정론 대역(`testing.StubJudge`)으로 갈아 끼우므로 **외부 호출 0회**다.
 """
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import cast
+from typing import Final, cast
 
 import psycopg
 from psycopg.rows import DictRow
 
 from reply_gate.config import Settings, get_settings
+from reply_gate.contracts import RejectReason
 from reply_gate.db import connect, database_unavailable_reason, readonly_connect
 from reply_gate.evaluation import (
     DEFAULT_GOLDEN_SET_PATH,
+    DEFAULT_JUDGE_FIXTURES_PATH,
     DEFAULT_L1_FIXTURES_PATH,
     DEFAULT_REPORT_DIR,
     DEFAULT_REPORT_STEM,
+    LIVE_L2_REPORT_STEM,
     LIVE_REPORT_STEM,
     EvaluationReport,
     GoldenCase,
     GoldenOutcome,
+    JudgeAccuracy,
+    JudgeFixture,
+    L2Outcome,
     PipelineAgreement,
     ReportStemError,
     RunConditions,
@@ -60,8 +80,10 @@ from reply_gate.evaluation import (
     build_report,
     display_path,
     load_golden_set,
+    load_judge_fixtures,
     load_l1_fixtures,
     measure_gate_accuracy,
+    measure_judge_accuracy,
     measure_pipeline_agreement,
     resolve_report_stem,
     utc_now_iso,
@@ -73,9 +95,9 @@ from reply_gate.llm import (
     OpenAIEmbeddingClient,
     OpenAIGenerationClient,
 )
-from reply_gate.pipeline import build_pipeline
+from reply_gate.pipeline import Judging, build_judge, build_pipeline
 from reply_gate.policy_index import index_policy_documents, load_policy_documents
-from reply_gate.testing import LexicalEmbeddingClient
+from reply_gate.testing import LexicalEmbeddingClient, StubJudge, build_stub_pipeline
 
 #: 대역 임베딩은 실제 모델과 유사도 분포가 달라 기본 임계값(0.3)에서 거의 다 걸러진다.
 #: 배관 검증용 실행에서만 쓰는 낮춘 기본값이고, 리포트에 그대로 기록된다.
@@ -84,28 +106,39 @@ STUB_SIMILARITY_THRESHOLD = 0.05
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="L1 게이트 단위 정확도(측정 1)와 파이프라인 판정 일치율(측정 2)을 측정한다"
+        description=(
+            "L1 게이트 단위 정확도(측정 1)·파이프라인 판정 일치율(측정 2)·"
+            "L2 판정 단위 정확도(측정 3)를 측정한다"
+        )
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--live",
         action="store_true",
-        help="측정 2 를 실제 OpenAI 클라이언트로 실행한다 (과금·비결정론, OPENAI_API_KEY 필요)",
+        help=(
+            "측정 2·3 을 실제 모델로 실행한다 "
+            "(과금·비결정론, OPENAI_API_KEY + L2 켜짐이면 ANTHROPIC_API_KEY 필요)"
+        ),
     )
     mode.add_argument(
         "--stub-llm",
         action="store_true",
-        help="측정 2 를 결정론 대역으로 실행한다 (하네스 배관 검증용 — 실제 수치가 아니다)",
+        help=(
+            "측정 2 를 결정론 대역(생성·임베딩·판정)으로 실행한다 "
+            "(하네스 배관 검증용 — 실제 수치가 아니다. 측정 3 은 돌지 않는다)"
+        ),
     )
     parser.add_argument("--golden-set", type=Path, default=DEFAULT_GOLDEN_SET_PATH)
     parser.add_argument("--l1-fixtures", type=Path, default=DEFAULT_L1_FIXTURES_PATH)
+    parser.add_argument("--judge-fixtures", type=Path, default=DEFAULT_JUDGE_FIXTURES_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_REPORT_DIR)
     parser.add_argument(
         "--report-stem",
         default=None,
         help=(
-            f"리포트 파일 이름 조각 (기본: 실측이면 `{LIVE_REPORT_STEM}`, 아니면 "
-            f"`{DEFAULT_REPORT_STEM}`). 라이브 이름 ⇔ 실측 규칙과 기존 실측 덮어쓰기 금지가 "
+            f"리포트 파일 이름 조각 (기본: L2 켜짐 실측이면 `{LIVE_L2_REPORT_STEM}-<n>`, "
+            f"꺼짐 실측이면 `{LIVE_REPORT_STEM}`, 실측이 아니면 `{DEFAULT_REPORT_STEM}`). "
+            f"라이브 이름 ⇔ 실측 · L2 켜짐 ⇔ l2 접두 규칙과 기존 실측 덮어쓰기 금지가 "
             f"실행 전에 강제된다"
         ),
     )
@@ -132,11 +165,40 @@ def _skip_reason(*, args: argparse.Namespace, settings: Settings) -> str | None:
         return "OPENAI_API_KEY 가 없다 — 측정 2 는 실제 생성 LLM 이 있어야 진짜 수치가 나온다"
     if args.live and settings.l2_enabled and not settings.anthropic_api_key:
         # 시작해 놓고 첫 판정 호출에서 죽으면 30건 중 일부만 과금하고 산출물은 없다.
+        # 여기서 L2 를 꺼서 측정 2 만 돌리는 **강등은 하지 않는다** — 그렇게 나온 값은
+        # 꺼짐 기준선인데 실행 조건은 켜짐으로 요청된 실행이라 둘 다 오염된다.
         return (
             "ANTHROPIC_API_KEY 가 없다 — L2 판정이 켜져 있으면 판정 없이 답변을 확정하지 "
-            "않으므로 측정 2 를 시작하지 않는다 (판정을 빼고 재보려면 L2_ENABLED=false)"
+            "않으므로 측정 2·3 을 시작하지 않는다 (판정을 빼고 재보려면 L2_ENABLED=false 로 "
+            "명시한다 — 그 실행은 꺼짐 기준선이다)"
         )
     return database_unavailable_reason(settings=settings)
+
+
+def _judge_skip_reason(
+    *, args: argparse.Namespace, settings: Settings, skip: str | None
+) -> str | None:
+    """측정 3 을 실행하지 못하는 사유. 실행 가능하면 `None`.
+
+    `--live` + L2 켜짐이 아니면 애초에 돌지 않고, 그 조건을 만족해도 **측정 2 의 사유를
+    그대로 물려받는다**: 키 부재도, DB 부재도 마찬가지다. DB 자체는 측정 3 에 필요 없지만,
+    두 측정의 실측 여부가 갈리면 과금된 판정 수치가 실측 이름을 받지 못하는 리포트
+    (덮어쓸 수 있는 `evaluation` 계열)에 실린다 — 재생성에 돈이 드는 산출물이 재생성이
+    공짜인 산출물과 같은 경로를 쓰는, 한 번 겪은 그 사고다.
+    """
+    if not args.live:
+        return (
+            "측정 3 은 판정 모델을 실제로 부르는 확률 층이라 `--live` 로만 돈다 — "
+            "결정론 대역으로는 판정 정확도를 잴 수 없다"
+        )
+    if not settings.l2_enabled:
+        return (
+            "L2 판정이 꺼져 있다 — 이 실행은 꺼짐 기준선이므로 판정 계열 측정을 돌리지 않는다 "
+            "(L2_ENABLED=true 로 다시 실행한다)"
+        )
+    if skip is not None:
+        return f"측정 2 와 같은 사유로 미실행: {skip}"
+    return None
 
 
 def _measurement_two_settings(*, args: argparse.Namespace, settings: Settings) -> Settings:
@@ -153,17 +215,40 @@ def _measurement_two_settings(*, args: argparse.Namespace, settings: Settings) -
     )
 
 
+#: 중단된 측정 2 의 실행 조건에 붙는 꼬리표. 실행 조건 항목은 "무엇으로 돌렸는가"만이 아니라
+#: **결과**도 적는 자리라(미실행이면 "미실행"이다), 중단도 구분되어 남아야 한다.
+_ABORTED_MARK: Final = " (측정 2 중단)"
+
+
+def _client_labels(*, args: argparse.Namespace, settings: Settings) -> tuple[str, str]:
+    """(생성 설명, 임베딩 설명) — 클라이언트를 만들지 않고도 정해진다.
+
+    측정 2 가 중단돼도 **무엇으로 돌리던 중이었는지**는 실행 조건에 남아야 한다: 과금된
+    실행이 어느 모델에 돈을 썼는지가 산출물에서 사라지면 중단 리포트를 읽을 수 없다.
+    """
+    if args.stub_llm:
+        return (
+            "결정론 대역 `evaluation.StubGenerationClient` (실제 모델 아님)",
+            f"결정론 대역 `testing.LexicalEmbeddingClient`"
+            f"({settings.embedding_dimensions}차원, 어휘 2-gram)",
+        )
+    return (
+        f"OpenAI `{settings.generation_model}` (effort={settings.generation_effort or '기본값'})",
+        f"OpenAI `{settings.embedding_model}` ({settings.embedding_dimensions}차원)",
+    )
+
+
 def _clients(
     *, args: argparse.Namespace, settings: Settings
 ) -> tuple[GenerationClient, EmbeddingClient, str, str]:
     """(생성 클라이언트, 임베딩 클라이언트, 생성 설명, 임베딩 설명)."""
+    generation_label, embedding_label = _client_labels(args=args, settings=settings)
     if args.stub_llm:
-        embedder = LexicalEmbeddingClient(dimensions=settings.embedding_dimensions)
         return (
             cast(GenerationClient, StubGenerationClient()),
-            embedder,
-            "결정론 대역 `evaluation.StubGenerationClient` (실제 모델 아님)",
-            f"결정론 대역 `testing.LexicalEmbeddingClient`({embedder.dimensions}차원, 어휘 2-gram)",
+            LexicalEmbeddingClient(dimensions=settings.embedding_dimensions),
+            generation_label,
+            embedding_label,
         )
     # 실제 실행 — 생성·임베딩 모두 OpenAI. 여기서만 실제 API 키를 쓴다.
     return (
@@ -173,9 +258,27 @@ def _clients(
             model=settings.embedding_model,
             dimensions=settings.embedding_dimensions,
         ),
-        f"OpenAI `{settings.generation_model}` (effort={settings.generation_effort or '기본값'})",
-        f"OpenAI `{settings.embedding_model}` ({settings.embedding_dimensions}차원)",
+        generation_label,
+        embedding_label,
     )
+
+
+def _judge_label(
+    *, args: argparse.Namespace, settings: Settings, skip: str | None, aborted: bool = False
+) -> str:
+    """실행 조건에 남는 판정 모델 설명 — 대역 수치를 실제 수치로 읽지 않게 하는 기록이다."""
+    if not settings.l2_enabled:
+        return "L2 꺼짐 (판정 미실행)"
+    if skip is not None:
+        return "미실행"
+    label = (
+        "결정론 대역 `testing.StubJudge` (실제 모델 아님)"
+        if args.stub_llm
+        else f"Anthropic `{settings.judge_model}` (effort={settings.judge_effort or '기본값'})"
+    )
+    # 측정 2 가 중단된 실행에서는 이 판정자가 **끝까지 돌지 않았다** — 세 항목(생성·임베딩·
+    # 판정)이 같은 꼬리표를 달아야 실행 조건만 읽고 완주한 실행으로 오해하지 않는다.
+    return f"{label}{_ABORTED_MARK}" if aborted else label
 
 
 def _run_measurement_two(
@@ -187,10 +290,21 @@ def _run_measurement_two(
     generation_client, embedding_client, generation_label, embedding_label = _clients(
         args=args, settings=settings
     )
-    pipeline = build_pipeline(
-        generation_client=generation_client,
-        embedding_client=embedding_client,
-        settings=settings,
+    pipeline = (
+        # 대역 실행은 판정도 대역이어야 외부 호출 0회다 — `build_pipeline` 은 판정자를
+        # 설정에서 조립하므로 주입 구멍이 없다(`testing.build_stub_pipeline` 의 존재 이유).
+        build_stub_pipeline(
+            generation_client=generation_client,
+            embedding_client=embedding_client,
+            judge=StubJudge(),
+            settings=settings,
+        )
+        if args.stub_llm
+        else build_pipeline(
+            generation_client=generation_client,
+            embedding_client=embedding_client,
+            settings=settings,
+        )
     )
 
     def progress(outcome: GoldenOutcome) -> None:
@@ -222,72 +336,81 @@ def _run_measurement_two(
     return agreement, generation_label, embedding_label
 
 
-def _require_stub_judge_gap(*, args: argparse.Namespace, settings: Settings) -> None:
-    """`--stub-llm` + L2 켜짐은 **지금 돌릴 수 없다** — 알려진 일시 공백이라 명시적으로 죽는다.
+def _reasons(reasons: tuple[RejectReason, ...]) -> str:
+    return "없음" if not reasons else "[" + ", ".join(reason.value for reason in reasons) + "]"
 
-    대역 실행은 외부 호출 0회여야 하는데 결정론 **판정** 대역이 아직 없다(하네스 확장
-    태스크 몫). 여기서 조용히 `l2_enabled=False` 로 낮춰 돌리면 리포트에는 대역 수치가
-    찍히지만 그 수치가 사이클 1 배관을 잰 것인지 L2 를 포함해 잰 것인지 알 수 없게 된다 —
-    "미실행 측정을 0 이나 빈 값으로 채우지 않는다"와 같은 이유로 멈춘다.
+
+def _run_measurement_three(
+    *, fixtures: tuple[JudgeFixture, ...], settings: Settings
+) -> JudgeAccuracy:
+    """측정 3 — 판정 픽스처를 **실제 판정기**에 흘린다(과금).
+
+    파이프라인을 거치지 않고 판정기를 직접 부른다: 재는 것이 판정 층 하나이므로 초안
+    생성·근거 수집이 끼면 무엇을 잰 것인지 흐려진다.
     """
-    if args.stub_llm and settings.l2_enabled:
-        raise SystemExit(
-            "`--stub-llm` 은 지금 돌릴 수 없다: L2 판정이 켜져 있는데(기본 켜짐) 결정론 판정 "
-            "대역이 아직 없어 대역 실행이 실제 판정 모델을 부르게 된다. 이 공백은 하네스 확장 "
-            "태스크가 결정론 판정 대역과 함께 닫는다. 지금 배관만 확인하려면 L2_ENABLED=false "
-            "로 **명시**하고 다시 실행한다 (그 실행은 사이클 1 동작을 잰 값이다)."
+    judge: Judging = build_judge(settings)
+
+    def progress(outcome: L2Outcome) -> None:
+        actual = outcome.actual_verdict
+        if outcome.error is not None or actual is None:
+            # 판정이 나오지 않은 건은 여기서 끝난다 — 아래 마크는 판정이 있는 건만 쓴다.
+            print(f"  [FAIL] {outcome.fixture_id} 판정 실패: {outcome.error}")
+            return
+        # 같은 줄이 찍는 것은 verdict 다. 사유만 어긋난 건을 `MISS` 로 찍으면 "기대 reject /
+        # 실제 reject" 옆에 실패 표시가 붙어, 리포트가 성공으로 세는 건을 콘솔이 뒤집는다.
+        if outcome.reasons_matched:
+            mark, detail = "OK  ", ""
+        elif outcome.verdict_matched:
+            mark = "사유"
+            detail = (
+                f" — 사유 불일치: 기대 {_reasons(outcome.expected_reasons)}"
+                f" / 실제 {_reasons(outcome.actual_reasons)}"
+            )
+        else:
+            mark, detail = "MISS", ""
+        print(
+            f"  [{mark}] {outcome.fixture_id} 기대 {outcome.expected_verdict.value} "
+            f"/ 실제 {actual.value}{detail}"
         )
 
-
-def _require_live_judge_gap(
-    *, args: argparse.Namespace, settings: Settings, skip: str | None
-) -> None:
-    """`--live` + L2 켜짐은 **실측이 실제로 돌 때만** 막는다 — 산출물이 L2 포함 여부를
-    말하지 못하기 때문이다.
-
-    라이브 리포트는 덮어쓸 수 없다(`evaluation.resolve_report_stem`). 그런데 지금은
-    실행 조건(`RunConditions`)에 L2 켜짐 여부도 판정 모델도 없고, 이름 계열도 사이클 1
-    실측이 쓰던 `evaluation-live-<n>` 그대로다. 이대로 돌리면 **"L2 를 포함해 잰 값인지
-    알 수 없는" 실측 리포트가 영구히 남는다** — `--stub-llm` 을 막는 것과 같은 모호함이다
-    (대역 수치가 무엇을 잰 것인지 알 수 없게 되는 문제).
-
-    **그래서 조건은 `skip is None` 까지다.** 막으려는 피해는 리포트가 실측 이름을 받을
-    때만(`measurement2_is_real`, 즉 `--live` + 측정 2 실행 가능) 성립한다. 키도 DB 도
-    없는 `--live` 는 측정 2 가 미실행이라 덮어쓸 수 있는 `evaluation` 계열로 떨어지므로,
-    여기서 죽이면 무료인 측정 1 산출물과 "측정 2 미실행 + 사유" 기록까지 함께 잃는다
-    (`scripts/AGENTS.md` 의 "미실행 측정은 리포트에 미실행 + 사유로 남긴다").
-
-    **이 가드는 뒤 태스크가 걷어낸다** — 셋이 다 갖춰졌을 때만이다:
-    (1) L2 실측 리포트 이름 계열(`evaluation-live-l2-<n>`), (2) 실행 조건의 판정 항목
-    (L2 켜짐·판정 모델), (3) **판정 토큰 계열의 리포트 집계**(`GoldenOutcome`·
-    `PipelineAgreement`·토큰 표·JSON 블록은 아직 생성·임베딩 2계열뿐이다). (3) 을 빼고
-    걷어내면 첫 L2 실측의 건당 비용 지표가 판정 비용을 통째로 누락한다. 그때까지
-    L2 를 포함한 실측은 산출물을 남길 자리가 없다.
-    """
-    if args.live and settings.l2_enabled and skip is None:
-        raise SystemExit(
-            "`--live` 는 지금 돌릴 수 없다: L2 판정이 켜져 있는데(기본 켜짐) 리포트가 그 "
-            "사실을 담지 못한다 — 실행 조건에 L2 켜짐 여부도 판정 모델도 남지 않고, 이름도 "
-            "사이클 1 실측과 같은 `evaluation-live-<n>` 계열이라 덮어쓸 수 없는 산출물이 "
-            "'L2 포함 여부 불명'으로 남는다. L2 실측용 이름 계열과 실행 조건 기록이 들어오는 "
-            "하네스 확장 태스크가 이 가드를 걷어낸다. 지금 사이클 1 실측을 다시 재려면 "
-            "L2_ENABLED=false 로 **명시**하고 다시 실행한다."
-        )
+    return measure_judge_accuracy(fixtures=fixtures, judge=judge, on_outcome=progress)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     settings = get_settings()
-    # 측정 1(무료)조차 시작하기 전에 죽인다 — 돌릴 수 없는 요청은 산출물을 남기지 않는다.
-    _require_stub_judge_gap(args=args, settings=settings)
-    # 라이브 가드는 미실행 사유를 알아야 판단한다(실측 이름을 받을 실행만 막는다).
+    # 키·DB 선검사는 **측정 시작 전**이다 — 도중에 발견하면 과금만 하고 산출물이 없다.
     skip = _skip_reason(args=args, settings=settings)
-    _require_live_judge_gap(args=args, settings=settings, skip=skip)
+    judge_skip = _judge_skip_reason(args=args, settings=settings, skip=skip)
 
     fixtures = load_l1_fixtures(args.l1_fixtures)
     cases = load_golden_set(args.golden_set)
+    # 판정 픽스처 로드 실패는 **측정 3 만** 접는다 — 키도 DB 도 필요 없는 측정 1 의 산출물을
+    # 판정 픽스처 파일이 인질로 잡으면, 무료 실행이 트레이스백으로 죽으면서 아무것도 안 남는다.
+    judge_fixtures: tuple[JudgeFixture, ...] = ()
+    judge_fixture_error: str | None = None
+    try:
+        judge_fixtures = load_judge_fixtures(args.judge_fixtures)
+    # `KeyboardInterrupt` 는 여기서 잡지 않는다 — 아직 아무것도 과금되지 않았고, 삼키면
+    # Ctrl-C 를 누른 실행이 그대로 측정 2(과금)로 넘어간다.
+    except Exception as error:
+        judge_fixture_error = (
+            f"판정 픽스처를 읽지 못했다 (`{display_path(args.judge_fixtures)}`): "
+            f"{type(error).__name__}: {error}"
+        )
+        print(f"경고 — {judge_fixture_error}")
+    if judge_fixture_error is not None:
+        # 이미 다른 사유로 미실행이어도 로드 실패는 함께 남긴다 — 사유 하나를 다른 사유가
+        # 덮으면 리포트만 보고는 픽스처 파일이 깨진 것을 알 수 없다.
+        judge_skip = (
+            judge_fixture_error if judge_skip is None else f"{judge_skip} / {judge_fixture_error}"
+        )
 
     run_settings = _measurement_two_settings(args=args, settings=settings)
+    # **과금 실행인가** — `--live` 로 선검사를 통과해 측정 2 가 실측으로 돌 조건이었던 실행.
+    # 리포트 이름(라이브 계열)과 종료 코드 규칙이 둘 다 이 하나의 값을 본다. 측정 2 가 도중에
+    # 중단돼도 이 값은 True 로 남는다: 이름은 이미 이 값으로 확정됐고(측정 시작 전 결정),
+    # 무엇보다 그 이름이 곧 "이 실행은 과금될 수 있었다"는 저장소에 남는 기록이다.
     measurement2_is_real = bool(args.live) and skip is None
 
     # 리포트 이름은 **측정을 시작하기 전에** 확정한다 — 여기서 거부될 실행이 과금(라이브
@@ -297,6 +420,7 @@ def main(argv: list[str] | None = None) -> int:
             requested=args.report_stem,
             live_requested=bool(args.live),
             measurement2_is_real=measurement2_is_real,
+            l2_enabled=settings.l2_enabled,
             out_dir=args.out_dir,
         )
     except ReportStemError as error:
@@ -309,6 +433,7 @@ def main(argv: list[str] | None = None) -> int:
     accuracy = measure_gate_accuracy(fixtures)
 
     pipeline: PipelineAgreement | SkippedMeasurement
+    measurement2_aborted = False
     if skip is not None:
         print(f"측정 2 — 미실행: {skip}")
         pipeline = SkippedMeasurement(reason=skip)
@@ -316,33 +441,94 @@ def main(argv: list[str] | None = None) -> int:
         embedding_label = "미실행"
     else:
         print(f"측정 2 — 골든셋 {len(cases)}건 end-to-end")
-        pipeline, generation_label, embedding_label = _run_measurement_two(
-            cases=cases, args=args, settings=run_settings
-        )
+        try:
+            pipeline, generation_label, embedding_label = _run_measurement_two(
+                cases=cases, args=args, settings=run_settings
+            )
+        # `measure_pipeline_agreement` 는 인프라 예외(DB 재기동 등)를 그대로 터뜨리는 것이
+        # 설계다 — 그 예외가 여기서 main 밖으로 나가면 **이미 과금된 완주분과 무료인 측정 1
+        # 산출물까지** 트레이스백과 함께 사라진다. 측정 3 과 정확히 같은 실패 모양이라 같은
+        # 패턴으로 막는다. `BaseException` 까지 넓히는 이유와 재발생시키지 않는 이유는
+        # 아래 측정 3 가드의 주석과 같다.
+        except BaseException as error:
+            aborted = f"측정 2 가 중단됐다: {type(error).__name__}: {error}"
+            print(f"측정 2 — 중단: {aborted}")
+            pipeline = SkippedMeasurement(reason=aborted)
+            measurement2_aborted = True
+            attempted_generation, attempted_embedding = _client_labels(
+                args=args, settings=run_settings
+            )
+            generation_label = f"{attempted_generation}{_ABORTED_MARK}"
+            embedding_label = f"{attempted_embedding}{_ABORTED_MARK}"
+            # 측정 2 가 중단된 실행에서 측정 3 을 **이어서 돌리지 않는다**: 중단 사유가
+            # Ctrl-C 면 이어 도는 것이 곧 추가 과금이고, 인프라 고장이면 골든셋 수치 없이
+            # 판정 수치만 남은 리포트가 된다(두 측정의 실측 여부가 갈리면 안 된다).
+            if judge_skip is None:
+                judge_skip = f"측정 2 와 같은 사유로 미실행: {aborted}"
+
+    judge_accuracy: JudgeAccuracy | SkippedMeasurement
+    measurement3_is_real = False
+    if judge_skip is not None:
+        print(f"측정 3 — 미실행: {judge_skip}")
+        judge_accuracy = SkippedMeasurement(reason=judge_skip)
+    else:
+        print(f"측정 3 — 판정 픽스처 {len(judge_fixtures)}건 (실제 판정 모델·과금)")
+        try:
+            judge_accuracy = _run_measurement_three(fixtures=judge_fixtures, settings=run_settings)
+        # `BaseException` 까지 잡는다: `except (Exception, KeyboardInterrupt)` 는
+        # `SystemExit`(BaseException 직계)을 놓쳐, 판정 SDK 나 그 의존이 `sys.exit()` 를
+        # 부르면 리포트 없이 프로세스가 끝난다. **재발생시키지 않는다** — 여기까지 왔으면
+        # 측정 2 는 이미 과금이 끝났고, 그 산출물을 남기는 것이 종료 신호를 그대로
+        # 전달하는 것보다 우선이다(중단 사실은 미실행 사유와 종료 코드 1 이 들고 간다).
+        except BaseException as error:
+            aborted = f"측정 3 이 중단됐다: {type(error).__name__}: {error}"
+            print(f"측정 3 — 중단: {aborted}")
+            judge_accuracy = SkippedMeasurement(reason=aborted)
+        else:
+            measurement3_is_real = True
+
+    # ── 종료 코드는 여기 한 곳에서만 정해진다 (규칙이 갈리지 않게) ──────────────
+    # **과금 실행에서 측정 3 이 미실행이면 1, 그 밖에는 0.** 사유가 무엇이든(픽스처 로드
+    # 실패·중단·측정 2 중단으로 인한 연쇄 미실행) 같다 — 골든셋 30건을 사고 판정 수치는 못
+    # 낸 실행이 종료 코드로는 성공으로 읽히면 안 되기 때문이다. `--live` 없이 도는 평범한
+    # 실행에서 측정 3 이 "`--live` 아님" 사유로 미실행인 것은 정상이므로 0 이다.
+    exit_code = 1 if measurement2_is_real and isinstance(judge_accuracy, SkippedMeasurement) else 0
 
     conditions = RunConditions(
         started_at=started_at,
         generation=generation_label,
         embedding=embedding_label,
+        judge=_judge_label(args=args, settings=settings, skip=skip, aborted=measurement2_aborted),
         similarity_threshold=run_settings.vector_similarity_threshold,
         top_k=run_settings.vector_top_k,
         l1_fixture_count=len(fixtures),
         golden_case_count=len(cases),
+        # 로드하지 못했으면 0 이 아니라 **미실행**이다.
+        judge_fixture_count=None if judge_fixture_error is not None else len(judge_fixtures),
         # 커밋되는 라이브 리포트에 로컬 절대 경로(사용자명 포함)를 남기지 않는다.
         l1_fixtures_path=display_path(args.l1_fixtures),
         golden_set_path=display_path(args.golden_set),
+        judge_fixtures_path=display_path(args.judge_fixtures),
         api_key_present=bool(settings.openai_api_key),
+        judge_api_key_present=bool(settings.anthropic_api_key),
+        l2_enabled=settings.l2_enabled,
         measurement2_is_real=measurement2_is_real,
+        # 진입점에서 측정 3 이 도는 조건은 `--live` + L2 켜짐 + 키뿐이다 — 완주했으면
+        # 실제 판정 모델로 낸 값이다(대역 판정은 `--stub-llm` 이고 그때는 돌지 않는다).
+        measurement3_is_real=measurement3_is_real,
     )
     report: EvaluationReport = build_report(
-        conditions=conditions, gate_accuracy=accuracy, pipeline=pipeline
+        conditions=conditions,
+        gate_accuracy=accuracy,
+        pipeline=pipeline,
+        judge_accuracy=judge_accuracy,
     )
     markdown_path, json_path = write_report(report, out_dir=args.out_dir, stem=stem)
 
     _print_summary(report)
     _print_targets(report)
     print(f"\n리포트: {markdown_path}\n리포트(JSON): {json_path}")
-    return 0
+    return exit_code
 
 
 def _print_summary(report: EvaluationReport) -> None:
@@ -358,19 +544,38 @@ def _print_summary(report: EvaluationReport) -> None:
     )
     if isinstance(report.pipeline, SkippedMeasurement):
         print(f"측정 2 결과 — 미실행 (사유: {report.pipeline.reason})")
+    else:
+        agreement = report.pipeline
+        match_rate = agreement.match_rate
+        recall = agreement.bait_reject_recall
+        print(
+            "측정 2 결과 — 일치율 "
+            f"{'n/a' if match_rate is None else f'{match_rate * 100:.1f}%'} "
+            f"({agreement.matched}/{agreement.total}), 기각 재현율 "
+            f"{'n/a' if recall is None else f'{recall * 100:.1f}%'} "
+            f"({agreement.bait_reject_reproduced}/{agreement.bait_total})"
+        )
+        if not report.conditions.measurement2_is_real:
+            print("  ※ 위 측정 2 수치는 대역으로 낸 값이다 — 실제 수치가 아니다.")
+
+    if isinstance(report.judge_accuracy, SkippedMeasurement):
+        print(f"측정 3 결과 — 미실행 (사유: {report.judge_accuracy.reason})")
         return
-    agreement = report.pipeline
-    match_rate = agreement.match_rate
-    recall = agreement.bait_reject_recall
+    judged = report.judge_accuracy
+    detection_rate = judged.detection_rate
+    false_positive_rate = judged.false_positive_rate
     print(
-        "측정 2 결과 — 일치율 "
-        f"{'n/a' if match_rate is None else f'{match_rate * 100:.1f}%'} "
-        f"({agreement.matched}/{agreement.total}), 기각 재현율 "
-        f"{'n/a' if recall is None else f'{recall * 100:.1f}%'} "
-        f"({agreement.bait_reject_reproduced}/{agreement.bait_total})"
+        "측정 3 결과 — L2 검출률 "
+        f"{'n/a' if detection_rate is None else f'{detection_rate * 100:.1f}%'} "
+        f"({judged.violation_detected}/{judged.violation_total}), 오탐률 "
+        f"{'n/a' if false_positive_rate is None else f'{false_positive_rate * 100:.1f}%'} "
+        f"({judged.clean_false_positive}/{judged.clean_total})"
+        f"{f', 판정 실패 {judged.error_total}건' if judged.error_total else ''}"
     )
-    if not report.conditions.measurement2_is_real:
-        print("  ※ 위 측정 2 수치는 대역으로 낸 값이다 — 실제 수치가 아니다.")
+    if report.conditions.measurement3_is_real:
+        print("  ※ 측정 3 은 확률 층이고 목표치는 미확정이다 — 달성·미달 판정이 붙지 않는다.")
+    else:
+        print("  ※ 위 측정 3 수치는 대역으로 낸 값이다 — 판정 모델의 정확도가 아니다.")
 
 
 def _print_targets(report: EvaluationReport) -> None:
