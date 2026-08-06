@@ -21,6 +21,11 @@
 **알려진 일시 공백**: L2 판정(기본 켜짐)에는 아직 결정론 대역이 없어 `--stub-llm` 이
 외부 호출 0회를 지킬 수 없다. 그래서 `--stub-llm` + L2 켜짐은 조용히 사이클 1 동작으로
 낮춰 돌리지 않고 **명시적 오류로 멈춘다**(`_require_stub_judge_gap`).
+
+같은 이유로 `--live` + L2 켜짐도 지금은 멈춘다(`_require_live_judge_gap`): 리포트에
+L2 켜짐 여부도 판정 모델도 남지 않고 이름 계열도 사이클 1 실측과 같아, 덮어쓸 수 없는
+라이브 산출물이 "L2 포함 여부 불명"인 채로 영구히 남는다. 두 가드 모두 하네스 확장
+태스크가 걷어낸다.
 """
 
 from __future__ import annotations
@@ -231,11 +236,36 @@ def _require_stub_judge_gap(*, args: argparse.Namespace, settings: Settings) -> 
         )
 
 
+def _require_live_judge_gap(*, args: argparse.Namespace, settings: Settings) -> None:
+    """`--live` + L2 켜짐도 **지금은 막는다** — 산출물이 L2 포함 여부를 말하지 못한다.
+
+    라이브 리포트는 덮어쓸 수 없다(`evaluation.resolve_report_stem`). 그런데 지금은
+    실행 조건(`RunConditions`)에 L2 켜짐 여부도 판정 모델도 없고, 이름 계열도 사이클 1
+    실측이 쓰던 `evaluation-live-<n>` 그대로다. 이대로 돌리면 **"L2 를 포함해 잰 값인지
+    알 수 없는" 실측 리포트가 영구히 남는다** — `--stub-llm` 을 막는 것과 같은 모호함이다
+    (대역 수치가 무엇을 잰 것인지 알 수 없게 되는 문제).
+
+    **이 가드는 뒤 태스크가 걷어낸다**: L2 실측 리포트 이름 계열(`evaluation-live-l2-<n>`)과
+    실행 조건의 판정 항목(L2 켜짐·판정 모델)이 들어오는 순간 이 함수를 지운다. 그때까지
+    L2 를 포함한 실측은 산출물을 남길 자리가 없다.
+    """
+    if args.live and settings.l2_enabled:
+        raise SystemExit(
+            "`--live` 는 지금 돌릴 수 없다: L2 판정이 켜져 있는데(기본 켜짐) 리포트가 그 "
+            "사실을 담지 못한다 — 실행 조건에 L2 켜짐 여부도 판정 모델도 남지 않고, 이름도 "
+            "사이클 1 실측과 같은 `evaluation-live-<n>` 계열이라 덮어쓸 수 없는 산출물이 "
+            "'L2 포함 여부 불명'으로 남는다. L2 실측용 이름 계열과 실행 조건 기록이 들어오는 "
+            "하네스 확장 태스크가 이 가드를 걷어낸다. 지금 사이클 1 실측을 다시 재려면 "
+            "L2_ENABLED=false 로 **명시**하고 다시 실행한다."
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     settings = get_settings()
     # 측정 1(무료)조차 시작하기 전에 죽인다 — 돌릴 수 없는 요청은 산출물을 남기지 않는다.
     _require_stub_judge_gap(args=args, settings=settings)
+    _require_live_judge_gap(args=args, settings=settings)
 
     fixtures = load_l1_fixtures(args.l1_fixtures)
     cases = load_golden_set(args.golden_set)

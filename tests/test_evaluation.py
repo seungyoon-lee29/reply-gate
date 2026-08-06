@@ -22,6 +22,7 @@ from typing import Any, cast
 import psycopg
 import pytest
 from psycopg.rows import DictRow
+from scripts import evaluate
 
 from reply_gate.config import Settings
 from reply_gate.contracts import (
@@ -734,6 +735,81 @@ def test_리포트는_사람용과_기계용_두_형식을_낸다(tmp_path: Path
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["measurement_1_l1_gate_accuracy"]["llm_calls"] == 0
     assert len(payload["measurement_1_l1_gate_accuracy"]["outcomes"]) == len(FIXTURES)
+
+
+# ── 실행 진입점의 가드 (scripts/evaluate.py — DB·LLM 없이 돈다) ──────────────
+#
+# 가드는 얇지만 **돌릴 수 없는 실행을 산출물 이전에 죽이는** 자리다. 여기가 새면
+# 무엇을 잰 것인지 알 수 없는 리포트가 남고, 라이브 리포트는 덮어쓸 수 없다.
+
+
+def _l2_settings(*, live_keys: bool = True, judge_key: bool = True) -> Settings:
+    key = "키가-아닌-테스트값"
+    return Settings(
+        l2_enabled=True,
+        openai_api_key=key if live_keys else "",
+        anthropic_api_key=key if judge_key else "",
+    )
+
+
+def _block_outbound_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """가드가 걷혀도 이 테스트가 실제 API 를 부르는 일이 없게 막는다 (측정 1 패턴과 같다)."""
+
+    def _blocked(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("가드가 막아야 할 실행이 외부 호출까지 갔다")
+
+    monkeypatch.setattr(socket.socket, "connect", _blocked)
+    monkeypatch.setattr(socket, "create_connection", _blocked)
+
+
+def test_stub_llm_은_L2_켜짐에서_산출물을_남기지_않고_멈춘다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """결정론 판정 대역이 없으므로 대역 실행이 실제 판정 모델을 부르게 된다 — 명시적으로 죽는다.
+
+    조용히 `l2_enabled=False` 로 낮춰 돌리면 대역 수치가 사이클 1 을 잰 것인지 L2 를
+    포함해 잰 것인지 알 수 없게 된다.
+    """
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings())
+    _block_outbound_sockets(monkeypatch)
+
+    with pytest.raises(SystemExit) as excinfo:
+        evaluate.main(["--stub-llm", "--out-dir", str(tmp_path)])
+
+    assert "결정론 판정" in str(excinfo.value)
+    # 측정 1(무료)조차 시작하기 전에 죽는다 — 리포트 파일이 남으면 안 된다.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_live_는_L2_켜짐에서_산출물을_남기지_않고_멈춘다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """라이브 리포트는 덮어쓸 수 없다 — "L2 포함 여부 불명"인 실측이 영구히 남으면 안 된다."""
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings())
+    _block_outbound_sockets(monkeypatch)
+
+    with pytest.raises(SystemExit) as excinfo:
+        evaluate.main(["--live", "--out-dir", str(tmp_path)])
+
+    message = str(excinfo.value)
+    assert "L2 판정이 켜져 있는데" in message
+    # 이 가드가 임시라는 사실이 오류 메시지에 남아야 뒤 태스크가 걷어낼 자리를 안다.
+    assert "하네스 확장 태스크" in message
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_판정_키가_없으면_측정2_를_시작하지_않는다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """시작해 놓고 첫 판정 호출에서 죽으면 30건 중 일부만 과금하고 산출물은 없다."""
+    monkeypatch.setattr(evaluate, "database_unavailable_reason", lambda *, settings: "DB 사유")
+    args = evaluate.build_parser().parse_args(["--live"])
+
+    reason = evaluate._skip_reason(args=args, settings=_l2_settings(judge_key=False))
+
+    assert reason is not None and "ANTHROPIC_API_KEY" in reason
+    # 양성 대조 — L2 가 꺼져 있으면 판정 키 부재는 사유가 아니고 뒤 검사로 넘어간다.
+    settings = _l2_settings(judge_key=False).model_copy(update={"l2_enabled": False})
+    assert evaluate._skip_reason(args=args, settings=settings) == "DB 사유"
 
 
 # ── 배관 전체 (대역 LLM + 시딩된 DB) ────────────────────────────────────────

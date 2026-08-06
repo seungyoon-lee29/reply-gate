@@ -109,11 +109,16 @@ L2_JUDGE_STAGE: Final = "l2_judge"
 
 
 class PipelineWiringError(RuntimeError):
-    """조립이 fail-closed 를 깨뜨린다 — L2 스위치가 켜졌는데 판정자가 없다.
+    """배선이 fail-closed 를 깨뜨린다 — 판정 없이 답변이 확정될 수 있는 상태다.
 
-    기본값 `None` 이 조용히 L2 를 끄는 구현을 금지하기 위한 것이다: 배선을 빠뜨린 실행이
-    "L2 를 통과했다"가 아니라 "L2 를 건너뛰었다"는 사실을 지표가 알 수 없게 되고,
-    검증하지 못한 답변이 검증된 답변처럼 나간다.
+    두 자리에서 난다: **조립 시점**(L2 스위치가 켜졌는데 판정자가 없다)과 **실행 중**
+    (L2 를 돌린 시도인데 판정 결과가 비어 있다). 둘 다 기본값·`None` 이 조용히 L2 를
+    끄는 구현을 금지하기 위한 것이다: 배선을 빠뜨린 실행이 "L2 를 통과했다"가 아니라
+    "L2 를 건너뛰었다"는 사실을 지표가 알 수 없게 되고, 검증하지 못한 답변이 검증된
+    답변처럼 나간다.
+
+    **인계 사유가 아니다** — 업무 판정이 아니라 배선 오류이므로 `llm_call_failed` 로
+    삼키지 않고 그대로 올려보낸다(자격 증명 부재와 같은 취급).
     """
 
 
@@ -292,7 +297,7 @@ class _Tally:
 
 
 def _combine(
-    l1_result: GateResult, l2_result: JudgeResult | None
+    l1_result: GateResult, l2_result: JudgeResult | None, *, l2_expected: bool
 ) -> tuple[
     Verdict,
     tuple[RejectReason, ...],
@@ -301,7 +306,21 @@ def _combine(
 
     종합 pass ⟺ L1 pass 이고 L2 가 실행됐다면 L2 도 pass. L2 미실행(`None`)은 pass 로
     치지 않고 **판정에서 빠진다** — 실행 실패의 진실은 인계 사유와 실패 단계가 들고 있다.
+
+    `l2_expected` 는 **이 시도에서 L2 판정이 나왔어야 하는가**다. 인자로 받는 이유는
+    `l2_result is None` 하나로는 "L2 를 안 돌렸다"와 "돌렸는데 판정이 비었다"를 구분할 수
+    없기 때문이다 — 구분하지 않으면 `None` 이 무조건 "L2 통과"로 접혀, 판정자가 배선된
+    채 빈 판정을 돌려주는 배선 실수가 검증 없는 답변을 `answered` 로 확정시킨다(fail-open).
+    fail-closed 는 배선 실수에도 성립해야 하므로 조용히 통과시키지 않고 죽는다.
+
+    호출부는 둘이다: 정상 종결 경로(L2 를 돌렸어야 하면 `True`)와 `_judge_failure`
+    (L2 호출이 실패해 판정이 없는 것이 **스펙이 정한 동작**이므로 `False`).
     """
+    if l2_expected and l2_result is None:
+        raise PipelineWiringError(
+            "L2 를 실행한 시도인데 판정 결과가 비어 있다 — 판정 없는 초안을 통과로 접지 "
+            "않는다. 판정자 배선(`Judging.judge` 의 반환 계약)을 확인한다."
+        )
     passed = l1_result.verdict is Verdict.PASS and (
         l2_result is None or l2_result.verdict is Verdict.PASS
     )
@@ -426,6 +445,9 @@ class InquiryPipeline:
                 )
             except LLMCallError as exc:
                 # 전송 오류는 래퍼가 이미 1회 재시도했다 → 인계 + 실패 단계 기록.
+                # 실패까지 과금된 토큰(예: 거절 응답의 입력 토큰)도 실비용이므로 집계한다.
+                tally.input_tokens += exc.input_tokens
+                tally.output_tokens += exc.output_tokens
                 return self._LoopOutcome(
                     answer=None,
                     claims=(),
@@ -443,8 +465,11 @@ class InquiryPipeline:
             # L1 을 통과한 초안만 `Draft` 로 해석된다 — L2 입력이자 최종 답변의 원본이다.
             draft = to_draft(generation.raw) if l1_result.verdict is Verdict.PASS else None
 
+            # 이 시도에서 L2 판정이 **나왔어야 하는가** — `_combine` 이 "L2 미실행"과
+            # "판정이 비었다"를 구분하는 근거다(fail-open 차단).
+            l2_expected = self._l2_enabled and draft is not None
             l2_result: JudgeResult | None = None
-            if draft is not None and self._l2_enabled:
+            if l2_expected and draft is not None:  # `draft` 재확인은 타입 좁히기다
                 # 판정자 미배선은 조립에서 이미 막혔다. 여기서 다시 보는 것은 타입 좁히기
                 # 겸 이중 잠금이다 — `assert` 로 두면 `python -O` 에서 사라져 스위치가
                 # 켜진 채 L2 를 건너뛰는 fail-open 이 된다.
@@ -465,8 +490,13 @@ class InquiryPipeline:
                         l1_result=l1_result,
                         raw_draft=generation.raw,
                     )
-                except LLMCallError:
-                    # 전송 오류는 래퍼가 이미 1회 재시도했다(토큰 정보는 없다).
+                except LLMCallError as exc:
+                    # 전송 오류는 래퍼가 이미 1회 재시도했다. 그때까지 이미 과금된 판정
+                    # 토큰(예: 형식 실패한 1회차)이 예외에 실려 온다 — 형식 불일치 소진과
+                    # 같은 이유로 그대로 집계한다. 여기서 버리면 실제로 과금된 호출이
+                    # 처리 기록에 0 으로 남는다.
+                    tally.judge_input_tokens += exc.input_tokens
+                    tally.judge_output_tokens += exc.output_tokens
                     return self._judge_failure(
                         tally=tally,
                         attempt_no=attempt_no,
@@ -477,7 +507,7 @@ class InquiryPipeline:
                 tally.judge_output_tokens += outcome.output_tokens
                 l2_result = outcome.result
 
-            verdict, reasons = _combine(l1_result, l2_result)
+            verdict, reasons = _combine(l1_result, l2_result, l2_expected=l2_expected)
             tally.attempts.append(
                 AttemptRecord(
                     attempt_no=attempt_no,
@@ -520,8 +550,11 @@ class InquiryPipeline:
         그 시도 행은 **L1 판정만** 남고 L2 판정은 null 이다(층 결합 정의상 종합 verdict 는
         pass 다 — 진실은 인계 사유와 실패 단계가 들고 있다). 재생성 사유가 아니므로 루프를
         더 돌리지 않는다: 인프라 실패는 초안을 고쳐서 나아지는 것이 아니다.
+
+        `l2_expected=False` 를 **명시**한다: 여기서 판정이 없는 것은 배선 실수가 아니라
+        스펙이 정한 동작이라, fail-open 차단 검사에 걸리면 안 된다.
         """
-        verdict, reasons = _combine(l1_result, None)
+        verdict, reasons = _combine(l1_result, None, l2_expected=False)
         tally.attempts.append(
             AttemptRecord(
                 attempt_no=attempt_no,

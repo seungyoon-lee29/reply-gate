@@ -750,7 +750,141 @@ def test_판정_키_부재는_llm_call_failed_로_삼키지_않고_전파한다(
         run(l2_pipeline(client, judge))
 
 
+# ── 이음매: 실제 `judge.Judge` 를 배선한 루프 (외부 호출 0회, DB 불필요) ─────
+#
+# 위의 L2 케이스는 전부 `ScriptedJudge` 목이 받는다 — 목은 어떤 키워드 조합도 삼키므로
+# 인자명(`draft=`/`evidence=`)이나 `JudgeOutcome` 필드명이 어긋나도 전부 녹색이다.
+# 아래 두 건은 **실제 판정 모듈**을 대본형 생성 클라이언트 위에 얹어 그 이음매를 본다.
+
+
+def judge_completion(
+    *,
+    claim_text: str,
+    reasons: Sequence[str] = (),
+    input_tokens: int = 40,
+    output_tokens: int = 9,
+) -> JsonCompletion:
+    """실제 `Judge` 의 파서를 통과하는 판정 산출 (claim 1개짜리 초안용).
+
+    정합성 규칙상 사유가 있으면 verdict 는 reject 이고 claim 판정도 reject 여야 한다.
+    """
+    verdict = "reject" if reasons else "pass"
+    return JsonCompletion(
+        data={
+            "claim_judgments": [
+                {"claim_text": claim_text, "verdict": verdict, "explanation": "판정 사유 상세."}
+            ],
+            "contradictions": [],
+            "verdict": verdict,
+            "reject_reasons": list(reasons),
+        },
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+
+def real_judge_pipeline(client: ScriptedGenerationClient) -> InquiryPipeline:
+    """생성도 판정도 같은 대본형 클라이언트를 쓰는 조립 — 판정자만 **실제 `Judge`** 다."""
+    return pipeline_with(
+        collector=StubCollector(collection(evidence=[POLICY_EVIDENCE])),
+        client=client,
+        judge=Judge(client=cast(GenerationClient, client)),
+        l2_enabled=True,
+    )
+
+
+def test_실제_판정자로도_L2_기각_후_재생성이_통과한다() -> None:
+    """목 없이 파이프라인 ↔ 판정 모듈 이음매를 끝까지 돈다 (외부 호출 0회)."""
+    client = scripted_client(
+        {
+            DRAFT_STAGE: [
+                citing_draft(text="첫 초안입니다."),
+                citing_draft(text="고친 초안입니다."),
+            ],
+            JUDGE_STAGE: [
+                judge_completion(
+                    claim_text="첫 초안입니다.",
+                    reasons=("unsupported_claim",),
+                    input_tokens=100,
+                    output_tokens=20,
+                ),
+                judge_completion(claim_text="고친 초안입니다.", input_tokens=30, output_tokens=4),
+            ],
+        }
+    )
+
+    processed = run(real_judge_pipeline(client))
+
+    assert processed.status is InquiryStatus.ANSWERED
+    assert processed.answer == "고친 초안입니다."
+    assert [(a.attempt_no, a.verdict) for a in processed.attempts] == [
+        (1, Verdict.REJECT),
+        (2, Verdict.PASS),
+    ]
+    assert processed.attempts[0].reject_reasons == (RejectReason.UNSUPPORTED_CLAIM,)
+    # 판정 호출에 초안 claim 과 수집 근거가 실렸다 — 인자명이 어긋나면 여기서 깨진다.
+    judge_calls = client.calls_for(JUDGE_STAGE)
+    assert len(judge_calls) == 2
+    assert "첫 초안입니다." in judge_calls[0]["user"]
+    assert POLICY_EVIDENCE.evidence_text in judge_calls[0]["user"]
+    # 판정 결과가 재생성 피드백으로 돌아온다 (claim 단위 상세까지).
+    assert "판정 사유 상세." in client.calls_for(DRAFT_STAGE)[1]["user"]
+    # 판정 토큰은 분리 집계된다 — 생성 계열은 수집(11/3) + 초안 2회(5/2 씩).
+    assert (processed.judge_input_tokens, processed.judge_output_tokens) == (130, 24)
+    assert (processed.input_tokens, processed.output_tokens) == (21, 7)
+
+
+def test_판정_형식_실패_뒤_전송_오류라도_과금된_판정_토큰이_남는다() -> None:
+    """1회차 200(형식 실패)로 과금된 뒤 2회차가 전송 오류 — 토큰이 0 으로 사라지지 않는다.
+
+    실제 과금된 호출이 처리 기록에 0 으로 남으면 건당 비용 지표가 거짓말을 한다
+    (docs/contracts.md "토큰 집계 경계").
+    """
+    client = scripted_client(
+        {
+            DRAFT_STAGE: [citing_draft(text="첫 초안입니다.")],
+            JUDGE_STAGE: [
+                LLMFormatError(
+                    stage=JUDGE_STAGE,
+                    detail="JSON 파싱 실패",
+                    raw_text="이건 JSON 이 아니다",
+                    input_tokens=30,
+                    output_tokens=5,
+                ),
+                LLMCallError(stage=JUDGE_STAGE, reason="transport_error", attempts=2),
+            ],
+        }
+    )
+
+    processed = run(real_judge_pipeline(client))
+
+    assert processed.status is InquiryStatus.ESCALATED
+    assert processed.escalation_reason is EscalationReason.LLM_CALL_FAILED
+    assert processed.failed_stage == L2_JUDGE_STAGE
+    assert processed.answer is None
+    # 판정 시도는 2회(형식 실패 + 전송 오류), 과금된 것은 1회차분이다.
+    assert len(client.calls_for(JUDGE_STAGE)) == 2
+    assert (processed.judge_input_tokens, processed.judge_output_tokens) == (30, 5)
+    # 생성 합산은 수집(11/3) + 초안 1회(5/2) 그대로 — 판정 토큰이 섞이지 않는다.
+    assert (processed.input_tokens, processed.output_tokens) == (16, 5)
+
+
 # ── 배선 규칙 (fail-open 차단) ──────────────────────────────────────────────
+
+
+def test_판정_결과가_비면_통과로_접지_않는다() -> None:
+    """L2 를 돌린 시도인데 판정이 비어 있으면 fail-closed 다 — 조용히 answered 로 가지 않는다.
+
+    오늘의 `judge.Judge` 로는 도달할 수 없는 상태지만, fail-closed 는 **배선 실수에도**
+    성립해야 한다: `l2_result is None` 을 "L2 통과"로 접으면 판정 없는 초안이 확정된다.
+    """
+    client = scripted_client({DRAFT_STAGE: [citing_draft()]})
+    empty = JudgeOutcome(
+        result=cast(JudgeResult, None), input_tokens=40, output_tokens=9, attempts=1
+    )
+
+    with pytest.raises(PipelineWiringError):
+        run(l2_pipeline(client, ScriptedJudge([empty])))
 
 
 def test_스위치_켜짐_판정자_미배선은_조립_시점_오류다() -> None:

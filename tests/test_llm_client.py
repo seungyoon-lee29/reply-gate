@@ -161,6 +161,8 @@ def test_거절_응답은_사용가능한_산출이_없으므로_실패다() -> 
         client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
 
     assert excinfo.value.reason == "refusal"
+    # 거절은 200 으로 온 응답이라 토큰이 이미 과금됐다 — 실패에 실어야 실비용이 남는다.
+    assert (excinfo.value.input_tokens, excinfo.value.output_tokens) == (11, 7)
 
 
 def test_형식오류는_재시도하지_않고_호출자에게_위임한다() -> None:
@@ -315,6 +317,9 @@ def test_anthropic_거절_응답은_사용가능한_산출이_없으므로_실�
         client.complete_json(stage="judge", system="s", user="u", schema=SCHEMA)
 
     assert excinfo.value.reason == "refusal"
+    # 200 으로 온 응답이므로 입력 토큰은 이미 과금됐다 — 판정 토큰이 0 으로 기록되면
+    # 실제로 돈이 나간 판정 호출이 처리 기록에서 사라진다.
+    assert (excinfo.value.input_tokens, excinfo.value.output_tokens) == (11, 7)
 
 
 def test_anthropic_형식오류는_재시도하지_않고_호출자에게_위임한다() -> None:

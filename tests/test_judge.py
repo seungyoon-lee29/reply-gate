@@ -350,6 +350,36 @@ def test_전송_오류는_재시도_없이_그대로_전파된다() -> None:
 
     assert excinfo.value.stage == JUDGE_STAGE
     assert len(recorder.calls) == 1
+    # 앞선 시도가 없었으므로 실을 토큰도 없다 (양성 대조 — 아래 회귀 테스트의 짝).
+    assert (excinfo.value.input_tokens, excinfo.value.output_tokens) == (0, 0)
+
+
+def test_형식_실패_뒤_전송_오류는_누적_토큰을_실어_전파한다() -> None:
+    """1회차가 200 으로 과금된 뒤 2회차가 전송 오류로 죽는 조합 — 누적분을 버리지 않는다.
+
+    버리면 실제로 과금된 판정 호출이 처리 기록에 0 으로 남는다 (docs/contracts.md
+    "토큰 집계 경계": 실행됐으나 실패한 호출의 토큰도 그대로 집계한다).
+    """
+    draft = _draft(("해외 배송 요금은 정책에 기재되어 있지 않습니다.", (OVERSEAS_ABSENT.id,)))
+    format_error = LLMFormatError(
+        stage=JUDGE_STAGE,
+        detail="JSON 파싱 실패",
+        raw_text="이건 JSON 이 아니다",
+        input_tokens=30,
+        output_tokens=5,
+    )
+    transport_error = LLMCallError(stage=JUDGE_STAGE, reason="transport_error", attempts=2)
+    judge, recorder = _judge([format_error, transport_error])
+
+    with pytest.raises(LLMCallError) as excinfo:
+        judge.judge(draft=draft, evidence=(OVERSEAS_ABSENT,))
+
+    assert len(recorder.calls) == 2
+    assert excinfo.value.stage == JUDGE_STAGE
+    assert excinfo.value.reason == "transport_error"
+    assert (excinfo.value.input_tokens, excinfo.value.output_tokens) == (30, 5)
+    # 원본 예외는 원인으로 남는다 — 새로 던지는 것은 토큰을 싣기 위해서다.
+    assert excinfo.value.__cause__ is transport_error
 
 
 # ── fail-closed 검증 — 사유 2종 밖 값·정합성 위반 거부 ──────────────────────
