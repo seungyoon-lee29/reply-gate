@@ -493,8 +493,9 @@ class InquiryPipeline:
                 except LLMCallError as exc:
                     # 전송 오류는 래퍼가 이미 1회 재시도했다. 그때까지 이미 과금된 판정
                     # 토큰(예: 형식 실패한 1회차)이 예외에 실려 온다 — 형식 불일치 소진과
-                    # 같은 이유로 그대로 집계한다. 여기서 버리면 실제로 과금된 호출이
-                    # 처리 기록에 0 으로 남는다.
+                    # 같은 이유로 그대로 집계한다. 여기서 버리면 값이 파이프라인 밖으로
+                    # 나가지 못해, 처리 기록·API 응답이 판정 토큰을 싣는 뒤 태스크 시점에
+                    # 실비용이 0 으로 굳는다.
                     tally.judge_input_tokens += exc.input_tokens
                     tally.judge_output_tokens += exc.output_tokens
                     return self._judge_failure(

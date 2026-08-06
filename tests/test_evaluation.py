@@ -782,11 +782,17 @@ def test_stub_llm_은_L2_켜짐에서_산출물을_남기지_않고_멈춘다(
     assert list(tmp_path.iterdir()) == []
 
 
-def test_live_는_L2_켜짐에서_산출물을_남기지_않고_멈춘다(
+def test_live_는_실측이_돌_조건에서만_L2_켜짐으로_멈춘다(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """라이브 리포트는 덮어쓸 수 없다 — "L2 포함 여부 불명"인 실측이 영구히 남으면 안 된다."""
+    """라이브 리포트는 덮어쓸 수 없다 — "L2 포함 여부 불명"인 실측이 영구히 남으면 안 된다.
+
+    가드가 발화하는 조건은 **실측 이름을 받을 실행**, 즉 키도 DB 도 갖춰져 측정 2 가
+    실제로 돌 때다. 그래서 여기서는 미실행 사유를 없애(`database_unavailable_reason`
+    → None) 실측이 돌 상태를 만든다.
+    """
     monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings())
+    monkeypatch.setattr(evaluate, "database_unavailable_reason", lambda *, settings: None)
     _block_outbound_sockets(monkeypatch)
 
     with pytest.raises(SystemExit) as excinfo:
@@ -799,15 +805,48 @@ def test_live_는_L2_켜짐에서_산출물을_남기지_않고_멈춘다(
     assert list(tmp_path.iterdir()) == []
 
 
-def test_판정_키가_없으면_측정2_를_시작하지_않는다(monkeypatch: pytest.MonkeyPatch) -> None:
-    """시작해 놓고 첫 판정 호출에서 죽으면 30건 중 일부만 과금하고 산출물은 없다."""
+def test_키_없는_live_는_죽지_않고_측정1_과_미실행_사유를_남긴다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """키가 없으면 측정 2 는 미실행이라 실측 이름을 받지 못한다 — 막을 피해가 없다.
+
+    이때 가드가 죽이면 무료인 측정 1 산출물까지 잃는다. 리포트는 덮어쓸 수 있는
+    `evaluation` 계열로 남고, 측정 2 는 **미실행 + 사유**로 기록된다
+    (`scripts/AGENTS.md` 불변식 5).
+    """
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings(live_keys=False))
+    _block_outbound_sockets(monkeypatch)
+
+    assert evaluate.main(["--live", "--out-dir", str(tmp_path)]) == 0
+
+    payload = json.loads((tmp_path / "evaluation.json").read_text(encoding="utf-8"))
+    assert payload["measurement_2_pipeline_agreement"]["executed"] is False
+    assert "OPENAI_API_KEY" in payload["measurement_2_pipeline_agreement"]["skip_reason"]
+    # 측정 1 은 그대로 산출된다 — 무료 측정을 라이브 가드가 인질로 잡지 않는다.
+    assert payload["measurement_1_l1_gate_accuracy"]["llm_calls"] == 0
+    # 비실측이므로 라이브 이름 계열은 만들어지지 않는다.
+    assert not list(tmp_path.glob("evaluation-live*"))
+
+
+def test_판정_키가_없으면_측정2_를_시작하지_않는다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """시작해 놓고 첫 판정 호출에서 죽으면 30건 중 일부만 과금하고 산출물은 없다.
+
+    이 사유는 **CLI 경로에서 실제로 관측된다** — 라이브 가드가 먼저 죽이면 도달할 수 없는
+    죽은 분기가 되므로, 판정을 private 함수 직접 호출이 아니라 `main` 산출물로 확인한다.
+    """
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings(judge_key=False))
     monkeypatch.setattr(evaluate, "database_unavailable_reason", lambda *, settings: "DB 사유")
+    _block_outbound_sockets(monkeypatch)
+
+    assert evaluate.main(["--live", "--out-dir", str(tmp_path)]) == 0
+
+    payload = json.loads((tmp_path / "evaluation.json").read_text(encoding="utf-8"))
+    assert "ANTHROPIC_API_KEY" in payload["measurement_2_pipeline_agreement"]["skip_reason"]
+
+    # 양성 대조 — L2 가 꺼져 있으면 판정 키 부재는 사유가 아니고 뒤 검사(DB)로 넘어간다.
     args = evaluate.build_parser().parse_args(["--live"])
-
-    reason = evaluate._skip_reason(args=args, settings=_l2_settings(judge_key=False))
-
-    assert reason is not None and "ANTHROPIC_API_KEY" in reason
-    # 양성 대조 — L2 가 꺼져 있으면 판정 키 부재는 사유가 아니고 뒤 검사로 넘어간다.
     settings = _l2_settings(judge_key=False).model_copy(update={"l2_enabled": False})
     assert evaluate._skip_reason(args=args, settings=settings) == "DB 사유"
 

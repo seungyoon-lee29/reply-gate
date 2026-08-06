@@ -603,6 +603,11 @@ class EvidenceCollector:
                     )
         except LLMCallError as exc:
             # 전송 오류는 래퍼가 이미 1회 재시도했다 — 어느 단계에서 왔든 llm_call_failed.
+            # 실패까지 실제로 과금된 토큰(예: 200 으로 돌아온 거절 응답의 usage)은 예외에
+            # 실려 온다 — 초안·판정 경로와 같은 규칙으로 원장에 더한 뒤 종결한다. 여기서만
+            # 버리면 같은 거절이 어느 단계에서 났느냐에 따라 실비용 기록이 갈린다.
+            ledger.input_tokens += exc.input_tokens
+            ledger.output_tokens += exc.output_tokens
             return self._finish(
                 ledger,
                 intent=intent,

@@ -22,10 +22,13 @@
 외부 호출 0회를 지킬 수 없다. 그래서 `--stub-llm` + L2 켜짐은 조용히 사이클 1 동작으로
 낮춰 돌리지 않고 **명시적 오류로 멈춘다**(`_require_stub_judge_gap`).
 
-같은 이유로 `--live` + L2 켜짐도 지금은 멈춘다(`_require_live_judge_gap`): 리포트에
-L2 켜짐 여부도 판정 모델도 남지 않고 이름 계열도 사이클 1 실측과 같아, 덮어쓸 수 없는
-라이브 산출물이 "L2 포함 여부 불명"인 채로 영구히 남는다. 두 가드 모두 하네스 확장
-태스크가 걷어낸다.
+같은 이유로 `--live` + L2 켜짐도 지금은 멈춘다(`_require_live_judge_gap`) — 단
+**측정 2 가 실제로 돌 조건일 때만**이다: 리포트에 L2 켜짐 여부도 판정 모델도 남지 않고
+이름 계열도 사이클 1 실측과 같아, 덮어쓸 수 없는 라이브 산출물이 "L2 포함 여부 불명"인
+채로 영구히 남기 때문이다. 키·DB 가 없어 측정 2 가 미실행이면 리포트는 실측 이름을 받지
+못하고(덮어쓸 수 있는 `evaluation` 계열) 그 피해가 성립하지 않으므로 막지 않는다 —
+측정 1 결과와 "측정 2 미실행 + 사유"를 담은 리포트가 그대로 남는다. 두 가드 모두 하네스
+확장 태스크가 걷어낸다.
 """
 
 from __future__ import annotations
@@ -236,8 +239,11 @@ def _require_stub_judge_gap(*, args: argparse.Namespace, settings: Settings) -> 
         )
 
 
-def _require_live_judge_gap(*, args: argparse.Namespace, settings: Settings) -> None:
-    """`--live` + L2 켜짐도 **지금은 막는다** — 산출물이 L2 포함 여부를 말하지 못한다.
+def _require_live_judge_gap(
+    *, args: argparse.Namespace, settings: Settings, skip: str | None
+) -> None:
+    """`--live` + L2 켜짐은 **실측이 실제로 돌 때만** 막는다 — 산출물이 L2 포함 여부를
+    말하지 못하기 때문이다.
 
     라이브 리포트는 덮어쓸 수 없다(`evaluation.resolve_report_stem`). 그런데 지금은
     실행 조건(`RunConditions`)에 L2 켜짐 여부도 판정 모델도 없고, 이름 계열도 사이클 1
@@ -245,11 +251,17 @@ def _require_live_judge_gap(*, args: argparse.Namespace, settings: Settings) -> 
     알 수 없는" 실측 리포트가 영구히 남는다** — `--stub-llm` 을 막는 것과 같은 모호함이다
     (대역 수치가 무엇을 잰 것인지 알 수 없게 되는 문제).
 
+    **그래서 조건은 `skip is None` 까지다.** 막으려는 피해는 리포트가 실측 이름을 받을
+    때만(`measurement2_is_real`, 즉 `--live` + 측정 2 실행 가능) 성립한다. 키도 DB 도
+    없는 `--live` 는 측정 2 가 미실행이라 덮어쓸 수 있는 `evaluation` 계열로 떨어지므로,
+    여기서 죽이면 무료인 측정 1 산출물과 "측정 2 미실행 + 사유" 기록까지 함께 잃는다
+    (`scripts/AGENTS.md` 의 "미실행 측정은 리포트에 미실행 + 사유로 남긴다").
+
     **이 가드는 뒤 태스크가 걷어낸다**: L2 실측 리포트 이름 계열(`evaluation-live-l2-<n>`)과
     실행 조건의 판정 항목(L2 켜짐·판정 모델)이 들어오는 순간 이 함수를 지운다. 그때까지
     L2 를 포함한 실측은 산출물을 남길 자리가 없다.
     """
-    if args.live and settings.l2_enabled:
+    if args.live and settings.l2_enabled and skip is None:
         raise SystemExit(
             "`--live` 는 지금 돌릴 수 없다: L2 판정이 켜져 있는데(기본 켜짐) 리포트가 그 "
             "사실을 담지 못한다 — 실행 조건에 L2 켜짐 여부도 판정 모델도 남지 않고, 이름도 "
@@ -265,13 +277,14 @@ def main(argv: list[str] | None = None) -> int:
     settings = get_settings()
     # 측정 1(무료)조차 시작하기 전에 죽인다 — 돌릴 수 없는 요청은 산출물을 남기지 않는다.
     _require_stub_judge_gap(args=args, settings=settings)
-    _require_live_judge_gap(args=args, settings=settings)
+    # 라이브 가드는 미실행 사유를 알아야 판단한다(실측 이름을 받을 실행만 막는다).
+    skip = _skip_reason(args=args, settings=settings)
+    _require_live_judge_gap(args=args, settings=settings, skip=skip)
 
     fixtures = load_l1_fixtures(args.l1_fixtures)
     cases = load_golden_set(args.golden_set)
 
     run_settings = _measurement_two_settings(args=args, settings=settings)
-    skip = _skip_reason(args=args, settings=settings)
     measurement2_is_real = bool(args.live) and skip is None
 
     # 리포트 이름은 **측정을 시작하기 전에** 확정한다 — 여기서 거부될 실행이 과금(라이브

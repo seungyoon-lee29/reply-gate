@@ -446,6 +446,33 @@ def test_초안_전송_오류는_llm_call_failed_이고_실패_단계를_남긴�
     assert processed.attempts == ()
 
 
+def test_초안_전송_오류가_실은_과금_토큰도_생성_합산에_남는다() -> None:
+    """200 으로 돌아온 거절 응답처럼 실패까지 과금된 초안 토큰도 실비용이다 — 버리지 않는다.
+
+    "실행됐으나 실패한 호출의 토큰도 그대로 집계한다"(이번 사이클 스펙). 판정 경로와 같은
+    규칙이고, 계열도 같아야 한다 — 초안은 생성 합산(`input_tokens`/`output_tokens`)이다.
+    """
+    failure = LLMCallError(
+        stage=DRAFT_STAGE,
+        reason="refusal",
+        attempts=1,
+        input_tokens=12,
+        output_tokens=3,
+    )
+    client = scripted_client({DRAFT_STAGE: [failure]})
+    pipeline = pipeline_with(
+        collector=StubCollector(collection(evidence=[POLICY_EVIDENCE])), client=client
+    )
+
+    processed = run(pipeline)
+
+    assert processed.escalation_reason is EscalationReason.LLM_CALL_FAILED
+    assert processed.failed_stage == DRAFT_STAGE
+    # 수집 대역(11/3) + 실패한 초안 호출(12/3) — 판정 계열에는 한 톨도 새지 않는다.
+    assert (processed.input_tokens, processed.output_tokens) == (23, 6)
+    assert (processed.judge_input_tokens, processed.judge_output_tokens) == (0, 0)
+
+
 def test_재생성_중_전송_오류가_나도_앞선_시도_기록은_남는다() -> None:
     rejected = draft_completion({"claims": [{"text": "환불 가능합니다.", "citation_ids": []}]})
     failure = LLMCallError(stage=DRAFT_STAGE, reason="transport_error", attempts=2)
@@ -837,8 +864,9 @@ def test_실제_판정자로도_L2_기각_후_재생성이_통과한다() -> Non
 def test_판정_형식_실패_뒤_전송_오류라도_과금된_판정_토큰이_남는다() -> None:
     """1회차 200(형식 실패)로 과금된 뒤 2회차가 전송 오류 — 토큰이 0 으로 사라지지 않는다.
 
-    실제 과금된 호출이 처리 기록에 0 으로 남으면 건당 비용 지표가 거짓말을 한다
-    (docs/contracts.md "토큰 집계 경계").
+    "실행됐으나 실패한 호출의 토큰도 그대로 집계한다"(이번 사이클 스펙). 파이프라인이
+    여기서 값을 잃으면 처리 기록·API 응답이 판정 토큰을 싣는 뒤 태스크 시점에 건당 비용
+    지표가 거짓말을 한다.
     """
     client = scripted_client(
         {
