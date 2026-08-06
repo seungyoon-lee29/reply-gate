@@ -7,11 +7,19 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from collections.abc import Sequence
+from typing import Final
 
-from reply_gate.llm import EmbeddingResult
+from reply_gate.config import Settings
+from reply_gate.contracts import ClaimJudgment, Draft, Evidence, JudgeResult, RejectReason, Verdict
+from reply_gate.draft import DraftGenerator
+from reply_gate.evidence import EvidenceCollector
+from reply_gate.judge import JudgeOutcome
+from reply_gate.llm import EmbeddingClient, EmbeddingResult, GenerationClient
+from reply_gate.pipeline import InquiryPipeline, Judging
 
-__all__ = ["LexicalEmbeddingClient"]
+__all__ = ["LexicalEmbeddingClient", "StubJudge", "build_stub_pipeline"]
 
 
 class LexicalEmbeddingClient:
@@ -52,3 +60,111 @@ class LexicalEmbeddingClient:
             counts[0] = 1.0
             return counts
         return [value / norm for value in counts]
+
+
+#: 숫자로 시작하는 토막(`3영업일`·`30,000원`·`1588-0000`·`ORD-20260720-0002` 의 숫자 구간).
+_NUMBER_RUN: Final = re.compile(r"[0-9][0-9,.\-~]*")
+#: 프롬프트 길이에서 유도하는 가짜 토큰 환산 비율(문자 → 토큰).
+_CHARS_PER_TOKEN: Final = 4
+
+
+def _numbers(text: str) -> set[str]:
+    """텍스트의 숫자열을 **구분 기호를 지운 값 집합**으로 뽑는다.
+
+    `30,000` 과 `30000`, `3~5` 와 `3`·`5` 가 같은 값으로 대조되게 하려는 것이다 —
+    표기 차이로 갈리면 대역이 근거에 있는 값을 "지어낸 값"으로 오판한다.
+    """
+    values: set[str] = set()
+    for match in _NUMBER_RUN.findall(text):
+        for part in re.split(r"[.,\-~]", match):
+            digits = part.strip()
+            if digits:
+                values.add(digits.lstrip("0") or "0")
+    return values
+
+
+class StubJudge:
+    """`Judging` 대역 — 결정론 판정. **실제 판정 모델이 아니다. 배관 검증 전용.**
+
+    규칙은 하나뿐이다: claim 텍스트의 숫자열 중 **그 claim 이 인용한 근거 원문에 없는
+    값**이 하나라도 있으면 그 claim 은 `unsupported_claim` 이다 — "근거에 없는 값을
+    지어냈다"의 기계적 근사다. 생성 대역(`evaluation.StubGenerationClient`)이 미끼
+    조항에서 값을 지어내는 것과 짝을 이룬다.
+
+    **모순 감지는 하지 않는다**(항상 빈 목록). 어휘 규칙으로 근사하면 금액·기간이 다른
+    정책 조항 대부분이 거짓 모순으로 잡혀 골든셋 배관 검증이 통째로 무의미해진다. 그래서
+    이 대역으로 낸 측정 3 수치는 **판정 모델의 정확도가 아니다** — 리포트가 실행 조건의
+    판정 모델 항목으로 그 사실을 말한다.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[Draft] = []
+
+    def judge(self, *, draft: Draft, evidence: Sequence[Evidence]) -> JudgeOutcome:
+        self.calls.append(draft)
+        evidence_by_id = {item.id: item for item in evidence}
+
+        judgments: list[ClaimJudgment] = []
+        for claim in draft.claims:
+            cited = " ".join(
+                evidence_by_id[citation_id].evidence_text
+                for citation_id in claim.citation_ids
+                if citation_id in evidence_by_id
+            )
+            fabricated = sorted(_numbers(claim.text) - _numbers(cited))
+            judgments.append(
+                ClaimJudgment(
+                    claim_text=claim.text,
+                    verdict=Verdict.REJECT if fabricated else Verdict.PASS,
+                    explanation=(
+                        f"인용 근거에 없는 값: {', '.join(fabricated)}"
+                        if fabricated
+                        else "인용 근거가 뒷받침한다"
+                    ),
+                )
+            )
+
+        rejected = any(judgment.verdict is Verdict.REJECT for judgment in judgments)
+        result = JudgeResult(
+            verdict=Verdict.REJECT if rejected else Verdict.PASS,
+            reject_reasons=(RejectReason.UNSUPPORTED_CLAIM,) if rejected else (),
+            claim_judgments=tuple(judgments),
+            contradictions=(),
+        )
+        prompt_chars = len(draft.answer_text) + sum(len(item.evidence_text) for item in evidence)
+        output_chars = sum(
+            len(judgment.claim_text) + len(judgment.explanation) for judgment in judgments
+        )
+        return JudgeOutcome(
+            result=result,
+            input_tokens=max(1, prompt_chars // _CHARS_PER_TOKEN),
+            output_tokens=max(1, output_chars // _CHARS_PER_TOKEN),
+            attempts=1,
+        )
+
+
+def build_stub_pipeline(
+    *,
+    generation_client: GenerationClient,
+    embedding_client: EmbeddingClient,
+    judge: Judging,
+    settings: Settings,
+) -> InquiryPipeline:
+    """대역 배관 검증용 파이프라인 — `pipeline.build_pipeline` 과 **같은 협력자**를 쓰되
+    판정자만 주입한다.
+
+    `build_pipeline` 은 판정자를 설정에서 조립하므로(실제 Anthropic 클라이언트) 주입
+    구멍이 없다. 그 구멍을 뚫는 것은 파이프라인 모듈의 결정이라, 여기서는 같은 조합을
+    다시 적는다 — **조합이 어긋나면 대역 실행이 실제 실행과 다른 것을 잰다.**
+    `tests/test_testing_doubles.py` 가 두 조립의 협력자 종류를 대조해 드리프트를 잡는다.
+    """
+    return InquiryPipeline(
+        collector=EvidenceCollector(
+            generation_client=generation_client,
+            embedding_client=embedding_client,
+            settings=settings,
+        ),
+        drafter=DraftGenerator(client=generation_client, effort=settings.generation_effort),
+        judge=judge,
+        l2_enabled=settings.l2_enabled,
+    )

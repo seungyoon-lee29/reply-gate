@@ -1,16 +1,21 @@
 """평가 하네스 — 결정론 층과 확률 층을 **분리해서** 측정한다
 (docs/tracking/decisions/0001-게이트를-2층으로-나눈다.md 의 층 분리가 측정에도 이어진다).
 
-두 측정은 서로의 수치를 오염시키지 않는다. 그것이 이 모듈의 존재 이유다.
+세 측정은 서로의 수치를 오염시키지 않는다. 그것이 이 모듈의 존재 이유다.
 
 * **측정 1 — L1 게이트 단위 정확도 (결정론).** `data/l1_fixtures.jsonl` 의 고정 "초안+근거"
   쌍에 `gate.evaluate_draft` 를 직접 적용한다. **LLM 을 호출하지 않는다** — 이 모듈은
-  `reply_gate.llm` 의 실제 클라이언트를 import 하지 않으며, 측정 1 경로는 네트워크를 타지
-  않는다. 100% 재현되므로 신뢰성 서사의 헤드라인 수치(구조적 오류 검출률·정상 초안 오탐률)는
-  여기서 나온다.
+  `reply_gate.llm` 의 실제 클라이언트를 import 하지 않으며(판정 실패를 분류하는 예외 형만
+  쓴다), 측정 1 경로는 네트워크를 타지 않는다. 100% 재현되므로 신뢰성 서사의 헤드라인
+  수치(구조적 오류 검출률·정상 초안 오탐률)는 여기서 나온다.
 * **측정 2 — 파이프라인 판정 일치율 (end-to-end).** 골든셋 30건을 파이프라인에 흘려
   허용 결과 집합과 대조한다. 확률 층이므로 재실행하면 값이 달라진다. **초안 전 인계
   경로가 포함되므로 L1 판정만의 지표가 아니다.**
+* **측정 3 — L2 판정 단위 정확도 (확률 층·과금).** `data/judge_fixtures.jsonl` 의 고정
+  "claim 집합 + 근거 집합 + 기대 판정" 쌍을 **실제 판정 모델에 직접** 흘린다. 픽스처
+  단위는 claim 집합이다 — 판정이 배치 호출이라 그 단위가 곧 측정 단위다. 측정 1 과 같은
+  모양의 수치(검출률·오탐률·사유 일치)를 내지만 **재현되지 않고 과금된다**. 목표치는
+  **미확정**이다: 첫 실측 뒤에 확정한다(결정 0006 의 방식 그대로).
 
 골든셋 라벨은 단일 정답이 아니라 **허용 결과 집합**이다(`ExpectedOutcomeSet`): 허용 최종
 상태 집합 + 허용 인계 사유 집합 + 기각 기대 여부 + 금지 기각 사유 집합. 초안이 확률적이라
@@ -35,6 +40,8 @@ import psycopg
 from psycopg.rows import DictRow
 
 from reply_gate.contracts import (
+    Claim,
+    Draft,
     EscalationReason,
     Evidence,
     EvidenceSource,
@@ -43,13 +50,23 @@ from reply_gate.contracts import (
     Verdict,
 )
 from reply_gate.gate import DEFAULT_PII_PATTERNS, REASON_ORDER, evaluate_draft
-from reply_gate.pipeline import ProcessedInquiry, ReceiptError, accept_inquiry, new_inquiry_id
+from reply_gate.judge import L2_REJECT_REASONS
+from reply_gate.llm import LLMCallError, LLMFormatError
+from reply_gate.pipeline import (
+    Judging,
+    ProcessedInquiry,
+    ReceiptError,
+    accept_inquiry,
+    new_inquiry_id,
+)
 
 __all__ = [
     "DEFAULT_GOLDEN_SET_PATH",
+    "DEFAULT_JUDGE_FIXTURES_PATH",
     "DEFAULT_L1_FIXTURES_PATH",
     "DEFAULT_REPORT_DIR",
     "DEFAULT_REPORT_STEM",
+    "LIVE_L2_REPORT_STEM",
     "LIVE_REPORT_STEM",
     "REASON_ORDER",
     "TARGETS",
@@ -58,8 +75,11 @@ __all__ = [
     "GateAccuracy",
     "GoldenCase",
     "GoldenOutcome",
+    "JudgeAccuracy",
+    "JudgeFixture",
     "L1Fixture",
     "L1Outcome",
+    "L2Outcome",
     "MetricTarget",
     "PipelineAgreement",
     "PipelineRunning",
@@ -73,8 +93,10 @@ __all__ = [
     "build_report",
     "display_path",
     "load_golden_set",
+    "load_judge_fixtures",
     "load_l1_fixtures",
     "measure_gate_accuracy",
+    "measure_judge_accuracy",
     "measure_pipeline_agreement",
     "render_markdown",
     "report_to_json",
@@ -88,6 +110,8 @@ _ROOT: Final = Path(__file__).resolve().parents[2]
 DEFAULT_GOLDEN_SET_PATH: Final = _ROOT / "data" / "golden_set.jsonl"
 #: 저장소의 L1 픽스처 셋 — 고정 초안+근거 쌍(LLM 호출 없음).
 DEFAULT_L1_FIXTURES_PATH: Final = _ROOT / "data" / "l1_fixtures.jsonl"
+#: 저장소의 L2 판정 픽스처 셋 — 고정 claim 집합+근거 집합+기대 판정(실제 판정 모델 호출).
+DEFAULT_JUDGE_FIXTURES_PATH: Final = _ROOT / "data" / "judge_fixtures.jsonl"
 #: 리포트 산출 위치. `evaluation-live*` 만 저장소가 추적하고 나머지는 gitignore 된다
 #: (라이브 실측은 재생성에 과금이 들어 근거로 커밋한다 — `resolve_report_stem`).
 DEFAULT_REPORT_DIR: Final = _ROOT / "reports"
@@ -97,6 +121,12 @@ DEFAULT_REPORT_STEM: Final = "evaluation"
 
 #: 라이브 실측이 쓰는 리포트 이름 접두. 이 접두로 시작하는 리포트만 저장소가 추적한다.
 LIVE_REPORT_STEM: Final = "evaluation-live"
+
+#: **L2 켜짐** 라이브 실측이 쓰는 이름 접두. L2 꺼짐 기준선(`evaluation-live-<n>`)과
+#: 같은 계열에 섞이면 어느 실측이 L2 를 포함해 잰 것인지 산출물만 보고는 알 수 없다.
+#: `LIVE_REPORT_STEM` 으로 시작하므로 기존 라이브 이름 불변식과 gitignore 추적 패턴을
+#: 그대로 만족한다.
+LIVE_L2_REPORT_STEM: Final = f"{LIVE_REPORT_STEM}-l2"
 
 
 class ReportStemError(ValueError):
@@ -116,12 +146,12 @@ def display_path(path: Path) -> str:
         return str(resolved)
 
 
-def _next_free_live_stem(out_dir: Path) -> str:
-    """제안용 — 비어 있는 `evaluation-live-N` 이름을 찾는다."""
+def _next_free_live_stem(out_dir: Path, *, prefix: str = LIVE_REPORT_STEM) -> str:
+    """제안용 — 비어 있는 `<접두>-N` 이름을 찾는다. 접두는 실행의 계열을 따른다."""
     n = 1
-    while any((out_dir / f"{LIVE_REPORT_STEM}-{n}{ext}").exists() for ext in (".md", ".json")):
+    while any((out_dir / f"{prefix}-{n}{ext}").exists() for ext in (".md", ".json")):
         n += 1
-    return f"{LIVE_REPORT_STEM}-{n}"
+    return f"{prefix}-{n}"
 
 
 def resolve_report_stem(
@@ -129,26 +159,49 @@ def resolve_report_stem(
     requested: str | None,
     live_requested: bool,
     measurement2_is_real: bool,
+    l2_enabled: bool,
     out_dir: Path,
 ) -> str:
     """리포트 이름을 확정한다 — 라이브 실측 산출물을 잃지 않게 막는 유일한 자리다.
 
-    규칙은 양방향이다: **라이브 이름 ⇔ 실측.**
+    규칙은 두 겹이고 **둘 다 양방향**이다.
+
+    **(1) 라이브 이름 ⇔ 실측**
 
     * 실측이 아닌 실행(측정 2 미실행·대역)은 라이브 이름을 쓸 수 없다. `--live` 를 줬어도
       키·DB 문제로 측정 2 가 미실행이면 비실측이므로 기본 이름은 `evaluation` 으로 떨어진다.
     * 실측(과금) 실행은 라이브 이름만 쓸 수 있다 — 실측 결과가 gitignore 되는 이름으로
       새어 나가 다음 기본 실행에 덮이는 것을 막는다.
+
+    **(2) L2 켜짐 실측 ⇔ `evaluation-live-l2` 접두**
+
+    * L2 켜짐 실측은 l2 계열에만 쓸 수 있고, L2 꺼짐 실측은 l2 계열에 쓸 수 없다.
+      기본 이름만 갈라 두면 `--report-stem evaluation-live-4` 한 줄이 꺼짐 기준선 계열을
+      오염시킨다 — **명시 스템에도 같은 검사를 건다.**
+    * L2 켜짐 실측의 기본 이름은 코드가 `evaluation-live-l2-<n>` 으로 자동 넘버링한다.
+      재실측 프로토콜이 3회 반복이라 기본 이름 충돌로 죽으면 안 되기 때문이다.
+
+    그 밖에:
+
     * 실측 실행은 **이미 존재하는 라이브 리포트를 덮어쓸 수 없다** — 비결정론이라 덮인
-      수치는 재생성되지 않는다. 비어 있는 이름을 제안한다.
+      수치는 재생성되지 않는다. 비어 있는 이름을 제안하되 **제안도 계열을 따른다.**
     * 이름은 경로가 아니라 **파일 이름 조각**이어야 한다 — `./`·`../`·절대경로로 검사를
       우회해 같은 파일명에 쓰는 것을 막는다. 대소문자 변형(macOS 기본 FS 는 대소문자
       무시)도 라이브 이름으로 취급한다.
 
     실행 전에 호출해야 한다: 여기서 거부되면 과금도 측정도 시작되지 않아야 한다.
     """
+    del live_requested  # 판정 근거는 "실측인가"이지 "실측을 요청했는가"가 아니다.
+    series = LIVE_L2_REPORT_STEM if l2_enabled else LIVE_REPORT_STEM
+
     if requested is None:
-        stem = LIVE_REPORT_STEM if measurement2_is_real else DEFAULT_REPORT_STEM
+        if not measurement2_is_real:
+            stem = DEFAULT_REPORT_STEM
+        elif l2_enabled:
+            # 3회 반복 실측이 기본 이름 충돌로 죽지 않게 빈 번호를 코드가 찾는다.
+            stem = _next_free_live_stem(out_dir, prefix=LIVE_L2_REPORT_STEM)
+        else:
+            stem = LIVE_REPORT_STEM
     else:
         stem = requested
         if (
@@ -164,7 +217,9 @@ def resolve_report_stem(
             )
 
     #: 대소문자 무시 파일시스템에서 `Evaluation-live` 는 라이브 리포트와 같은 파일이다.
-    is_live_name = stem.casefold().startswith(LIVE_REPORT_STEM)
+    folded = stem.casefold()
+    is_live_name = folded.startswith(LIVE_REPORT_STEM)
+    is_l2_name = folded.startswith(LIVE_L2_REPORT_STEM)
 
     if is_live_name and not measurement2_is_real:
         raise ReportStemError(
@@ -175,8 +230,20 @@ def resolve_report_stem(
     if measurement2_is_real and not stem.startswith(LIVE_REPORT_STEM):
         raise ReportStemError(
             f"거부: 실측(과금) 실행이 `{stem}` 에 쓰면 산출물이 gitignore 되어 다음 기본 "
-            f"실행에 덮인다 — 실제로 한 번 그렇게 잃었다. `{LIVE_REPORT_STEM}` 로 시작하는 "
-            f"이름을 쓰라."
+            f"실행에 덮인다 — 실제로 한 번 그렇게 잃었다. `{series}` 로 시작하는 이름을 쓰라."
+        )
+    if measurement2_is_real and l2_enabled and not stem.startswith(LIVE_L2_REPORT_STEM):
+        raise ReportStemError(
+            f"거부: L2 켜짐 실측이 `{stem}` 에 쓰면 L2 꺼짐 기준선 계열과 섞인다 — 산출물만 "
+            f"보고는 어느 쪽이 L2 를 포함해 잰 값인지 알 수 없게 된다. "
+            f"`{LIVE_L2_REPORT_STEM}` 로 시작하는 이름을 쓰라 (예: "
+            f"--report-stem {_next_free_live_stem(out_dir, prefix=LIVE_L2_REPORT_STEM)})."
+        )
+    if measurement2_is_real and not l2_enabled and is_l2_name:
+        raise ReportStemError(
+            f"거부: `{stem}` 은 L2 켜짐 실측 계열 이름인데 이 실행은 L2 가 꺼져 있다. "
+            f"꺼짐 기준선은 `{LIVE_REPORT_STEM}` 계열에만 쓴다 — 계열이 뒤섞이면 두 실측을 "
+            f"대조하는 근거가 사라진다."
         )
     if measurement2_is_real:
         candidates = (out_dir / f"{stem}{ext}" for ext in (".md", ".json"))
@@ -185,7 +252,7 @@ def resolve_report_stem(
             raise ReportStemError(
                 f"거부: {existing[0]} 이 이미 있다 — 실측은 비결정론이라 덮이면 그 수치는 "
                 f"재생성되지 않는다. 비어 있는 이름을 쓰라 (예: "
-                f"--report-stem {_next_free_live_stem(out_dir)})."
+                f"--report-stem {_next_free_live_stem(out_dir, prefix=series)})."
             )
     return stem
 
@@ -416,6 +483,10 @@ class GoldenOutcome:
     input_tokens: int
     output_tokens: int
     embedding_tokens: int
+    #: 판정(L2) 토큰은 생성·임베딩과 **분리**해서 싣는다 — provider 와 단가가 다르다.
+    #: L2 미실행이면 0 이다(임베딩 관례와 같다).
+    judge_input_tokens: int
+    judge_output_tokens: int
     matched: bool
     mismatches: tuple[str, ...]
     #: 접수 거부처럼 파이프라인에 진입조차 못한 경우의 사유.
@@ -423,6 +494,11 @@ class GoldenOutcome:
 
     @property
     def rejected_at_least_once(self) -> bool:
+        """시도 중 **최소 1건**이 기각인가 — **층 무관**이다.
+
+        종합 verdict 를 보므로 L1 기각도 L2 기각도 같은 자격으로 들어온다. 기각 재현율의
+        정의가 층에 묶이면 L2 도입이 지표 정의를 바꾸게 되고, 도입 전후 비교가 깨진다.
+        """
         return any(verdict is Verdict.REJECT for verdict in self.attempt_verdicts)
 
 
@@ -445,6 +521,10 @@ class PipelineAgreement:
     input_tokens_total: int
     output_tokens_total: int
     embedding_tokens_total: int
+    #: 판정 계열은 생성·임베딩과 분리해서 센다. L2 켜짐 실측에서 이 계열을 빠뜨리면
+    #: 건당 비용 지표가 판정 비용을 통째로 누락한다.
+    judge_input_tokens_total: int
+    judge_output_tokens_total: int
     status_counts: Mapping[str, int]
     escalation_counts: Mapping[str, int]
     outcomes: tuple[GoldenOutcome, ...]
@@ -455,7 +535,10 @@ class PipelineAgreement:
 
     @property
     def bait_reject_recall(self) -> float | None:
-        """기각 유발 문의의 기각 재현율 — 데모 신뢰성의 근거 수치."""
+        """기각 유발 문의의 기각 재현율 — 데모 신뢰성의 근거 수치.
+
+        정의는 **시도 중 최소 1건 기각, 층 무관**이다(L2 도입으로 바뀌지 않는다).
+        """
         return None if self.bait_total == 0 else self.bait_reject_reproduced / self.bait_total
 
     @property
@@ -469,11 +552,17 @@ class PipelineAgreement:
         return None if self.total == 0 else self.embedding_tokens_total / self.total
 
     @property
-    def total_tokens_per_inquiry(self) -> float | None:
+    def judge_tokens_per_inquiry(self) -> float | None:
         if self.total == 0:
             return None
-        total = self.input_tokens_total + self.output_tokens_total + self.embedding_tokens_total
-        return total / self.total
+        return (self.judge_input_tokens_total + self.judge_output_tokens_total) / self.total
+
+    @property
+    def total_tokens_per_inquiry(self) -> float | None:
+        """세 계열 합산 — 판정 계열을 빠뜨리면 L2 켜짐 실측의 건당 비용이 거짓이 된다."""
+        if self.total == 0:
+            return None
+        return _grand_total(self) / self.total
 
 
 @dataclass(frozen=True)
@@ -600,6 +689,8 @@ def evaluate_case(
             input_tokens=0,
             output_tokens=0,
             embedding_tokens=0,
+            judge_input_tokens=0,
+            judge_output_tokens=0,
             matched=False,
             mismatches=(f"접수 거부: {exc}",),
             error=str(exc),
@@ -627,6 +718,8 @@ def evaluate_case(
         input_tokens=processed.input_tokens,
         output_tokens=processed.output_tokens,
         embedding_tokens=processed.embedding_tokens,
+        judge_input_tokens=processed.judge_input_tokens,
+        judge_output_tokens=processed.judge_output_tokens,
         matched=matched,
         mismatches=mismatches,
         error=None,
@@ -693,6 +786,8 @@ def measure_pipeline_agreement(
         input_tokens_total=sum(outcome.input_tokens for outcome in outcomes),
         output_tokens_total=sum(outcome.output_tokens for outcome in outcomes),
         embedding_tokens_total=sum(outcome.embedding_tokens for outcome in outcomes),
+        judge_input_tokens_total=sum(outcome.judge_input_tokens for outcome in outcomes),
+        judge_output_tokens_total=sum(outcome.judge_output_tokens for outcome in outcomes),
         status_counts=status_counts,
         escalation_counts=escalation_counts,
         outcomes=tuple(outcomes),
@@ -712,6 +807,358 @@ def _ceil_div(numerator: int, denominator: int) -> int:
     return -(-numerator // denominator)
 
 
+# ══ 측정 3 — L2 판정 단위 정확도 (확률 층 · 과금) ═══════════════════════════
+
+
+@dataclass(frozen=True)
+class JudgeFixture:
+    """고정 "claim 집합 + 근거 집합 + 기대 판정" 1건.
+
+    단위가 claim 1개가 아니라 **claim 집합**인 이유는 판정이 시도당 1회 배치 호출이기
+    때문이다 — 모순 감지가 claim·근거 교차 시야를 요구해서 쪼갤 수 없다. 측정 단위는
+    호출 단위와 같아야 한다.
+    """
+
+    id: str
+    category: str
+    note: str
+    evidences: tuple[Evidence, ...]
+    claims: tuple[Claim, ...]
+    expected_verdict: Verdict
+    expected_reasons: tuple[RejectReason, ...]
+    #: `claims` 와 같은 순서의 claim 별 기대 판정.
+    expected_claim_verdicts: tuple[Verdict, ...]
+    #: 기대 모순 근거쌍 — 파일에 적힌 순서 그대로.
+    expected_contradiction_pairs: tuple[tuple[str, str], ...]
+
+    @property
+    def draft(self) -> Draft:
+        """판정 입력이 되는 초안. L1 을 통과한 형태여야 한다(L2 는 L1 통과분만 본다)."""
+        return Draft(claims=self.claims)
+
+    @property
+    def expected_contradictions(self) -> frozenset[frozenset[str]]:
+        """대조용 — 모순은 **순서 없는 쌍**이다(a,b 와 b,a 는 같은 모순이다)."""
+        return frozenset(frozenset(pair) for pair in self.expected_contradiction_pairs)
+
+    @property
+    def is_violation(self) -> bool:
+        """기각되어야 하는 픽스처인가 — 검출률의 분모."""
+        return self.expected_verdict is Verdict.REJECT
+
+
+@dataclass(frozen=True)
+class L2Outcome:
+    """판정 픽스처 1건의 측정 결과.
+
+    `error` 가 있으면 **판정하지 못한 것**이다 — 통과로도 기각으로도 세지 않고 검출률·
+    오탐률의 분모에서 빠진다. 실패를 0 으로 접으면 리포트가 거짓말을 한다.
+    """
+
+    fixture_id: str
+    category: str
+    expected_verdict: Verdict
+    actual_verdict: Verdict | None
+    expected_reasons: tuple[RejectReason, ...]
+    actual_reasons: tuple[RejectReason, ...]
+    claim_total: int
+    claim_verdict_matched: int
+    contradiction_expected: int
+    contradiction_matched: int
+    contradiction_extra: int
+    input_tokens: int
+    output_tokens: int
+    error: str | None
+
+    @property
+    def judged(self) -> bool:
+        return self.error is None
+
+    @property
+    def verdict_matched(self) -> bool:
+        return self.expected_verdict is self.actual_verdict
+
+    @property
+    def reasons_matched(self) -> bool:
+        """사유 목록이 **순서까지** 같은가. 순서는 계약(`L2_REJECT_REASONS`)이 정한다."""
+        return self.judged and self.expected_reasons == self.actual_reasons
+
+
+@dataclass(frozen=True)
+class JudgeAccuracy:
+    """측정 3 의 집계. **확률 층이고 과금된다** — 재실행하면 값이 달라진다."""
+
+    total: int
+    error_total: int
+    violation_total: int
+    violation_detected: int
+    clean_total: int
+    clean_false_positive: int
+    reason_set_exact: int
+    claim_total: int
+    claim_verdict_matched: int
+    contradiction_expected_total: int
+    contradiction_matched_total: int
+    contradiction_extra_total: int
+    input_tokens_total: int
+    output_tokens_total: int
+    breakdown: tuple[ReasonBreakdown, ...]
+    outcomes: tuple[L2Outcome, ...]
+
+    @property
+    def judged_total(self) -> int:
+        """실제로 판정이 나온 픽스처 수 — 비율의 분모는 전부 이 안에서 나온다."""
+        return self.total - self.error_total
+
+    @property
+    def detection_rate(self) -> float | None:
+        """L2 검출률 — 기각되어야 할 픽스처 중 실제로 기각된 비율."""
+        if self.violation_total == 0:
+            return None
+        return self.violation_detected / self.violation_total
+
+    @property
+    def false_positive_rate(self) -> float | None:
+        """L2 오탐률 — 통과해야 할 픽스처 중 기각된 비율."""
+        if self.clean_total == 0:
+            return None
+        return self.clean_false_positive / self.clean_total
+
+    @property
+    def reason_set_exact_rate(self) -> float | None:
+        if self.judged_total == 0:
+            return None
+        return self.reason_set_exact / self.judged_total
+
+    @property
+    def claim_verdict_match_rate(self) -> float | None:
+        """claim 단위 판정 일치율 — 픽스처 단위 판정보다 촘촘한 보조 지표."""
+        if self.claim_total == 0:
+            return None
+        return self.claim_verdict_matched / self.claim_total
+
+    @property
+    def contradiction_recall(self) -> float | None:
+        if self.contradiction_expected_total == 0:
+            return None
+        return self.contradiction_matched_total / self.contradiction_expected_total
+
+    @property
+    def tokens_per_fixture(self) -> float | None:
+        if self.total == 0:
+            return None
+        return (self.input_tokens_total + self.output_tokens_total) / self.total
+
+
+def _claims_from_json(rows: Sequence[Any], *, fixture_id: str) -> tuple[Claim, ...]:
+    claims = tuple(
+        Claim(
+            text=str(row["text"]),
+            citation_ids=tuple(str(value) for value in row["citation_ids"]),
+        )
+        for row in rows
+    )
+    if not claims:
+        raise ValueError(f"{fixture_id}: claim 이 하나도 없다")
+    return claims
+
+
+def _expected_judgment_from_json(
+    raw: Mapping[str, Any], *, fixture_id: str, claims: Sequence[Claim], evidence_ids: set[str]
+) -> tuple[Verdict, tuple[RejectReason, ...], tuple[Verdict, ...], tuple[tuple[str, str], ...]]:
+    """기대 판정 라벨을 읽고 **자기 정합성**을 검사한다 — 라벨이 어긋나면 지표가 거짓말을 한다.
+
+    검사는 판정 모듈의 fail-closed 파싱(`judge._parse_judge_result`)과 같은 규칙이다:
+    사유는 L2 2종뿐, verdict ⇔ 사유, `unsupported_claim` ⇔ reject claim 존재,
+    `contradictory_evidence` 면 모순쌍 기록 필수, 모순 ID 는 수집 근거 안에서만 유효.
+    """
+    verdict = Verdict(raw["verdict"])
+    reasons: list[RejectReason] = []
+    for value in raw["reject_reasons"]:
+        reason = RejectReason(value)
+        if reason not in L2_REJECT_REASONS:
+            raise ValueError(f"{fixture_id}: L2 사유 2종 밖의 값이다: {value}")
+        reasons.append(reason)
+    ordered = tuple(reason for reason in L2_REJECT_REASONS if reason in set(reasons))
+    if tuple(reasons) != ordered:
+        raise ValueError(f"{fixture_id}: reject_reasons 는 계약 순서여야 한다 {ordered!r}")
+    if (verdict is Verdict.REJECT) != bool(ordered):
+        raise ValueError(f"{fixture_id}: reject 는 사유가 1개 이상, pass 는 사유가 없어야 한다")
+
+    judgments = list(raw["claim_judgments"])
+    if [str(item["claim_text"]) for item in judgments] != [claim.text for claim in claims]:
+        raise ValueError(f"{fixture_id}: claim_judgments 가 claim 전부와 순서까지 대응해야 한다")
+    claim_verdicts = tuple(Verdict(item["verdict"]) for item in judgments)
+    any_rejected = any(item is Verdict.REJECT for item in claim_verdicts)
+    if (RejectReason.UNSUPPORTED_CLAIM in ordered) != any_rejected:
+        raise ValueError(
+            f"{fixture_id}: unsupported_claim 은 reject 인 claim 이 있을 때만, 있으면 반드시 붙는다"
+        )
+
+    pairs: list[tuple[str, str]] = []
+    for item in raw.get("contradictions", ()):
+        id_a, id_b = str(item["evidence_id_a"]), str(item["evidence_id_b"])
+        if id_a == id_b:
+            raise ValueError(f"{fixture_id}: 같은 근거끼리의 모순 쌍이다: {id_a}")
+        for evidence_id in (id_a, id_b):
+            if evidence_id not in evidence_ids:
+                raise ValueError(f"{fixture_id}: 모순 쌍의 ID 가 근거 목록에 없다: {evidence_id}")
+        pairs.append((id_a, id_b))
+    if RejectReason.CONTRADICTORY_EVIDENCE in ordered and not pairs:
+        raise ValueError(f"{fixture_id}: contradictory_evidence 인데 모순 근거쌍 기록이 없다")
+    return verdict, ordered, claim_verdicts, tuple(pairs)
+
+
+def load_judge_fixtures(path: Path = DEFAULT_JUDGE_FIXTURES_PATH) -> tuple[JudgeFixture, ...]:
+    """판정 픽스처 셋을 읽는다. 라벨이 ground truth 이므로 어긋난 줄은 오류로 세운다."""
+    fixtures: list[JudgeFixture] = []
+    seen: set[str] = set()
+    for row in _read_jsonl(path):
+        fixture_id = str(row["id"])
+        if fixture_id in seen:
+            raise ValueError(f"판정 픽스처 ID 가 중복된다: {fixture_id}")
+        seen.add(fixture_id)
+        evidences = tuple(_evidence_from_json(item) for item in row["evidences"])
+        if not evidences:
+            raise ValueError(f"{fixture_id}: 근거가 하나도 없다")
+        evidence_ids = {item.id for item in evidences}
+        claims = _claims_from_json(row["claims"], fixture_id=fixture_id)
+        for claim in claims:
+            # L1 을 통과한 초안만 L2 입력이 된다 — 인용 없음·미해석 인용은 L1 이 잡는 결함이다.
+            if not claim.citation_ids:
+                raise ValueError(f"{fixture_id}: 인용이 없는 claim 은 L1 이 먼저 기각한다")
+            unknown = sorted(set(claim.citation_ids) - evidence_ids)
+            if unknown:
+                raise ValueError(f"{fixture_id}: 근거 목록에 없는 인용 ID 다: {unknown!r}")
+        verdict, reasons, claim_verdicts, pairs = _expected_judgment_from_json(
+            row["expected"], fixture_id=fixture_id, claims=claims, evidence_ids=evidence_ids
+        )
+        fixtures.append(
+            JudgeFixture(
+                id=fixture_id,
+                category=str(row["category"]),
+                note=str(row.get("note", "")),
+                evidences=evidences,
+                claims=claims,
+                expected_verdict=verdict,
+                expected_reasons=reasons,
+                expected_claim_verdicts=claim_verdicts,
+                expected_contradiction_pairs=pairs,
+            )
+        )
+    if not fixtures:
+        raise ValueError(f"판정 픽스처가 하나도 없다: {path}")
+    return tuple(fixtures)
+
+
+def evaluate_judge_fixture(*, fixture: JudgeFixture, judge: Judging) -> L2Outcome:
+    """판정 픽스처 1건을 **실제 판정기**에 흘려 라벨과 대조한다.
+
+    판정 실패(형식 불일치 소진·전송 오류)는 삼키지 않고 `error` 로 **기록**한다:
+    11건 중 1건의 실패로 과금된 나머지 측정이 통째로 사라지면 안 되고, 그렇다고 실패를
+    "통과"로 접으면 오탐률이 거짓이 된다. 자격 증명 부재(`MissingCredentialsError`)는
+    업무 판정이 아니라 설정 오류이므로 여기서 잡지 않고 그대로 올라간다.
+    """
+    expected_pairs = fixture.expected_contradictions
+    try:
+        outcome = judge.judge(draft=fixture.draft, evidence=fixture.evidences)
+    except (LLMFormatError, LLMCallError) as exc:
+        return L2Outcome(
+            fixture_id=fixture.id,
+            category=fixture.category,
+            expected_verdict=fixture.expected_verdict,
+            actual_verdict=None,
+            expected_reasons=fixture.expected_reasons,
+            actual_reasons=(),
+            claim_total=len(fixture.claims),
+            claim_verdict_matched=0,
+            contradiction_expected=len(expected_pairs),
+            contradiction_matched=0,
+            contradiction_extra=0,
+            input_tokens=exc.input_tokens,
+            output_tokens=exc.output_tokens,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    result = outcome.result
+    verdict_by_text = {item.claim_text: item.verdict for item in result.claim_judgments}
+    matched_claims = sum(
+        1
+        for claim, expected in zip(fixture.claims, fixture.expected_claim_verdicts, strict=True)
+        if verdict_by_text.get(claim.text) is expected
+    )
+    actual_pairs = frozenset(
+        frozenset((item.evidence_id_a, item.evidence_id_b)) for item in result.contradictions
+    )
+    return L2Outcome(
+        fixture_id=fixture.id,
+        category=fixture.category,
+        expected_verdict=fixture.expected_verdict,
+        actual_verdict=result.verdict,
+        expected_reasons=fixture.expected_reasons,
+        actual_reasons=result.reject_reasons,
+        claim_total=len(fixture.claims),
+        claim_verdict_matched=matched_claims,
+        contradiction_expected=len(expected_pairs),
+        contradiction_matched=len(expected_pairs & actual_pairs),
+        contradiction_extra=len(actual_pairs - expected_pairs),
+        input_tokens=outcome.input_tokens,
+        output_tokens=outcome.output_tokens,
+        error=None,
+    )
+
+
+def measure_judge_accuracy(
+    *,
+    fixtures: Sequence[JudgeFixture],
+    judge: Judging,
+    on_outcome: Callable[[L2Outcome], None] | None = None,
+) -> JudgeAccuracy:
+    """측정 3 — 판정 픽스처 전체를 **끝까지** 흘린다. 실제 판정 모델을 부르므로 과금된다."""
+    outcomes: list[L2Outcome] = []
+    for fixture in fixtures:
+        outcome = evaluate_judge_fixture(fixture=fixture, judge=judge)
+        outcomes.append(outcome)
+        if on_outcome is not None:
+            on_outcome(outcome)
+
+    judged = [outcome for outcome in outcomes if outcome.judged]
+    violations = [outcome for outcome in judged if outcome.expected_verdict is Verdict.REJECT]
+    cleans = [outcome for outcome in judged if outcome.expected_verdict is Verdict.PASS]
+    breakdown = tuple(
+        ReasonBreakdown(
+            reason=reason,
+            expected_count=sum(1 for o in judged if reason in o.expected_reasons),
+            detected_count=sum(
+                1 for o in judged if reason in o.expected_reasons and reason in o.actual_reasons
+            ),
+            spurious_count=sum(
+                1 for o in judged if reason not in o.expected_reasons and reason in o.actual_reasons
+            ),
+        )
+        for reason in L2_REJECT_REASONS
+    )
+    return JudgeAccuracy(
+        total=len(outcomes),
+        error_total=sum(1 for outcome in outcomes if not outcome.judged),
+        violation_total=len(violations),
+        violation_detected=sum(1 for o in violations if o.actual_verdict is Verdict.REJECT),
+        clean_total=len(cleans),
+        clean_false_positive=sum(1 for o in cleans if o.actual_verdict is Verdict.REJECT),
+        reason_set_exact=sum(1 for o in judged if o.reasons_matched),
+        claim_total=sum(outcome.claim_total for outcome in judged),
+        claim_verdict_matched=sum(outcome.claim_verdict_matched for outcome in judged),
+        contradiction_expected_total=sum(outcome.contradiction_expected for outcome in judged),
+        contradiction_matched_total=sum(outcome.contradiction_matched for outcome in judged),
+        contradiction_extra_total=sum(outcome.contradiction_extra for outcome in judged),
+        # 실패한 호출이 쓴 토큰도 실비용이므로 그대로 집계한다(판정 모듈의 규칙과 같다).
+        input_tokens_total=sum(outcome.input_tokens for outcome in outcomes),
+        output_tokens_total=sum(outcome.output_tokens for outcome in outcomes),
+        breakdown=breakdown,
+        outcomes=tuple(outcomes),
+    )
+
+
 # ══ 실행 조건 · 리포트 ══════════════════════════════════════════════════════
 
 
@@ -722,13 +1169,22 @@ class RunConditions:
     started_at: str
     generation: str
     embedding: str
+    #: 판정(L2) 모델 — 실제 모델인지 대역인지, 꺼져 있는지가 여기서 갈린다.
+    #: L2 꺼짐 기준선과 켜짐 실측은 산출물 모양이 같으므로, 구분은 이 항목이 들고 있다.
+    judge: str
     similarity_threshold: float
     top_k: int
     l1_fixture_count: int
     golden_case_count: int
+    judge_fixture_count: int
     l1_fixtures_path: str
     golden_set_path: str
+    judge_fixtures_path: str
     api_key_present: bool
+    #: 판정 키(ANTHROPIC) 존재 여부 — 값이 아니라 **존재 여부만** 남긴다.
+    judge_api_key_present: bool
+    #: L2 판정 스위치. 지연·토큰·일치율을 기존 실측과 비교할 때 반드시 함께 읽어야 한다.
+    l2_enabled: bool
     #: 측정 2 수치가 실제 모델로 낸 값인가. 대역이면 False 이고 리포트가 그렇게 적는다.
     measurement2_is_real: bool
 
@@ -763,7 +1219,8 @@ class MetricTarget:
 #: L1 두 지표는 **결정론 층**이라 100%/0% 를 목표로 박을 수 있다: 픽스처가 고정이고
 #: 게이트가 LLM 을 부르지 않으므로 달성은 재현되며, 미달은 곧 회귀다.
 #: 일치율은 확률 층이라 반복 실행마다 흔들린다 — 3회 실측 71.1%(70.0~73.3%) 위에
-#: 75% 를 둔 것은 **지금 닿지 않는 목표**이고, 그 간극이 다음 사이클(L2·임계값)의 몫이다.
+#: 75% 를 둔 것은 **지금 닿지 않는 목표**이고, 그 간극을 이번 사이클의 L2·임계값이 겨냥한다.
+#: 측정 3(L2 판정 단위 정확도)은 **여기 없다**: 목표치가 미확정이라 대조할 경계가 없다.
 TARGETS: Final[tuple[MetricTarget, ...]] = (
     MetricTarget(key="detection_rate", label="측정 1 구조적 오류 검출률", bound=1.0),
     MetricTarget(
@@ -800,9 +1257,14 @@ class EvaluationReport:
     conditions: RunConditions
     gate_accuracy: GateAccuracy
     pipeline: PipelineAgreement | SkippedMeasurement
+    judge_accuracy: JudgeAccuracy | SkippedMeasurement
 
     def measured(self) -> dict[str, float | None]:
-        """목표치 대조에 쓰는 실측값. 측정 2 미실행이면 일치율은 `None`."""
+        """목표치 대조에 쓰는 실측값. 측정 2 미실행이면 일치율은 `None`.
+
+        **측정 3 지표는 여기 들어오지 않는다** — 목표치가 미확정이라 대조할 경계가 없다.
+        수치는 측정 3 절이 그대로 싣고, 목표는 첫 실측 뒤에 확정한다.
+        """
         return {
             "detection_rate": self.gate_accuracy.detection_rate,
             "false_positive_rate": self.gate_accuracy.false_positive_rate,
@@ -841,8 +1303,16 @@ def build_report(
     conditions: RunConditions,
     gate_accuracy: GateAccuracy,
     pipeline: PipelineAgreement | SkippedMeasurement,
+    judge_accuracy: JudgeAccuracy | SkippedMeasurement,
 ) -> EvaluationReport:
-    return EvaluationReport(conditions=conditions, gate_accuracy=gate_accuracy, pipeline=pipeline)
+    """리포트를 조립한다. **측정 3 도 명시해야 한다** — 기본값으로 비워 두면 미실행이
+    조용히 "사유 없는 미실행"으로 찍힌다."""
+    return EvaluationReport(
+        conditions=conditions,
+        gate_accuracy=gate_accuracy,
+        pipeline=pipeline,
+        judge_accuracy=judge_accuracy,
+    )
 
 
 def utc_now_iso() -> str:
@@ -866,17 +1336,20 @@ _LIMITS: Final = """\
 
 - **L1 은 패턴형 PII 만 본다.** 전화번호·이메일·주민등록번호처럼 정규식으로 잡히는 값만
   검사한다. 이름·주소 등 비패턴형 개인정보는 정규식으로 잡을 수 없어 **L1 의 검사 대상이
-  아니며 L2 사이클로 이월**한다. 검출률 수치를 "개인정보 전반"으로 읽으면 안 된다.
-- **L1 은 내용의 진위를 보지 않는다.** citation 존재·무결성·스키마·PII 만 검사하므로,
-  근거를 인용했지만 내용이 근거와 어긋나는 답변은 이번 사이클에서 통과한다.
-- **측정 2 는 확률 층이다.** 초안 생성이 비결정론이므로 재실행하면 값이 달라진다.
-  측정 1 만 100% 재현된다.
+  아니다**(L2 도 근거-주장 정합만 보므로 대상이 아니다). 검출률 수치를 "개인정보 전반"으로
+  읽으면 안 된다.
+- **L1 은 내용의 진위를 보지 않는다.** citation 존재·무결성·스키마·PII 만 검사한다.
+  근거를 인용했지만 내용이 근거와 어긋나는 답변은 L1 이 아니라 **L2 의미 검증**이 잡는다 —
+  **L2 를 끈 실행에는 그 층이 통째로 없다**(실행 조건의 "L2 판정" 항목을 함께 읽어야 한다).
+- **측정 2·3 은 확률 층이다.** 초안 생성과 판정이 비결정론이므로 재실행하면 값이 달라지고
+  실제 모델 실행은 과금된다. 측정 1 만 100% 재현된다.
 - **측정 2 의 일치율에는 초안 전 인계 경로가 포함된다** — 근거 0건·주문번호 없음·주문
   없음으로 끝난 건도 분모에 들어가므로 **L1 판정만의 지표가 아니다**.
+- **측정 3 의 목표치는 미확정이다.** 첫 실측 뒤에 확정하므로 이 수치에는 달성·미달 판정이
+  붙지 않는다.
 
-## 이월 (L2 사이클)
+## 이월 (다음 사이클)
 
-- 내용상 hallucination율 (claim 단위 근거 대조)
 - L1 필터링에 의한 L2 호출 감소율
 - RAG 검색 품질 단계별 개선표
 - 비패턴형 개인정보(이름·주소) 검출
@@ -897,15 +1370,20 @@ def render_markdown(report: EvaluationReport) -> str:
         f"- 실행 시각(UTC): `{conditions.started_at}`",
         f"- 생성 LLM: {conditions.generation}",
         f"- 임베딩: {conditions.embedding}",
+        f"- L2 판정: {'켜짐' if conditions.l2_enabled else '꺼짐'} / 판정 모델: {conditions.judge}",
         f"- 유사도 임계값: {conditions.similarity_threshold} / top k: {conditions.top_k}",
         f"- L1 픽스처: {conditions.l1_fixture_count}건 (`{conditions.l1_fixtures_path}`)",
         f"- 골든셋: {conditions.golden_case_count}건 (`{conditions.golden_set_path}`)",
+        f"- 판정 픽스처: {conditions.judge_fixture_count}건 (`{conditions.judge_fixtures_path}`)",
         f"- OPENAI_API_KEY 설정 여부: {'설정됨' if conditions.api_key_present else '없음'}",
+        f"- ANTHROPIC_API_KEY 설정 여부: "
+        f"{'설정됨' if conditions.judge_api_key_present else '없음'}",
         "",
     ]
     lines.extend(_render_targets(report))
     lines.extend(_render_measurement_one(report.gate_accuracy))
     lines.extend(_render_measurement_two(report.pipeline, conditions))
+    lines.extend(_render_measurement_three(report.judge_accuracy, conditions))
     lines.append(_LIMITS)
     return "\n".join(lines)
 
@@ -1019,20 +1497,14 @@ def _render_measurement_two(
             f"p95: {_int(pipeline.latency_p95_ms)} ms "
             "(파이프라인 `run` 의 벽시계 시간 — 처리 기록 저장은 포함하지 않는다)",
             "",
-            "### 문의 1건당 토큰 (생성·임베딩 구분)",
+            "### 문의 1건당 토큰 (생성·임베딩·판정 구분)",
+            "",
+            "provider 와 단가가 다른 계열을 합산하면 건당 비용 지표가 무너진다 — 세 계열은",
+            "끝까지 분리해서 센다. L2 미실행이면 판정 계열은 0 이다.",
             "",
             "| 계열 | 합계 | 건당 |",
             "| --- | ---: | ---: |",
-            f"| 생성 입력 | {pipeline.input_tokens_total} | "
-            f"{_num(pipeline.input_tokens_total / pipeline.total if pipeline.total else None)} |",
-            f"| 생성 출력 | {pipeline.output_tokens_total} | "
-            f"{_num(pipeline.output_tokens_total / pipeline.total if pipeline.total else None)} |",
-            f"| 생성 소계 | {pipeline.input_tokens_total + pipeline.output_tokens_total} | "
-            f"{_num(pipeline.generation_tokens_per_inquiry)} |",
-            f"| 임베딩 | {pipeline.embedding_tokens_total} | "
-            f"{_num(pipeline.embedding_tokens_per_inquiry)} |",
-            f"| **합산** | {_grand_total(pipeline)} | "
-            f"**{_num(pipeline.total_tokens_per_inquiry)}** |",
+            *_token_rows(pipeline),
             "",
             "### 종결 분포",
             "",
@@ -1055,10 +1527,122 @@ def _render_measurement_two(
     return lines
 
 
-def _grand_total(pipeline: PipelineAgreement) -> int:
-    return (
-        pipeline.input_tokens_total + pipeline.output_tokens_total + pipeline.embedding_tokens_total
+def _token_rows(pipeline: PipelineAgreement) -> list[str]:
+    """토큰 표의 본문 — 계열 셋(생성·임베딩·판정)을 끝까지 분리해서 적는다."""
+
+    def per_inquiry(total: int) -> float | None:
+        return None if pipeline.total == 0 else total / pipeline.total
+
+    generation_total = pipeline.input_tokens_total + pipeline.output_tokens_total
+    judge_total = pipeline.judge_input_tokens_total + pipeline.judge_output_tokens_total
+    rows: list[tuple[str, int, float | None]] = [
+        ("생성 입력", pipeline.input_tokens_total, per_inquiry(pipeline.input_tokens_total)),
+        ("생성 출력", pipeline.output_tokens_total, per_inquiry(pipeline.output_tokens_total)),
+        ("생성 소계", generation_total, pipeline.generation_tokens_per_inquiry),
+        ("임베딩", pipeline.embedding_tokens_total, pipeline.embedding_tokens_per_inquiry),
+        (
+            "판정 입력",
+            pipeline.judge_input_tokens_total,
+            per_inquiry(pipeline.judge_input_tokens_total),
+        ),
+        (
+            "판정 출력",
+            pipeline.judge_output_tokens_total,
+            per_inquiry(pipeline.judge_output_tokens_total),
+        ),
+        ("판정 소계", judge_total, pipeline.judge_tokens_per_inquiry),
+    ]
+    lines = [f"| {label} | {total} | {_num(value)} |" for label, total, value in rows]
+    lines.append(
+        f"| **합산** | {_grand_total(pipeline)} | **{_num(pipeline.total_tokens_per_inquiry)}** |"
     )
+    return lines
+
+
+def _grand_total(pipeline: PipelineAgreement) -> int:
+    """세 계열 합산 — 판정 계열이 빠지면 L2 켜짐 실측의 건당 비용이 실제보다 작아진다."""
+    return (
+        pipeline.input_tokens_total
+        + pipeline.output_tokens_total
+        + pipeline.embedding_tokens_total
+        + pipeline.judge_input_tokens_total
+        + pipeline.judge_output_tokens_total
+    )
+
+
+def _render_measurement_three(
+    accuracy: JudgeAccuracy | SkippedMeasurement, conditions: RunConditions
+) -> list[str]:
+    lines = ["## 측정 3 — L2 판정 단위 정확도 (확률 층)", ""]
+    if isinstance(accuracy, SkippedMeasurement):
+        lines.extend(
+            [
+                f"**미실행 (사유: {accuracy.reason})**",
+                "",
+                "수치를 0 이나 빈 값으로 채우지 않는다 — 미실행은 미실행으로 남긴다.",
+                "",
+            ]
+        )
+        return lines
+
+    failed_note = f" / 판정 실패 {accuracy.error_total} — 분모 제외" if accuracy.error_total else ""
+    lines.extend(
+        [
+            "고정 claim 집합을 **판정기에 직접** 흘려 기대 판정과 대조했다(무엇으로 판정했는지는",
+            "아래 판정 모델 항목이 들고 있다). 측정 1 과 같은 모양의 수치지만 실제 모델 실행은",
+            "**확률 층이고 과금된다** — 재실행하면 값이 달라진다.",
+            "목표치: **미확정** (첫 실측 뒤에 확정한다 — 미측정을 미달로도 달성으로도 적지",
+            "않는 규칙과 같은 이유로, 경계가 없는 지표에 판정을 붙이지 않는다).",
+            "",
+            f"- 판정 모델: {conditions.judge}",
+            f"- 픽스처 총수: **{accuracy.total}건** "
+            f"(기각 기대 {accuracy.violation_total} / 통과 기대 {accuracy.clean_total}"
+            f"{failed_note})",
+            f"- **L2 검출률: {_pct(accuracy.detection_rate)}** "
+            f"({accuracy.violation_detected}/{accuracy.violation_total})",
+            f"- **L2 오탐률: {_pct(accuracy.false_positive_rate)}** "
+            f"({accuracy.clean_false_positive}/{accuracy.clean_total})",
+            f"- 사유 목록까지 정확히 일치: {_pct(accuracy.reason_set_exact_rate)} "
+            f"({accuracy.reason_set_exact}/{accuracy.judged_total})",
+            f"- claim 단위 판정 일치: {_pct(accuracy.claim_verdict_match_rate)} "
+            f"({accuracy.claim_verdict_matched}/{accuracy.claim_total})",
+            f"- 모순 근거쌍: 기대 {accuracy.contradiction_expected_total}건 중 "
+            f"{accuracy.contradiction_matched_total}건 검출 "
+            f"(기대 밖 검출 {accuracy.contradiction_extra_total}건)",
+            f"- 판정 토큰: 입력 {accuracy.input_tokens_total} / "
+            f"출력 {accuracy.output_tokens_total} "
+            f"(픽스처당 {_num(accuracy.tokens_per_fixture)})",
+            "",
+            "### 사유 2종별 내역",
+            "",
+            "| 사유 | 기대 픽스처 | 검출 | 검출률 | 오발화(기대하지 않은 발화) |",
+            "| --- | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    lines.extend(
+        f"| `{item.reason.value}` | {item.expected_count} | {item.detected_count} | "
+        f"{_pct(item.detection_rate)} | {item.spurious_count} |"
+        for item in accuracy.breakdown
+    )
+    lines.append("")
+
+    failures = [outcome for outcome in accuracy.outcomes if not outcome.reasons_matched]
+    if failures:
+        lines.extend(["### 기대와 어긋난 픽스처", ""])
+        lines.extend(
+            f"- `{outcome.fixture_id}` ({outcome.category}): "
+            f"기대 {outcome.expected_verdict.value}{_reason_list(outcome.expected_reasons)} → "
+            + (
+                f"판정 실패({outcome.error})"
+                if outcome.actual_verdict is None
+                else f"실제 {outcome.actual_verdict.value}{_reason_list(outcome.actual_reasons)}"
+            )
+            for outcome in failures
+        )
+    else:
+        lines.append("모든 픽스처가 기대 판정·기대 사유 목록과 일치했다.")
+    lines.append("")
+    return lines
 
 
 def _counts(counts: Mapping[str, int]) -> str:
@@ -1093,13 +1677,18 @@ def report_to_json(report: EvaluationReport) -> dict[str, Any]:
             "started_at": conditions.started_at,
             "generation": conditions.generation,
             "embedding": conditions.embedding,
+            "judge": conditions.judge,
+            "l2_enabled": conditions.l2_enabled,
             "similarity_threshold": conditions.similarity_threshold,
             "top_k": conditions.top_k,
             "l1_fixture_count": conditions.l1_fixture_count,
             "golden_case_count": conditions.golden_case_count,
+            "judge_fixture_count": conditions.judge_fixture_count,
             "l1_fixtures_path": conditions.l1_fixtures_path,
             "golden_set_path": conditions.golden_set_path,
+            "judge_fixtures_path": conditions.judge_fixtures_path,
             "api_key_present": conditions.api_key_present,
+            "judge_api_key_present": conditions.judge_api_key_present,
             "measurement2_is_real": conditions.measurement2_is_real,
         },
         "measurement_1_l1_gate_accuracy": {
@@ -1137,18 +1726,19 @@ def report_to_json(report: EvaluationReport) -> dict[str, Any]:
             ],
         },
         "limits": {
-            "pii": "L1 은 패턴형 PII 만 검사한다. 이름·주소 등 비패턴형은 L2 사이클로 이월.",
-            "content": "L1 은 내용의 진위를 검사하지 않는다 (L2 이월).",
+            "pii": "L1 은 패턴형 PII 만 검사한다. 이름·주소 등 비패턴형은 어느 층의 대상도 아니다.",
+            "content": "L1 은 내용의 진위를 검사하지 않는다 — 그 층은 L2 이고, 끄면 없다.",
             "measurement_2": "확률 층이라 재실행하면 값이 달라진다. 일치율에 초안 전 인계 포함.",
+            "measurement_3": "확률 층이고 과금된다. 목표치는 미확정이라 달성 판정이 없다.",
         },
-        "deferred_to_l2": [
-            "내용상 hallucination율",
+        "deferred": [
             "L1 필터링에 의한 L2 호출 감소율",
             "RAG 검색 품질 단계별 개선표",
             "비패턴형 개인정보(이름·주소) 검출",
         ],
     }
     payload["measurement_2_pipeline_agreement"] = _measurement_two_json(report.pipeline)
+    payload["measurement_3_l2_judge_accuracy"] = _measurement_three_json(report.judge_accuracy)
     return payload
 
 
@@ -1173,8 +1763,11 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
             "generation_input_total": pipeline.input_tokens_total,
             "generation_output_total": pipeline.output_tokens_total,
             "embedding_total": pipeline.embedding_tokens_total,
+            "judge_input_total": pipeline.judge_input_tokens_total,
+            "judge_output_total": pipeline.judge_output_tokens_total,
             "generation_per_inquiry": pipeline.generation_tokens_per_inquiry,
             "embedding_per_inquiry": pipeline.embedding_tokens_per_inquiry,
+            "judge_per_inquiry": pipeline.judge_tokens_per_inquiry,
             "total_per_inquiry": pipeline.total_tokens_per_inquiry,
         },
         "status_counts": dict(pipeline.status_counts),
@@ -1194,11 +1787,81 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
                 "input_tokens": outcome.input_tokens,
                 "output_tokens": outcome.output_tokens,
                 "embedding_tokens": outcome.embedding_tokens,
+                "judge_input_tokens": outcome.judge_input_tokens,
+                "judge_output_tokens": outcome.judge_output_tokens,
                 "matched": outcome.matched,
                 "mismatches": list(outcome.mismatches),
                 "error": outcome.error,
             }
             for outcome in pipeline.outcomes
+        ],
+    }
+
+
+def _measurement_three_json(accuracy: JudgeAccuracy | SkippedMeasurement) -> dict[str, Any]:
+    if isinstance(accuracy, SkippedMeasurement):
+        return {"executed": False, "skip_reason": accuracy.reason}
+    return {
+        "executed": True,
+        "deterministic": False,
+        "billed": True,
+        # 목표치는 첫 실측 뒤에 확정한다 — 경계가 없으므로 달성 여부도 없다(`null`).
+        "target": None,
+        "target_note": "미확정 — 첫 실측 후 확정",
+        "total": accuracy.total,
+        "judged_total": accuracy.judged_total,
+        "error_total": accuracy.error_total,
+        "violation_total": accuracy.violation_total,
+        "violation_detected": accuracy.violation_detected,
+        "detection_rate": accuracy.detection_rate,
+        "clean_total": accuracy.clean_total,
+        "clean_false_positive": accuracy.clean_false_positive,
+        "false_positive_rate": accuracy.false_positive_rate,
+        "reason_set_exact": accuracy.reason_set_exact,
+        "reason_set_exact_rate": accuracy.reason_set_exact_rate,
+        "claim_total": accuracy.claim_total,
+        "claim_verdict_matched": accuracy.claim_verdict_matched,
+        "claim_verdict_match_rate": accuracy.claim_verdict_match_rate,
+        "contradiction_expected_total": accuracy.contradiction_expected_total,
+        "contradiction_matched_total": accuracy.contradiction_matched_total,
+        "contradiction_extra_total": accuracy.contradiction_extra_total,
+        "contradiction_recall": accuracy.contradiction_recall,
+        "tokens": {
+            "input_total": accuracy.input_tokens_total,
+            "output_total": accuracy.output_tokens_total,
+            "per_fixture": accuracy.tokens_per_fixture,
+        },
+        "reason_breakdown": [
+            {
+                "reason": item.reason.value,
+                "expected_count": item.expected_count,
+                "detected_count": item.detected_count,
+                "detection_rate": item.detection_rate,
+                "spurious_count": item.spurious_count,
+            }
+            for item in accuracy.breakdown
+        ],
+        "outcomes": [
+            {
+                "fixture_id": outcome.fixture_id,
+                "category": outcome.category,
+                "expected_verdict": outcome.expected_verdict.value,
+                "actual_verdict": (
+                    None if outcome.actual_verdict is None else outcome.actual_verdict.value
+                ),
+                "expected_reasons": [reason.value for reason in outcome.expected_reasons],
+                "actual_reasons": [reason.value for reason in outcome.actual_reasons],
+                "claim_total": outcome.claim_total,
+                "claim_verdict_matched": outcome.claim_verdict_matched,
+                "contradiction_expected": outcome.contradiction_expected,
+                "contradiction_matched": outcome.contradiction_matched,
+                "contradiction_extra": outcome.contradiction_extra,
+                "input_tokens": outcome.input_tokens,
+                "output_tokens": outcome.output_tokens,
+                "matched": outcome.reasons_matched,
+                "error": outcome.error,
+            }
+            for outcome in accuracy.outcomes
         ],
     }
 
