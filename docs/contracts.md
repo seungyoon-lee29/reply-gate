@@ -28,14 +28,15 @@ HTTP 엔드포인트 4개가 외부 표면의 전부다. 인증은 없다.
 | `content` | ✅ | 빈 문자열·공백만은 거부 |
 | `order_no` | — | 주면 `ORD-YYYYMMDD-NNNN` 형식이어야 하고 날짜가 실재해야 한다. 빈 문자열·공백은 **미입력으로 취급**(HTML 폼이 빈 필드를 항상 보내기 때문) |
 
-**응답 200**
+**응답 200** — 아래는 **L1 기각 → 재생성 → L2 기각**으로 인계된 장면이다(`answered` 면
+`answer`/`claims` 가 채워지고 `escalation_reason` 이 `null` 이다).
 
 ```json
 {
   "inquiry_id": "58276c6f-870f-46ea-9675-467dace9f115",
-  "status": "answered",
-  "answer": "확정 답변 텍스트 — escalated 면 null",
-  "claims": [ { "text": "답변 문장 1개", "citation_ids": ["policy:support:4-1"] } ],
+  "status": "escalated",
+  "answer": null,
+  "claims": [],
   "citations": [ { "id": "policy:support:4-1", "source": "policy", "content": "조항 텍스트 또는 쿼리+결과 요약" } ],
   "attempts": [
     { "verdict": "reject", "reject_reasons": ["missing_citation"],
@@ -59,6 +60,11 @@ HTTP 엔드포인트 4개가 외부 표면의 전부다. 인증은 없다.
 ```
 
 - `status` — `answered` | `escalated`
+- `answer` / `claims` — `answered` 면 확정 답변 텍스트와 claim 배열
+  (`{text, citation_ids}` — 아래 "답변 계약" 절과 같은 모양)이 실리고, `escalated` 면
+  각각 `null` 과 `[]` 이다. **이 셋은 함께 움직인다** — `answered` ⟺ `answer != null` ⟺
+  `escalation_reason == null` 이고, DB 도 같은 불변식을 CHECK 로 건다
+  (`inquiries_terminal_shape`)
 - `attempts` — 최대 2건. 초안 전 인계면 `[]`
 - `escalation_reason` — `no_evidence` | `missing_order_ref` | `order_not_found` | `sql_failed`
   | `llm_call_failed` | `rejected_twice`. `answered` 면 `null`
@@ -88,9 +94,15 @@ pass 이고 **L2 가 실행됐다면** L2 도 pass. 층별 내역은 두 키로 
 - **`l2: null` 은 "통과"가 아니라 "판정이 없었다"** 이다. 특히 ③ 판정 호출 실패 시도는
   층 결합 정의상 **종합 `verdict` 가 `pass` 인데 문의는 인계된다** — 그 시도의 진실은
   `escalation_reason: "llm_call_failed"` 가 들고 있다. 종합 verdict 만 보고 통과로 읽으면 안 된다.
-- `l2.claim_judgments` 는 초안의 claim **전부**(통과한 claim 포함)를 순서대로 담는다.
-  각 항목은 `{claim_text, verdict, explanation}` 이고, `claim_text` 는 답변 계약의 claim 에
-  별도 ID 가 없어 text 로 가리키는 참조다.
+- `l2.claim_judgments` 는 **그 시도 초안의** claim **전부**(통과한 claim 포함)와 **1:1 로
+  대응한다**. 각 항목은 `{claim_text, verdict, explanation}` 이고, `claim_text` 는 답변
+  계약의 claim 에 별도 ID 가 없어 text 로 가리키는 참조다.
+  **짝짓기는 `claim_text` 로 한다 — 배열 위치는 계약이 아니다.** fail-closed 검증기가
+  강제하는 것은 초안 claim 집합과의 완전 대응과 중복 없음까지이고(`judge._parse_claim_judgments`),
+  배열 순서는 프롬프트가 요청할 뿐 거부 사유가 아니다. 위치로 짝지으면 "어느 문장이 왜
+  기각됐는지"가 다른 claim 에 붙을 수 있다.
+- 인계된 문의는 최상위 `claims` 가 `[]` 여도 이 배열은 **기각된 초안의** claim 을 담는다 —
+  두 배열을 서로 짝지으면 안 된다.
 - `l2.contradictions` 는 **근거쌍 단위** 기록 `{evidence_id_a, evidence_id_b, explanation}` 이다.
   **기록됐다고 곧 기각은 아니다** — 초안이 모순을 명시하고 두 기준을 모두 안내했으면
   `reject_reasons` 에 오르지 않고 기록만 남는다.
