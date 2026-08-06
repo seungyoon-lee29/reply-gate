@@ -2,7 +2,7 @@
 
 이 모듈은 docs/contracts.md "답변 계약" 과 docs/business-rules.md 의
 "L1 게이트 판정 규칙"·"상태 전이" 를 코드로 옮긴 것이다.
-**다음 사이클의 L2(claim 단위 LLM judge)가 그대로 이어받는 계약**이므로, 편의로 구조를 바꾸지
+**L2(claim 단위 LLM judge)가 그대로 이어받는 계약**이므로, 편의로 구조를 바꾸지
 않는다(바꾸려면 사용자 승인).
 
 여러 모듈이 공유하는 정의만 둔다 — 초안 생성·게이트·근거 수집의 구현 세부는 각 모듈 소유다.
@@ -15,15 +15,19 @@ from enum import StrEnum
 from typing import Any
 
 __all__ = [
+    "COMBINED_REASON_ORDER",
     "DRAFT_JSON_SCHEMA",
     "Claim",
+    "ClaimJudgment",
     "Draft",
     "EscalationReason",
     "Evidence",
+    "EvidenceContradiction",
     "EvidenceSource",
     "GateResult",
     "InquiryStatus",
     "IntentSource",
+    "JudgeResult",
     "RejectReason",
     "Verdict",
     "policy_evidence_id",
@@ -97,16 +101,44 @@ class Draft:
 
 
 class RejectReason(StrEnum):
-    """L1 기각 사유. docs/business-rules.md "L1 게이트 판정 규칙" 의 enum 이 전부다."""
+    """기각 사유 — L1 4종 + L2 2종이 전부다.
 
+    L1 4종은 docs/business-rules.md "L1 게이트 판정 규칙" 의 enum 그대로이고 L1 의 전부다.
+    L2 2종은 claim 단위 의미 검증의 전부다:
+
+    * `unsupported_claim` — 어떤 claim 이 인용한 근거로 뒷받침되지 않는다.
+    * `contradictory_evidence` — 수집 근거에 서로 모순되는 쌍이 있고, 초안이 그 모순을
+      명시하지 않은 채 해당 근거를 딛고 답한다.
+    """
+
+    # L1 — 기계 검사 (gate.py)
     SCHEMA_VIOLATION = "schema_violation"
     MISSING_CITATION = "missing_citation"
     INVALID_CITATION = "invalid_citation"
     PII_DETECTED = "pii_detected"
+    # L2 — claim 단위 의미 검증
+    UNSUPPORTED_CLAIM = "unsupported_claim"
+    CONTRADICTORY_EVIDENCE = "contradictory_evidence"
+
+
+#: 종합 사유(= L1 사유와 L2 사유의 합집합)의 고정 순서 — L1 4종 먼저, L2 2종 뒤. 각 층 안 순서도
+#: 고정이다. 한 시도 안에서 두 층 사유는 공존하지 않지만(L2 는 L1 pass 시에만 실행),
+#: 시도 간 평탄화·집계가 결정론이려면 교차층 순서까지 계약이어야 한다.
+#:
+#: L1 접두 4종은 `gate.REASON_ORDER` 와 일치해야 한다 — contracts 는 gate 를 import 할 수
+#: 없으므로(순환) 정합은 테스트가 고정한다(tests/test_contracts.py).
+COMBINED_REASON_ORDER: tuple[RejectReason, ...] = (
+    RejectReason.SCHEMA_VIOLATION,
+    RejectReason.MISSING_CITATION,
+    RejectReason.INVALID_CITATION,
+    RejectReason.PII_DETECTED,
+    RejectReason.UNSUPPORTED_CLAIM,
+    RejectReason.CONTRADICTORY_EVIDENCE,
+)
 
 
 class Verdict(StrEnum):
-    """시도(attempt) 1건의 L1 판정."""
+    """판정값. 시도(attempt) 1건의 L1·L2 판정과 L2 의 claim 단위 판정이 공유한다."""
 
     PASS = "pass"
     REJECT = "reject"
@@ -118,6 +150,47 @@ class GateResult:
 
     verdict: Verdict
     reject_reasons: tuple[RejectReason, ...] = ()
+
+
+@dataclass(frozen=True)
+class ClaimJudgment:
+    """claim 1개에 대한 L2 판정.
+
+    `claim_text` 는 판정 대상 claim 의 text 참조다 — 답변 계약의 claim 은 별도 ID 가 없으므로
+    text 로 어느 claim 인지 가리킨다. `explanation` 은 판정 사유 설명(한국어 산문)이다.
+    """
+
+    claim_text: str
+    verdict: Verdict
+    explanation: str
+
+
+@dataclass(frozen=True)
+class EvidenceContradiction:
+    """수집 근거 중 서로 모순되는 근거쌍 1건.
+
+    모순은 **근거쌍 단위**로 기록한다 — 특정 claim 에 귀속되지 않을 수 있으므로
+    claim 판정 배열(`JudgeResult.claim_judgments`)과 별도다.
+    """
+
+    evidence_id_a: str
+    evidence_id_b: str
+    explanation: str
+
+
+@dataclass(frozen=True)
+class JudgeResult:
+    """L2 판정 결과 — `GateResult` 와 같은 골격(verdict + 사유 목록)에 L2 세부를 더한다.
+
+    `reject_reasons` 에는 L2 2종(`unsupported_claim`·`contradictory_evidence`)만 실린다.
+    `claim_judgments` 는 claim 단위 판정 전부(통과한 claim 포함)이고, `contradictions` 는
+    근거쌍 단위 모순 기록이다.
+    """
+
+    verdict: Verdict
+    reject_reasons: tuple[RejectReason, ...] = ()
+    claim_judgments: tuple[ClaimJudgment, ...] = ()
+    contradictions: tuple[EvidenceContradiction, ...] = ()
 
 
 class EscalationReason(StrEnum):
