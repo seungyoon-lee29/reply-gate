@@ -14,6 +14,7 @@
 ├── CLAUDE.md / AGENTS.md          → 이 파일 (두 파일 내용 동일)
 ├── README.md                      → 외부 공개용 전시 문서
 ├── docs/
+│   ├── problem.md                 → 문제정의: 무엇을 왜 만드는가, 성공 판정 기준, 범위
 │   ├── architecture.md            → 구성요소와 데이터 흐름
 │   ├── business-rules.md          → 도메인 규칙·상태 전이·판정 규칙
 │   ├── security.md                → text-to-SQL 안전장치 3층, PII 정책, 비밀 관리
@@ -54,10 +55,15 @@
 
 기본: `docs/standards.md` → `docs/engineering-notes.md` → 손댈 모듈의 `AGENTS.md`.
 
+**이 프로젝트가 처음이거나, 어떤 변경이 제품의 주장과 어긋나는지 판단이 서지 않으면
+`docs/problem.md` 를 먼저 읽는다.** 무엇을 왜 만드는지, 성공을 무엇으로 판정하는지,
+무엇이 명시적으로 범위 밖인지가 거기 있다.
+
 작업 종류별로 먼저 볼 곳:
 
 | 손대려는 것 | 먼저 읽을 것 |
 |---|---|
+| 범위·목표·측정 기준 자체 | `docs/problem.md` + `docs/tracking/decisions/0001`·`0006` |
 | SQL 검증기(`sql_guard.py`) | `docs/engineering-notes.md` 의 "실제로 뚫렸던 경로" 3건 + `docs/tracking/decisions/0005` |
 | L1 게이트(`gate.py`) | `docs/business-rules.md` 의 PII 규칙 + `docs/engineering-notes.md` 의 오탐 사례 |
 | L2 판정(`judge.py`) | `docs/business-rules.md` 의 "L2 판정 규칙" + `docs/tracking/decisions/0007` |
