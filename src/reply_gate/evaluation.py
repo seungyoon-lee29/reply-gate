@@ -439,6 +439,13 @@ def measure_gate_accuracy(fixtures: Sequence[L1Fixture]) -> GateAccuracy:
 
 # ══ 측정 2 — 파이프라인 판정 일치율 (end-to-end, 확률 층) ═══════════════════
 
+#: 미끼 범주 — 기각 재현율의 분모(결정 0008). 라벨(`expect_reject`)이 아니라 범주다.
+BAIT_CATEGORY = "reject_bait"
+
+#: 골든셋이 쓰는 범주 전체 — 로드 시 검증한다. 범주 오타는 예외 없이 재현율 분모를
+#: 비워 지표를 조용히 소멸시키기 때문이다.
+GOLDEN_CATEGORIES = frozenset({"normal", BAIT_CATEGORY, "no_evidence", "escalation"})
+
 
 @dataclass(frozen=True)
 class ExpectedOutcomeSet:
@@ -446,7 +453,8 @@ class ExpectedOutcomeSet:
 
     * `statuses` — 허용 최종 상태 집합(비어 있을 수 없다).
     * `escalation_reasons` — `escalated` 로 끝났을 때 허용되는 인계 사유 집합.
-    * `expect_reject` — 시도 중 **최소 1건**이 기각이어야 하는가(기각 재현율의 분모).
+    * `expect_reject` — 시도 중 **최소 1건**이 기각이어야 하는가. 케이스 단위 요구일 뿐
+      기각 재현율의 분모가 아니다 — 분모는 `category == "reject_bait"` 다(결정 0008).
     * `forbidden_reject_reasons` — 어떤 시도에서도 나오면 안 되는 사유(오탐 감시).
     """
 
@@ -535,9 +543,11 @@ class PipelineAgreement:
 
     @property
     def bait_reject_recall(self) -> float | None:
-        """기각 유발 문의의 기각 재현율 — 데모 신뢰성의 근거 수치.
+        """미끼(`reject_bait`) 문의의 기각 재현율 — 목표 없는 관측값(결정 0006·0008).
 
-        정의는 **시도 중 최소 1건 기각, 층 무관**이다(L2 도입으로 바뀌지 않는다).
+        분자의 정의는 **시도 중 최소 1건 기각, 층 무관**이다(L2 도입으로 바뀌지 않는다).
+        분모는 라벨(`expect_reject`)이 아니라 범주다 — 라벨을 판정 규칙에 정렬하면서
+        (결정 0008) 기각 요구는 해제했지만 관측은 유지하기 때문이다.
         """
         return None if self.bait_total == 0 else self.bait_reject_reproduced / self.bait_total
 
@@ -602,6 +612,9 @@ def load_golden_set(path: Path = DEFAULT_GOLDEN_SET_PATH) -> tuple[GoldenCase, .
             raise ValueError(f"골든셋 ID 가 중복된다: {case_id}")
         seen.add(case_id)
         order_no = row.get("order_no")
+        category = str(row["category"])
+        if category not in GOLDEN_CATEGORIES:
+            raise ValueError(f"{case_id}: 알 수 없는 범주다: {category}")
         try:
             expected = _expected_from_json(row["expected"])
         except ValueError as exc:
@@ -609,7 +622,7 @@ def load_golden_set(path: Path = DEFAULT_GOLDEN_SET_PATH) -> tuple[GoldenCase, .
         cases.append(
             GoldenCase(
                 id=case_id,
-                category=str(row["category"]),
+                category=category,
                 order_no=None if order_no is None else str(order_no),
                 content=str(row["content"]),
                 expected=expected,
@@ -761,7 +774,7 @@ def measure_pipeline_agreement(
     bait = [
         (case, outcome)
         for case, outcome in zip(cases, outcomes, strict=True)
-        if case.expected.expect_reject
+        if case.category == BAIT_CATEGORY
     ]
     watch = [
         (case, outcome)
@@ -1511,8 +1524,9 @@ def _render_measurement_two(
             f"- **허용 결과 집합 대비 일치율: {_pct(pipeline.match_rate)}** "
             f"({pipeline.matched}/{pipeline.total}) "
             "— **초안 전 인계 경로 포함이며 L1 판정만의 지표가 아니다.**",
-            f"- **기각 유발 문의의 기각 재현율: {_pct(pipeline.bait_reject_recall)}** "
-            f"({pipeline.bait_reject_reproduced}/{pipeline.bait_total})",
+            f"- **미끼 문의(reject_bait)의 기각 재현율: {_pct(pipeline.bait_reject_recall)}** "
+            f"({pipeline.bait_reject_reproduced}/{pipeline.bait_total}) "
+            "— 목표 없는 관측값이다(결정 0006·0008).",
             f"- 정상 PII 에코 감시 케이스: {pipeline.forbidden_watch_total}건 중 "
             f"금지 사유 발화 {pipeline.forbidden_violations}건",
             f"- 지연 p50: {_int(pipeline.latency_p50_ms)} ms / "

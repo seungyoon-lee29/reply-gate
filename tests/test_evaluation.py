@@ -144,10 +144,11 @@ def _case(
     reasons: tuple[EscalationReason, ...] = (),
     expect_reject: bool = False,
     forbidden: tuple[RejectReason, ...] = (),
+    category: str = "normal",
 ) -> GoldenCase:
     return GoldenCase(
         id=case_id,
-        category="normal",
+        category=category,
         order_no=None,
         content="문의",
         expected=ExpectedOutcomeSet(
@@ -387,13 +388,15 @@ def test_골든셋은_30건이고_네_범주를_섞어_담는다() -> None:
     assert categories == {"normal", "reject_bait", "no_evidence", "escalation"}
 
 
-def test_기각_유발_문의만_기각을_기대한다() -> None:
-    """`expect_reject` 는 기각 재현율의 분모다 — 범주와 어긋나면 지표가 흐려진다."""
-    baits = [case for case in GOLDEN if case.expected.expect_reject]
-    assert {case.id for case in baits} == {
-        case.id for case in GOLDEN if case.category == "reject_bait"
-    }
-    assert len(baits) >= 5
+def test_미끼_라벨은_기각을_요구하지_않는다() -> None:
+    """결정 0008 회귀 방지 — 재현율 분모는 범주(`reject_bait`)이고 라벨이 아니다.
+
+    정면 조항을 딛은 "없다" 안내는 결정 0007 이 통과시키기로 정한 쪽이므로, 미끼 라벨이
+    기각을 요구하면 채점표가 설계와 어긋난다. 기각은 허용하되 요구하지 않는다.
+    """
+    baits = [case for case in GOLDEN if case.category == "reject_bait"]
+    assert {case.id for case in baits} == {"G16", "G17", "G18", "G19", "G20"}
+    assert not any(case.expected.expect_reject for case in baits)
 
 
 def test_골든셋_주문번호는_전부_접수_형식을_만족한다() -> None:
@@ -502,12 +505,17 @@ def test_허용_결과_집합_안이면_상태가_달라도_일치다() -> None:
 
 
 def test_기각_재현율은_시도_판정에서_나온다() -> None:
-    """미끼 문의는 최종 상태가 answered 여도 기각이 한 번은 나와야 한다."""
+    """재현율 분모는 범주(`reject_bait`)이고, `expect_reject` 는 케이스 단위 요구다.
+
+    기각이 한 번도 없으면 재현율에서 빠지고, `expect_reject` 라벨이 켜져 있으면
+    그 케이스는 불일치로도 찍힌다 — 두 축이 분리되어 있음을 함께 고정한다.
+    """
     bait = _case(
         "B",
         statuses=(InquiryStatus.ANSWERED, InquiryStatus.ESCALATED),
         reasons=(EscalationReason.REJECTED_TWICE,),
         expect_reject=True,
+        category="reject_bait",
     )
     rejected_then_passed = _processed(
         attempts=(
@@ -523,10 +531,17 @@ def test_기각_재현율은_시도_판정에서_나온다() -> None:
     never_rejected = _processed(
         attempts=(AttemptRecord(attempt_no=1, verdict=Verdict.PASS, reject_reasons=(), draft={}),)
     )
+    # 반대 방향 고정: 미끼 범주가 아니면 expect_reject 가 켜져 있어도 분모에 들어가지 않는다.
+    nonbait_expecting = _case(
+        "N",
+        statuses=(InquiryStatus.ANSWERED, InquiryStatus.ESCALATED),
+        reasons=(EscalationReason.REJECTED_TWICE,),
+        expect_reject=True,
+    )
 
     agreement = measure_pipeline_agreement(
-        cases=[bait, bait],
-        pipeline=ScriptedPipeline([rejected_then_passed, never_rejected]),
+        cases=[bait, bait, nonbait_expecting],
+        pipeline=ScriptedPipeline([rejected_then_passed, never_rejected, never_rejected]),
         app_conn=_NO_CONN,
         readonly_conn=_NO_CONN,
     )
@@ -536,6 +551,8 @@ def test_기각_재현율은_시도_판정에서_나온다() -> None:
     assert agreement.bait_reject_recall == 0.5
     assert agreement.outcomes[0].matched is True
     assert agreement.outcomes[1].matched is False
+    # 비미끼 케이스도 expect_reject 요구는 그대로 받는다 — 불일치로는 찍히되 분모 밖이다.
+    assert agreement.outcomes[2].matched is False
 
 
 def test_금지_기각_사유가_발화하면_오탐으로_집계된다() -> None:
@@ -601,7 +618,7 @@ def test_L2_기각도_미끼_기각_재현율에_들어간다() -> None:
         "B",
         statuses=(InquiryStatus.ANSWERED, InquiryStatus.ESCALATED),
         reasons=(EscalationReason.REJECTED_TWICE,),
-        expect_reject=True,
+        category="reject_bait",
     )
     l2_rejected = _processed(
         attempts=(
@@ -1736,7 +1753,7 @@ def test_하네스가_골든셋_30건을_대역으로_끝까지_흘려_리포트
     assert [outcome.case_id for outcome in agreement.outcomes] == [case.id for case in GOLDEN]
     assert all(outcome.error is None for outcome in agreement.outcomes)
     assert agreement.latency_p50_ms is not None and agreement.latency_p95_ms is not None
-    # 기각 유발 문의 5건에서 L1 기각이 실제로 재현되어야 재현율이 의미를 가진다.
+    # 미끼 범주 5건에서 L1 기각이 실제로 재현되어야 재현율이 의미를 가진다(분모는 범주다).
     assert agreement.bait_total == 5
     assert agreement.bait_reject_reproduced == 5
     assert agreement.bait_reject_recall == 1.0
@@ -1758,7 +1775,7 @@ def test_하네스가_골든셋_30건을_대역으로_끝까지_흘려_리포트
 
     assert "## 측정 1 — L1 게이트 단위 정확도 (결정론)" in markdown
     assert "## 측정 2 — 파이프라인 판정 일치율 (end-to-end)" in markdown
-    assert "기각 유발 문의의 기각 재현율" in markdown
+    assert "미끼 문의(reject_bait)의 기각 재현율" in markdown
     assert payload["measurement_2_pipeline_agreement"]["executed"] is True
     assert len(payload["measurement_2_pipeline_agreement"]["outcomes"]) == 30
     tokens = payload["measurement_2_pipeline_agreement"]["tokens"]
