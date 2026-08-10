@@ -13,6 +13,9 @@ venv/
 .env.*
 !.env.example
 
+# Claude Code 로컬 전용 설정 (개인 권한 allowlist — 공유 대상 아님)
+.claude/settings.local.json
+
 # dryforge 작업 공간 (3-doc 본문은 버전관리 대상)
 .dryforge/worktrees/
 .dryforge/backup/
