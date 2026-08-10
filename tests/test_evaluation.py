@@ -848,7 +848,7 @@ def test_미실행_측정3_은_0_이_아니라_사유로_남는다() -> None:
     }
 
 
-def test_실측된_측정3_리포트는_확률층과_과금과_목표치_미확정을_적는다() -> None:
+def test_실측된_측정3_리포트는_확률층과_과금과_무목표를_적는다() -> None:
     """측정 1 과 같은 형태의 수치지만 **재현되지 않고 과금된다** — 리포트가 그 사실을 들고 있다."""
     accuracy = measure_judge_accuracy(fixtures=JUDGE_FIXTURES, judge=OracleJudge(JUDGE_FIXTURES))
     report = _report(
@@ -860,7 +860,7 @@ def test_실측된_측정3_리포트는_확률층과_과금과_목표치_미확�
     payload = report_to_json(report)["measurement_3_l2_judge_accuracy"]
 
     assert "확률 층이고 과금된다" in markdown
-    assert "목표치: **미확정**" in markdown
+    assert "목표치: **없음**" in markdown
     assert "L2 검출률: 100.0%" in markdown
     assert "L2 오탐률: 0.0%" in markdown
     # 목표치 대비 표는 3종 그대로다 — 측정 3 지표를 목표로 승격하지 않는다.
