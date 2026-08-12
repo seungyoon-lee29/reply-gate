@@ -487,6 +487,8 @@ class GoldenOutcome:
     failed_stage: str | None
     attempt_verdicts: tuple[Verdict, ...]
     reject_reasons: tuple[RejectReason, ...]
+    #: 파이프라인이 실제 수집·채택해 결과에 실은 근거 ID. 검색 라벨은 이 값의 입력이 아니다.
+    adopted_evidence_ids: tuple[str, ...]
     latency_ms: int
     input_tokens: int
     output_tokens: int
@@ -698,6 +700,7 @@ def evaluate_case(
             failed_stage=None,
             attempt_verdicts=(),
             reject_reasons=(),
+            adopted_evidence_ids=(),
             latency_ms=0,
             input_tokens=0,
             output_tokens=0,
@@ -727,6 +730,7 @@ def evaluate_case(
         reject_reasons=tuple(
             reason for attempt in processed.attempts for reason in attempt.reject_reasons
         ),
+        adopted_evidence_ids=tuple(item.id for item in processed.evidence),
         latency_ms=processed.latency_ms,
         input_tokens=processed.input_tokens,
         output_tokens=processed.output_tokens,
@@ -1280,6 +1284,39 @@ class TargetAssessment:
 
 
 @dataclass(frozen=True)
+class FailureAttributionCase:
+    """기각·인계 1건을 검색 정답 라벨과 조인한 판정 근거."""
+
+    case_id: str
+    classification: str
+    relevant_evidence_ids: tuple[str, ...]
+    adopted_evidence_ids: tuple[str, ...]
+    missing_relevant_evidence_ids: tuple[str, ...]
+    rejected_at_least_once: bool
+    escalated: bool
+    ended_with_zero_evidence: bool
+    l2_caught_with_evidence: bool
+
+
+@dataclass(frozen=True)
+class FailureAttribution:
+    """검색 실패와 생성 문제 분해. 카운트는 산출된 때만 존재한다."""
+
+    labels_path: str
+    generation_issue_count: int
+    retrieval_failure_count: int
+    expected_no_answer_count: int
+    cases: tuple[FailureAttributionCase, ...]
+
+
+@dataclass(frozen=True)
+class UnavailableBreakdown:
+    """분해를 산출하지 못한 사유. 0건 집계와 구분한다."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
 class EvaluationReport:
     """리포트 1건 — 사람이 읽는 마크다운과 기계가 읽는 JSON 의 공통 원본."""
 
@@ -1287,6 +1324,7 @@ class EvaluationReport:
     gate_accuracy: GateAccuracy
     pipeline: PipelineAgreement | SkippedMeasurement
     judge_accuracy: JudgeAccuracy | SkippedMeasurement
+    failure_attribution: FailureAttribution | UnavailableBreakdown
 
     def measured(self) -> dict[str, float | None]:
         """목표치 대조에 쓰는 실측값. 측정 2 미실행이면 일치율은 `None`.
@@ -1333,14 +1371,103 @@ def build_report(
     gate_accuracy: GateAccuracy,
     pipeline: PipelineAgreement | SkippedMeasurement,
     judge_accuracy: JudgeAccuracy | SkippedMeasurement,
+    retrieval_labels_path: Path | None = None,
 ) -> EvaluationReport:
     """리포트를 조립한다. **측정 3 도 명시해야 한다** — 기본값으로 비워 두면 미실행이
     조용히 "사유 없는 미실행"으로 찍힌다."""
+    failure_attribution = _build_failure_attribution(
+        pipeline=pipeline,
+        retrieval_labels_path=retrieval_labels_path,
+    )
     return EvaluationReport(
         conditions=conditions,
         gate_accuracy=gate_accuracy,
         pipeline=pipeline,
         judge_accuracy=judge_accuracy,
+        failure_attribution=failure_attribution,
+    )
+
+
+def _build_failure_attribution(
+    *,
+    pipeline: PipelineAgreement | SkippedMeasurement,
+    retrieval_labels_path: Path | None,
+) -> FailureAttribution | UnavailableBreakdown:
+    # 지연 import: retrieval_labels 는 골든셋 검증을 위해 evaluation 로더를 쓴다.
+    # 보고서 조립 시점에만 반대 방향을 열어 모듈 순환 import 를 피한다.
+    from reply_gate.retrieval_labels import (
+        DEFAULT_RETRIEVAL_LABELS_PATH,
+        load_retrieval_labels,
+    )
+
+    path = DEFAULT_RETRIEVAL_LABELS_PATH if retrieval_labels_path is None else retrieval_labels_path
+    try:
+        labels = load_retrieval_labels(path)
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        return UnavailableBreakdown(reason=f"검색 정답 라벨 로드 실패({type(exc).__name__}): {exc}")
+
+    if isinstance(pipeline, SkippedMeasurement):
+        return UnavailableBreakdown(reason=f"측정 2 미실행: {pipeline.reason}")
+
+    relevant_by_id = {label.id: tuple(sorted(label.relevant_evidence_ids)) for label in labels}
+    candidates = tuple(
+        outcome
+        for outcome in pipeline.outcomes
+        if outcome.rejected_at_least_once or outcome.status is InquiryStatus.ESCALATED
+    )
+    missing_labels = sorted(
+        outcome.case_id for outcome in candidates if outcome.case_id not in relevant_by_id
+    )
+    if missing_labels:
+        return UnavailableBreakdown(
+            reason="검색 정답 라벨에 없는 케이스: " + ", ".join(missing_labels)
+        )
+
+    attributed: list[FailureAttributionCase] = []
+    for outcome in candidates:
+        relevant = relevant_by_id[outcome.case_id]
+        adopted = outcome.adopted_evidence_ids
+        adopted_set = set(adopted)
+        if not relevant:
+            # G21~G24 는 정답이 "근거 없음"이다. 인계된 경우만 정상
+            # 동작으로 기록하고 검색 실패/생성 문제 카운트에서 뺀다.
+            if outcome.status is not InquiryStatus.ESCALATED:
+                continue
+            classification = "expected_no_answer"
+        elif adopted_set.intersection(relevant):
+            classification = "generation_issue"
+        else:
+            classification = "retrieval_failure"
+
+        l2_rejected = bool(set(outcome.reject_reasons).intersection(L2_REJECT_REASONS))
+        attributed.append(
+            FailureAttributionCase(
+                case_id=outcome.case_id,
+                classification=classification,
+                relevant_evidence_ids=relevant,
+                adopted_evidence_ids=adopted,
+                missing_relevant_evidence_ids=tuple(
+                    evidence_id for evidence_id in relevant if evidence_id not in adopted_set
+                ),
+                rejected_at_least_once=outcome.rejected_at_least_once,
+                escalated=outcome.status is InquiryStatus.ESCALATED,
+                ended_with_zero_evidence=not adopted,
+                l2_caught_with_evidence=bool(adopted) and l2_rejected,
+            )
+        )
+
+    return FailureAttribution(
+        labels_path=display_path(path),
+        generation_issue_count=sum(
+            item.classification == "generation_issue" for item in attributed
+        ),
+        retrieval_failure_count=sum(
+            item.classification == "retrieval_failure" for item in attributed
+        ),
+        expected_no_answer_count=sum(
+            item.classification == "expected_no_answer" for item in attributed
+        ),
+        cases=tuple(attributed),
     )
 
 
@@ -1417,6 +1544,7 @@ def render_markdown(report: EvaluationReport) -> str:
     lines.extend(_render_targets(report))
     lines.extend(_render_measurement_one(report.gate_accuracy))
     lines.extend(_render_measurement_two(report.pipeline, conditions))
+    lines.extend(_render_failure_attribution(report.failure_attribution))
     lines.extend(_render_measurement_three(report.judge_accuracy, conditions))
     lines.append(_LIMITS)
     return "\n".join(lines)
@@ -1547,8 +1675,16 @@ def _render_measurement_two(
             f"- 최종 상태: {_counts(pipeline.status_counts)}",
             f"- 인계 사유: {_counts(pipeline.escalation_counts)}",
             "",
+            "### 케이스별 채택 근거",
+            "",
         ]
     )
+    lines.extend(
+        f"- `{outcome.case_id}`: "
+        + (", ".join(f"`{evidence_id}`" for evidence_id in outcome.adopted_evidence_ids) or "없음")
+        for outcome in pipeline.outcomes
+    )
+    lines.append("")
 
     mismatched = [outcome for outcome in pipeline.outcomes if not outcome.matched]
     if mismatched:
@@ -1598,6 +1734,59 @@ def _token_rows(pipeline: PipelineAgreement, conditions: RunConditions) -> list[
     lines.append(
         f"| **합산** | {_grand_total(pipeline)} | **{_num(pipeline.total_tokens_per_inquiry)}** |"
     )
+    return lines
+
+
+def _render_failure_attribution(
+    attribution: FailureAttribution | UnavailableBreakdown,
+) -> list[str]:
+    lines = ["### 검색 실패 / 생성 문제 분해", ""]
+    if isinstance(attribution, UnavailableBreakdown):
+        lines.extend(
+            [
+                f"**미산출 (사유: {attribution.reason})**",
+                "",
+                "미산출을 0건·빈 집계·성공으로 대체하지 않는다.",
+                "",
+            ]
+        )
+        return lines
+
+    lines.extend(
+        [
+            f"- 검색 정답 라벨: `{attribution.labels_path}`",
+            f"- 생성 문제: **{attribution.generation_issue_count}건** — "
+            "정답 조항을 채택했지만 기각·인계",
+            f"- 검색 실패: **{attribution.retrieval_failure_count}건** — "
+            "정답 조항을 채택하지 못해 기각·인계",
+            f"- 빈 정답 정상 인계: **{attribution.expected_no_answer_count}건** — "
+            "앞의 두 분류에 포함하지 않음",
+            "",
+            "#### 케이스별 판정 근거",
+            "",
+        ]
+    )
+    labels = {
+        "generation_issue": "생성 문제",
+        "retrieval_failure": "검색 실패",
+        "expected_no_answer": "빈 정답 정상 인계",
+    }
+    for item in attribution.cases:
+        relevant = ", ".join(f"`{value}`" for value in item.relevant_evidence_ids) or "없음"
+        adopted = ", ".join(f"`{value}`" for value in item.adopted_evidence_ids) or "없음"
+        route = ""
+        if item.classification == "expected_no_answer":
+            if item.ended_with_zero_evidence:
+                route = " / 검색 0건 종료"
+            elif item.l2_caught_with_evidence:
+                route = " / 근거 채택 후 L2 검출"
+            else:
+                route = " / 근거를 채택했지만 L2 기각 없음"
+        lines.append(
+            f"- `{item.case_id}`: **{labels[item.classification]}** — "
+            f"정답 근거 {relevant} / 채택 근거 {adopted}{route}"
+        )
+    lines.append("")
     return lines
 
 
@@ -1806,10 +1995,39 @@ def report_to_json(report: EvaluationReport) -> dict[str, Any]:
         ],
     }
     payload["measurement_2_pipeline_agreement"] = _measurement_two_json(report.pipeline)
+    payload["failure_attribution"] = _failure_attribution_json(report.failure_attribution)
     payload["measurement_3_l2_judge_accuracy"] = _measurement_three_json(
         report.judge_accuracy, conditions
     )
     return payload
+
+
+def _failure_attribution_json(
+    attribution: FailureAttribution | UnavailableBreakdown,
+) -> dict[str, Any]:
+    if isinstance(attribution, UnavailableBreakdown):
+        return {"computed": False, "reason": attribution.reason}
+    return {
+        "computed": True,
+        "labels_path": attribution.labels_path,
+        "generation_issue_count": attribution.generation_issue_count,
+        "retrieval_failure_count": attribution.retrieval_failure_count,
+        "expected_no_answer_count": attribution.expected_no_answer_count,
+        "cases": [
+            {
+                "case_id": item.case_id,
+                "classification": item.classification,
+                "relevant_evidence_ids": list(item.relevant_evidence_ids),
+                "adopted_evidence_ids": list(item.adopted_evidence_ids),
+                "missing_relevant_evidence_ids": list(item.missing_relevant_evidence_ids),
+                "rejected_at_least_once": item.rejected_at_least_once,
+                "escalated": item.escalated,
+                "ended_with_zero_evidence": item.ended_with_zero_evidence,
+                "l2_caught_with_evidence": item.l2_caught_with_evidence,
+            }
+            for item in attribution.cases
+        ],
+    }
 
 
 def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> dict[str, Any]:
@@ -1853,6 +2071,7 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
                 "failed_stage": outcome.failed_stage,
                 "attempt_verdicts": [verdict.value for verdict in outcome.attempt_verdicts],
                 "reject_reasons": [reason.value for reason in outcome.reject_reasons],
+                "adopted_evidence_ids": list(outcome.adopted_evidence_ids),
                 "latency_ms": outcome.latency_ms,
                 "input_tokens": outcome.input_tokens,
                 "output_tokens": outcome.output_tokens,
