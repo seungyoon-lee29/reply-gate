@@ -1,23 +1,33 @@
 """DB 없는 벡터 검색 비교 하네스의 공개 동작."""
 
+import inspect
+import json
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
+
+import pytest
 
 from reply_gate.evaluation import load_golden_set
-from reply_gate.llm import EmbeddingClient, EmbeddingResult
+from reply_gate.llm import EmbeddingClient, EmbeddingResult, GenerationClient, JsonCompletion
 from reply_gate.policy_index import load_policy_documents
 from reply_gate.retrieval_eval import (
     RankedHit,
+    RetrievalConfigurationError,
     RetrievalEvalConfig,
     RetrievalQuery,
     RetrievedCase,
+    StrategyCutoffs,
     evaluate_retrieval,
+    evaluate_strategy_ladder,
     retrieve_cases,
+    retrieve_strategy_ladder,
     run_retrieval_comparison,
     score_retrieval,
     write_report,
+    write_strategy_report,
 )
 from reply_gate.retrieval_labels import RetrievalLabel, load_retrieval_labels
+from reply_gate.retrieval_strategies import RetrievalStage, StrategyDefinition
 from reply_gate.testing import LexicalEmbeddingClient
 
 
@@ -33,6 +43,17 @@ class _FixedEmbedder:
     def embed(self, *, stage: str, texts: list[str]) -> EmbeddingResult:
         self.calls.append((stage, tuple(texts)))
         return EmbeddingResult(vectors=[self._vectors[text] for text in texts], total_tokens=0)
+
+
+class _IdentityReranker:
+    def complete_json(self, **kwargs: Any) -> JsonCompletion:
+        payload = json.loads(cast(str, kwargs["user"]))
+        candidates = cast(list[dict[str, str]], payload["candidates"])
+        return JsonCompletion(
+            data={"evidence_ids": [candidate["evidence_id"] for candidate in candidates]},
+            input_tokens=0,
+            output_tokens=0,
+        )
 
 
 def test_score_retrieval_uses_documented_empty_label_and_zero_hit_denominators() -> None:
@@ -229,9 +250,28 @@ def test_stub_completes_30_cases_writes_both_reports_and_never_overwrites(
     assert '"labels_used_for_retrieval": false' in json_before
 
 
-def test_run_retrieval_comparison_is_a_complete_free_stub_entrypoint(
-    tmp_path: Path,
+@pytest.mark.parametrize("live", [False, True])
+def test_run_retrieval_comparison_requires_rewrites_for_default_ladder(
+    tmp_path: Path, live: bool
 ) -> None:
+    with pytest.raises(RetrievalConfigurationError, match="재작성"):
+        run_retrieval_comparison(
+            live=live,
+            dimensions=32,
+            top_k=5,
+            cutoff=0.10,
+            sweep_start=0.10,
+            sweep_end=0.20,
+            sweep_step=0.05,
+            output_dir=tmp_path / "reports",
+            cache_dir=tmp_path / "cache",
+        )
+
+    assert not (tmp_path / "reports").exists()
+    assert not (tmp_path / "cache").exists()
+
+
+def test_run_vector_only_without_rewrites_reports_rewrite_not_used(tmp_path: Path) -> None:
     paths = run_retrieval_comparison(
         live=False,
         dimensions=32,
@@ -242,8 +282,189 @@ def test_run_retrieval_comparison_is_a_complete_free_stub_entrypoint(
         sweep_step=0.05,
         output_dir=tmp_path / "reports",
         cache_dir=tmp_path / "cache",
+        strategies=(StrategyDefinition("vector", (RetrievalStage.VECTOR,)),),
     )
 
-    assert paths.markdown.exists()
-    assert paths.json.exists()
-    assert "G17" in paths.markdown.read_text(encoding="utf-8")
+    payload = json.loads(paths.json.read_text(encoding="utf-8"))
+    assert [strategy["name"] for strategy in payload["strategies"]] == ["vector"]
+    assert payload["run_conditions"]["rewrite_source"] == "not_used"
+    assert "질의 재작성: 미사용" in paths.markdown.read_text(encoding="utf-8")
+
+
+def test_strategy_ladder_completes_four_stub_combinations_and_reports_separate_cuts(
+    tmp_path: Path,
+) -> None:
+    cases = load_golden_set()
+    comparison = evaluate_strategy_ladder(
+        documents=load_policy_documents(),
+        cases=cases,
+        labels=load_retrieval_labels(),
+        rewritten_queries={case.id: f"{case.content} 재작성" for case in cases},
+        embedder=LexicalEmbeddingClient(dimensions=32),
+        embedding_config=RetrievalEvalConfig(
+            model="lexical-2gram-v1",
+            dimensions=32,
+            top_k=5,
+            cutoff=0.10,
+            is_stub=True,
+        ),
+        cutoffs=StrategyCutoffs(
+            cosine_similarity=0.10,
+            rrf_score=0.0,
+            rerank_top_n=3,
+        ),
+        reranker=cast(GenerationClient, _IdentityReranker()),
+        rerank_model="stub-reranker",
+        cache_dir=tmp_path / "embedding-cache",
+        rerank_cache_dir=tmp_path / "rerank-cache",
+    )
+
+    assert [result.strategy.name for result in comparison.strategies] == [
+        "vector",
+        "vector_rewrite",
+        "vector_rewrite_hybrid",
+        "vector_rewrite_hybrid_rerank",
+    ]
+    assert [result.cutoff_kind for result in comparison.strategies] == [
+        "cosine_similarity",
+        "cosine_similarity",
+        "rrf_score",
+        "rank_limit",
+    ]
+    assert [result.cutoff_value for result in comparison.strategies] == [0.10, 0.10, 0.0, 3]
+    assert all(len(result.cases) == 30 for result in comparison.strategies)
+
+    paths = write_strategy_report(comparison, output_dir=tmp_path / "reports")
+    report = json.loads(paths.json.read_text(encoding="utf-8"))
+    assert report["run_conditions"]["labels_used_for_retrieval"] is False
+    assert report["run_conditions"]["rewrite_source"] == "caller_injected"
+    assert "실제 검색 품질이 아니다" in report["run_conditions"]["warning"]
+    case = report["strategies"][3]["cases"][0]
+    assert case["strategy"] == "vector_rewrite_hybrid_rerank"
+    assert case["cutoff"] == {"kind": "rank_limit", "value": 3}
+    assert {"rank", "evidence_id", "vector_similarity", "bm25_score", "rrf_score"} <= set(
+        case["ranked_hits"][0]
+    )
+    assert "accepted_hits" in case
+
+
+@pytest.mark.parametrize(
+    ("rewritten_queries", "message"),
+    [
+        ({}, "누락=G"),
+        ({"G": "재작성", "EXTRA": "추가"}, "추가=EXTRA"),
+        ({"G": "   "}, "비어"),
+    ],
+)
+def test_rewrite_input_is_validated_before_embedding(
+    tmp_path: Path, rewritten_queries: dict[str, str], message: str
+) -> None:
+    embedder = _FixedEmbedder({"정책 A": [1.0, 0.0], "문의": [1.0, 0.0], "재작성": [0.0, 1.0]})
+
+    with pytest.raises(RetrievalConfigurationError, match=message):
+        retrieve_strategy_ladder(
+            queries=(RetrievalQuery(case_id="G", text="문의"),),
+            policy_texts=(("policy:a:1", "정책 A"),),
+            rewritten_queries=rewritten_queries,
+            embedder=cast(EmbeddingClient, embedder),
+            embedding_config=RetrievalEvalConfig(model="fixed", dimensions=2),
+            cutoffs=StrategyCutoffs(),
+            reranker=cast(GenerationClient, _IdentityReranker()),
+            rerank_model="stub-reranker",
+            cache_dir=tmp_path / "embedding-cache",
+            rerank_cache_dir=tmp_path / "rerank-cache",
+        )
+
+    assert embedder.calls == []
+
+
+def test_vector_rewrite_uses_distinct_injected_text(tmp_path: Path) -> None:
+    embedder = _FixedEmbedder(
+        {
+            "정책 A": [1.0, 0.0],
+            "정책 B": [0.0, 1.0],
+            "원문 문의": [1.0, 0.0],
+            "실제 재작성 문의": [0.0, 1.0],
+        }
+    )
+
+    retrieved = retrieve_strategy_ladder(
+        queries=(RetrievalQuery(case_id="G", text="원문 문의"),),
+        policy_texts=(("policy:a:1", "정책 A"), ("policy:b:1", "정책 B")),
+        rewritten_queries={"G": "실제 재작성 문의"},
+        embedder=cast(EmbeddingClient, embedder),
+        embedding_config=RetrievalEvalConfig(model="fixed", dimensions=2, top_k=2),
+        cutoffs=StrategyCutoffs(cosine_similarity=0.5),
+        reranker=None,
+        rerank_model="",
+        cache_dir=tmp_path / "embedding-cache",
+        rerank_cache_dir=tmp_path / "rerank-cache",
+        strategies=(
+            StrategyDefinition("vector", (RetrievalStage.VECTOR,)),
+            StrategyDefinition("vector_rewrite", (RetrievalStage.VECTOR, RetrievalStage.REWRITE)),
+        ),
+    )
+
+    by_name = {result.strategy.name: result.cases[0] for result in retrieved}
+    assert [hit.evidence_id for hit in by_name["vector"].accepted_hits] == ["policy:a:1"]
+    assert [hit.evidence_id for hit in by_name["vector_rewrite"].accepted_hits] == [
+        "policy:a:1",
+        "policy:b:1",
+    ]
+    assert ("retrieval_query", ("실제 재작성 문의",)) in embedder.calls
+
+
+def test_strategy_retrieval_boundary_does_not_accept_or_import_labels() -> None:
+    assert "labels" not in inspect.signature(retrieve_strategy_ladder).parameters
+    retrieval_eval_module = inspect.getmodule(retrieve_strategy_ladder)
+    assert retrieval_eval_module is not None
+    source = inspect.getsource(retrieval_eval_module)
+    strategy_source = inspect.getsource(
+        __import__("reply_gate.retrieval_strategies", fromlist=["retrieval_strategies"])
+    )
+
+    assert (
+        "labels="
+        not in source[source.index("def retrieve_strategy_ladder") :][
+            : source[source.index("def retrieve_strategy_ladder") :].index("\ndef ")
+        ]
+    )
+    assert "retrieval_labels" not in strategy_source
+    assert "RetrievalLabel" not in strategy_source
+
+
+def test_hybrid_and_rerank_keep_rrf_cut_separate_from_cosine_cut(tmp_path: Path) -> None:
+    embedder = _FixedEmbedder(
+        {
+            "정책 A": [1.0, 0.0],
+            "정책 B": [0.0, 1.0],
+            "문의": [0.8, 0.2],
+            "재작성": [0.2, 0.8],
+        }
+    )
+
+    retrieved = retrieve_strategy_ladder(
+        queries=(RetrievalQuery(case_id="G", text="문의"),),
+        policy_texts=(("policy:a:1", "정책 A"), ("policy:b:1", "정책 B")),
+        rewritten_queries={"G": "재작성"},
+        embedder=cast(EmbeddingClient, embedder),
+        embedding_config=RetrievalEvalConfig(model="fixed", dimensions=2, top_k=2, cutoff=0.99),
+        cutoffs=StrategyCutoffs(
+            cosine_similarity=0.99,
+            rrf_score=0.0325,
+            rerank_top_n=1,
+        ),
+        reranker=cast(GenerationClient, _IdentityReranker()),
+        rerank_model="stub-reranker",
+        cache_dir=tmp_path / "embedding-cache",
+        rerank_cache_dir=tmp_path / "rerank-cache",
+    )
+
+    by_name = {result.strategy.name: result.cases[0] for result in retrieved}
+    assert by_name["vector_rewrite"].accepted_hits == ()
+    assert [hit.evidence_id for hit in by_name["vector_rewrite_hybrid"].accepted_hits] == [
+        "policy:a:1"
+    ]
+    assert [hit.evidence_id for hit in by_name["vector_rewrite_hybrid_rerank"].ranked_hits] == [
+        "policy:a:1"
+    ]

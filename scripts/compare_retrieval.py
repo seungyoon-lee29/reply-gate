@@ -1,4 +1,4 @@
-"""DB 없는 정책 검색 비교 실행 진입점.
+"""DB 없는 정책 벡터 단독 비교 실행 진입점.
 
     uv run python -m scripts.compare_retrieval --stub-embedding
     uv run python -m scripts.compare_retrieval --live  # 실제 임베딩 호출, 과금 가능
@@ -16,27 +16,37 @@ from reply_gate.evaluation import DEFAULT_GOLDEN_SET_PATH
 from reply_gate.policy_index import DEFAULT_POLICY_DIR
 from reply_gate.retrieval_eval import (
     DEFAULT_EMBEDDING_CACHE_DIR,
+    DEFAULT_NGRAM_SIZE,
+    DEFAULT_RERANK_MODEL,
     DEFAULT_RETRIEVAL_REPORT_DIR,
+    DEFAULT_RRF_CUTOFF,
+    DEFAULT_RRF_K,
     RetrievalConfigurationError,
     run_retrieval_comparison,
 )
 from reply_gate.retrieval_labels import DEFAULT_RETRIEVAL_LABELS_PATH
+from reply_gate.retrieval_strategies import RetrievalStage, StrategyDefinition
+
+_VECTOR_ONLY = (StrategyDefinition("vector", (RetrievalStage.VECTOR,)),)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="DB 없이 정책 조항과 골든셋 문의의 벡터 단독 검색 품질을 비교한다"
+        description=(
+            "DB 없이 정책 조항과 골든셋 문의의 벡터 단독 검색을 평가한다. "
+            "재작성 포함 사다리는 패키지 API에 재작성문을 주입해 실행한다."
+        )
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--live",
         action="store_true",
-        help="OpenAI 임베딩을 실제 호출한다 (명시적 opt-in, 캐시 miss는 과금 가능)",
+        help="OpenAI 임베딩·리랭크를 실제 호출한다 (명시적 opt-in, 캐시 miss는 과금 가능)",
     )
     mode.add_argument(
         "--stub-embedding",
         action="store_true",
-        help="결정론 어휘 임베딩 대역을 쓴다 (기본값, 배관 검증 전용)",
+        help="결정론 임베딩·리랭크 대역을 쓴다 (기본값, 배관 검증 전용)",
     )
     parser.add_argument("--policy-dir", type=Path, default=DEFAULT_POLICY_DIR)
     parser.add_argument("--golden-set", type=Path, default=DEFAULT_GOLDEN_SET_PATH)
@@ -54,6 +64,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sweep-start", type=float, default=0.10)
     parser.add_argument("--sweep-end", type=float, default=0.70)
     parser.add_argument("--sweep-step", type=float, default=0.05)
+    parser.add_argument("--rrf-k", type=int, default=DEFAULT_RRF_K, help="RRF 순위 완화 상수")
+    parser.add_argument(
+        "--rrf-cutoff",
+        type=float,
+        default=DEFAULT_RRF_CUTOFF,
+        help="하이브리드 RRF 채택 컷",
+    )
+    parser.add_argument(
+        "--ngram-size",
+        type=int,
+        default=DEFAULT_NGRAM_SIZE,
+        help="BM25 한국어 문자 n-gram 크기",
+    )
+    parser.add_argument("--rerank-top-n", type=int, default=5, help="리랭크 뒤 최종 채택 순위 상한")
+    parser.add_argument(
+        "--rerank-model",
+        default=DEFAULT_RERANK_MODEL,
+        help="실제 모드의 OpenAI 리랭크 모델 (대역 모드에서는 호출하지 않음)",
+    )
     return parser
 
 
@@ -73,6 +102,12 @@ def main(argv: list[str] | None = None) -> int:
             labels_path=args.labels,
             output_dir=args.out_dir,
             cache_dir=args.cache_dir,
+            rrf_k=args.rrf_k,
+            rrf_cutoff=args.rrf_cutoff,
+            ngram_size=args.ngram_size,
+            rerank_top_n=args.rerank_top_n,
+            rerank_model=args.rerank_model,
+            strategies=_VECTOR_ONLY,
         )
     except (RetrievalConfigurationError, FileNotFoundError, ValueError) as exc:
         print(f"검색 비교 실행 실패: {exc}", file=sys.stderr)
