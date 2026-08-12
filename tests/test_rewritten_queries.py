@@ -61,54 +61,98 @@ def _write_rows(path: Path, rows: list[dict[str, object]]) -> None:
     )
 
 
+def _normalized_from_module(node: ast.ImportFrom) -> str:
+    """테스트 대상 패키지 파일의 상대 import를 절대 모듈명으로 바꾼다."""
+    if node.level == 0:
+        return node.module or ""
+    package_parts = ["reply_gate"]
+    ascents = node.level - 1
+    if ascents > len(package_parts):
+        return node.module or ""
+    base_parts = package_parts[: len(package_parts) - ascents]
+    if node.module:
+        base_parts.extend(node.module.split("."))
+    return ".".join(base_parts)
+
+
+def _fold_path_string(node: ast.AST) -> str | None:
+    """금지 픽스처 경로 판정에 필요한 문자열·Path 조립만 접는다."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _fold_path_string(node.left)
+        right = _fold_path_string(node.right)
+        return left + right if left is not None and right is not None else None
+    if isinstance(node, ast.Call):
+        function = node.func
+        is_path = (isinstance(function, ast.Name) and function.id == "Path") or (
+            isinstance(function, ast.Attribute) and function.attr == "Path"
+        )
+        if is_path and len(node.args) == 1 and not node.keywords:
+            return _fold_path_string(node.args[0])
+        return None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        left = _fold_path_string(node.left)
+        right = _fold_path_string(node.right)
+        if left is not None and right is not None:
+            return f"{left.rstrip('/')}/{right.lstrip('/')}"
+    return None
+
+
 def _runtime_isolation_violations(sources: Mapping[str, str]) -> tuple[str, ...]:
     """AST에서 금지 import·호출·상수·픽스처 경로 참조를 찾는다."""
     violations: list[str] = []
     for filename, source in sources.items():
         tree = ast.parse(source, filename=filename)
-        forbidden_aliases: set[str] = set()
+        forbidden_module_aliases: set[str] = set()
+        forbidden_symbol_aliases: dict[str, str] = {}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     if alias.name in _FORBIDDEN_MODULES:
-                        forbidden_aliases.add(alias.asname or alias.name.split(".")[-1])
+                        forbidden_module_aliases.add(alias.asname or alias.name.split(".")[-1])
                         violations.append(f"{filename}: 금지 모듈 import {alias.name}")
             elif isinstance(node, ast.ImportFrom):
-                module = node.module or ""
+                module = _normalized_from_module(node)
                 if module in _FORBIDDEN_MODULES:
                     violations.append(f"{filename}: 금지 모듈 import {module}")
-                    forbidden_aliases.update(alias.asname or alias.name for alias in node.names)
+                    for alias in node.names:
+                        local_name = alias.asname or alias.name
+                        if alias.name in _FORBIDDEN_SYMBOLS:
+                            forbidden_symbol_aliases[local_name] = alias.name
                 elif module == "reply_gate":
                     for alias in node.names:
                         imported = f"reply_gate.{alias.name}"
                         if imported in _FORBIDDEN_MODULES:
-                            forbidden_aliases.add(alias.asname or alias.name)
+                            forbidden_module_aliases.add(alias.asname or alias.name)
                             violations.append(f"{filename}: 금지 모듈 import {imported}")
 
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 function = node.func
                 if isinstance(function, ast.Name) and (
-                    function.id in _FORBIDDEN_SYMBOLS or function.id in forbidden_aliases
+                    function.id in _FORBIDDEN_SYMBOLS
+                    or function.id in forbidden_symbol_aliases
+                    or function.id in forbidden_module_aliases
                 ):
                     violations.append(f"{filename}: 금지 로더 호출 {function.id}")
                 elif isinstance(function, ast.Attribute) and (
                     function.attr in _FORBIDDEN_SYMBOLS
                     or (
                         isinstance(function.value, ast.Name)
-                        and function.value.id in forbidden_aliases
+                        and function.value.id in forbidden_module_aliases
                     )
                 ):
                     violations.append(f"{filename}: 금지 로더 호출 {function.attr}")
-            elif isinstance(node, ast.Name) and node.id in _FORBIDDEN_SYMBOLS:
-                violations.append(f"{filename}: 금지 상수/로더 참조 {node.id}")
+            elif isinstance(node, ast.Name) and (
+                node.id in _FORBIDDEN_SYMBOLS or node.id in forbidden_symbol_aliases
+            ):
+                symbol = forbidden_symbol_aliases.get(node.id, node.id)
+                violations.append(f"{filename}: 금지 상수/로더 참조 {symbol}")
             elif isinstance(node, ast.Attribute) and node.attr in _FORBIDDEN_SYMBOLS:
                 violations.append(f"{filename}: 금지 상수/로더 참조 {node.attr}")
-            elif (
-                isinstance(node, ast.Constant)
-                and isinstance(node.value, str)
-                and _FORBIDDEN_PATH in node.value
-            ):
+            folded_path = _fold_path_string(node)
+            if folded_path is not None and _FORBIDDEN_PATH in folded_path:
                 violations.append(f"{filename}: 금지 픽스처 경로 참조")
     return tuple(dict.fromkeys(violations))
 
@@ -225,6 +269,9 @@ def test_런타임_실행_경로는_재작성_평가_픽스처와_격리된다()
         "from reply_gate import retrieval_eval\nretrieval_eval.load_rewritten_queries()\n",
         "DEFAULT_REWRITTEN_QUERIES_PATH = 'data/elsewhere.jsonl'\n",
         "fixture = Path('data/rewritten_queries.jsonl')\n",
+        "from .retrieval_eval import load_rewritten_queries as load\nload()\n",
+        "from .retrieval_eval import DEFAULT_REWRITTEN_QUERIES_PATH as path\nfixture = path\n",
+        'fixture = Path("data") / ("rewritten_" + "queries.jsonl")\n',
     ],
 )
 def test_런타임_격리_검사는_금지_참조_변이를_RED로_잡는다(mutant: str) -> None:
