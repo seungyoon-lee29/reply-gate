@@ -7,6 +7,7 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.retrieval-cache/
 
 # 환경·시크릿
 .env
@@ -29,6 +30,8 @@ reports/*
 !reports/evaluation-live.json
 !reports/evaluation-live-*.md
 !reports/evaluation-live-*.json
+!reports/retrieval-*.md
+!reports/retrieval-*.json
 
 # 에디터·OS
 .DS_Store
