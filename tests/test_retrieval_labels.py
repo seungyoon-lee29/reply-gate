@@ -41,11 +41,11 @@ def test_저장소_검색_라벨_30건을_정책_원문_기준으로_읽는다()
         "G06": frozenset({"policy:shipping:1-6"}),
         "G07": frozenset({"policy:support:4-7"}),
         "G08": frozenset({"policy:shipping:1-7"}),
-        "G09": frozenset(),
-        "G10": frozenset(),
+        "G09": frozenset({"policy:shipping:1-5"}),
+        "G10": frozenset({"policy:shipping:1-5"}),
         "G11": frozenset({"policy:shipping:1-1"}),
         "G12": frozenset({"policy:refund:2-4"}),
-        "G13": frozenset(),
+        "G13": frozenset({"policy:refund:2-4"}),
         "G14": frozenset({"policy:exchange:3-5"}),
         "G15": frozenset({"policy:refund:2-5"}),
         "G16": frozenset({"policy:support:4-1"}),
@@ -57,12 +57,12 @@ def test_저장소_검색_라벨_30건을_정책_원문_기준으로_읽는다()
         "G22": frozenset(),
         "G23": frozenset(),
         "G24": frozenset(),
-        "G25": frozenset(),
-        "G26": frozenset(),
-        "G27": frozenset(),
-        "G28": frozenset(),
-        "G29": frozenset(),
-        "G30": frozenset(),
+        "G25": frozenset({"policy:shipping:1-5"}),
+        "G26": frozenset({"policy:shipping:1-1"}),
+        "G27": frozenset({"policy:shipping:1-5"}),
+        "G28": frozenset({"policy:refund:2-4"}),
+        "G29": frozenset({"policy:support:4-5"}),
+        "G30": frozenset({"policy:support:4-5"}),
     }
     assert all(label.note for label in labels)
 
@@ -70,9 +70,8 @@ def test_저장소_검색_라벨_30건을_정책_원문_기준으로_읽는다()
 def test_무근거_문의_네_건의_빈_정답_집합을_보존한다() -> None:
     labels = {label.id: label for label in load_retrieval_labels()}
 
-    assert all(
-        not labels[case_id].relevant_evidence_ids for case_id in ("G21", "G22", "G23", "G24")
-    )
+    empty_ids = {case_id for case_id, label in labels.items() if not label.relevant_evidence_ids}
+    assert empty_ids == {"G21", "G22", "G23", "G24"}
 
 
 def test_골든셋에_없는_ID가_라벨에_있으면_거부한다(tmp_path: Path) -> None:
