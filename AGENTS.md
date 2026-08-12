@@ -48,8 +48,9 @@
 5. **평가용으로 심은 장치를 제거하지 않는다.** 정책 문서의 미끼·모호·상충 조항, 기각 유발
    골든셋 문의, L1 픽스처, **L2 판정 픽스처**(`data/judge_fixtures.jsonl` — 측정 3 의 유일한
    입력), **검색 정답 라벨**(`data/retrieval_labels.jsonl` — 검색 recall·precision 의 유일한
-   정답 입력), **재작성 질의 픽스처**(`data/rewritten_queries.jsonl` — 골든셋 검색 전략 비교의
-   고정 오프라인 입력). 제거하면 기각 장면과 검색 품질 측정이 재현되지 않는다.
+   정답 입력), **blind 재작성 질의 픽스처**(`data/rewritten_queries.jsonl` — 기본 비교 입력),
+   **oracle upper-bound 픽스처**(`data/rewritten_queries_oracle.jsonl` — 정책·라벨 기반 상한
+   대조군). 제거하면 기각 장면과 검색 품질 측정이 재현되지 않는다.
 
 전체 규칙은 `docs/standards.md` 에 있다.
 

@@ -48,8 +48,8 @@ def test_저장소_검색_라벨_30건을_정책_원문_기준으로_읽는다()
         "G13": frozenset({"policy:refund:2-4"}),
         "G14": frozenset({"policy:exchange:3-5"}),
         "G15": frozenset({"policy:refund:2-5"}),
-        "G16": frozenset({"policy:support:4-1"}),
-        "G17": frozenset({"policy:support:4-1"}),
+        "G16": frozenset({"policy:support:4-1", "policy:support:4-2"}),
+        "G17": frozenset({"policy:support:4-1", "policy:support:4-2"}),
         "G18": frozenset({"policy:refund:2-6"}),
         "G19": frozenset({"policy:support:4-2"}),
         "G20": frozenset({"policy:support:4-1", "policy:support:4-2"}),
@@ -60,18 +60,34 @@ def test_저장소_검색_라벨_30건을_정책_원문_기준으로_읽는다()
         "G25": frozenset({"policy:shipping:1-5"}),
         "G26": frozenset({"policy:shipping:1-1"}),
         "G27": frozenset({"policy:shipping:1-5"}),
-        "G28": frozenset({"policy:refund:2-4"}),
+        "G28": frozenset(),
         "G29": frozenset({"policy:support:4-5"}),
         "G30": frozenset({"policy:support:4-5"}),
     }
     assert all(label.note for label in labels)
 
 
-def test_무근거_문의_네_건의_빈_정답_집합을_보존한다() -> None:
+def test_직접_답하거나_제한할_정책이_없는_다섯_건은_빈_정답이다() -> None:
     labels = {label.id: label for label in load_retrieval_labels()}
 
     empty_ids = {case_id for case_id, label in labels.items() if not label.relevant_evidence_ids}
-    assert empty_ids == {"G21", "G22", "G23", "G24"}
+    assert empty_ids == {"G21", "G22", "G23", "G24", "G28"}
+
+
+def test_처리_전제는_제외하고_직접_답변과_공개_제한_근거는_모두_라벨링한다() -> None:
+    labels = {label.id: label for label in load_retrieval_labels()}
+
+    assert labels["G16"].relevant_evidence_ids == frozenset(
+        {"policy:support:4-1", "policy:support:4-2"}
+    )
+    assert labels["G17"].relevant_evidence_ids == frozenset(
+        {"policy:support:4-1", "policy:support:4-2"}
+    )
+    assert labels["G25"].relevant_evidence_ids == frozenset({"policy:shipping:1-5"})
+    assert labels["G29"].relevant_evidence_ids == frozenset({"policy:support:4-5"})
+    assert labels["G30"].relevant_evidence_ids == frozenset({"policy:support:4-5"})
+    assert "처리 전제" in labels["G25"].note
+    assert "공개 제한" in labels["G30"].note
 
 
 def test_골든셋에_없는_ID가_라벨에_있으면_거부한다(tmp_path: Path) -> None:

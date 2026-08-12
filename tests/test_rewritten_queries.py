@@ -11,6 +11,7 @@ import pytest
 
 from reply_gate.evaluation import DEFAULT_GOLDEN_SET_PATH, load_golden_set
 from reply_gate.retrieval_eval import (
+    DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH,
     DEFAULT_REWRITTEN_QUERIES_PATH,
     load_rewritten_queries,
 )
@@ -40,11 +41,12 @@ _FORBIDDEN_MODULES = frozenset(
 )
 _FORBIDDEN_SYMBOLS = frozenset(
     {
+        "DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH",
         "DEFAULT_REWRITTEN_QUERIES_PATH",
         "load_rewritten_queries",
     }
 )
-_FORBIDDEN_PATH = "rewritten_queries.jsonl"
+_FORBIDDEN_PATHS = ("rewritten_queries.jsonl", "rewritten_queries_oracle.jsonl")
 
 
 def _rows() -> list[dict[str, object]]:
@@ -152,7 +154,7 @@ def _runtime_isolation_violations(sources: Mapping[str, str]) -> tuple[str, ...]
             elif isinstance(node, ast.Attribute) and node.attr in _FORBIDDEN_SYMBOLS:
                 violations.append(f"{filename}: 금지 상수/로더 참조 {node.attr}")
             folded_path = _fold_path_string(node)
-            if folded_path is not None and _FORBIDDEN_PATH in folded_path:
+            if folded_path is not None and any(path in folded_path for path in _FORBIDDEN_PATHS):
                 violations.append(f"{filename}: 금지 픽스처 경로 참조")
     return tuple(dict.fromkeys(violations))
 
@@ -168,9 +170,39 @@ def test_저장소_재작성_질의_30건을_골든셋과_정확히_대응해_�
     assert len(rewrites) == len(cases) == 30
     assert list(rewrites) == [case.id for case in cases]
     assert set(_rows()[0]) == {"id", "original", "rewritten", "note"}
-    assert rewrites["G17"] == (
-        "고객센터 전화 상담을 위해 상담원과 통화할 수 있는 전화번호와 운영 안내"
-    )
+    assert rewrites["G17"] == "상담원 통화 전화번호 문의"
+
+
+def test_기본은_원문만으로_만든_blind_재작성이고_oracle은_별도_보존한다() -> None:
+    blind = load_rewritten_queries(DEFAULT_REWRITTEN_QUERIES_PATH)
+    oracle = load_rewritten_queries(DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH)
+
+    assert len(blind) == len(oracle) == 30
+    assert blind["G03"] == "교환 가능한 경우 문의"
+    assert oracle["G03"] == "상품 교환 가능 사유와 반품 후 재주문 조건"
+    assert blind["G28"] == "이 주문의 환불 처리 요청"
+    assert oracle["G28"] == "이 주문의 환불 처리 절차와 환불 진행 기간"
+
+
+@pytest.mark.parametrize(
+    ("case_id", "forbidden"),
+    [
+        ("G12", "카드"),
+        ("G16", "운영시간"),
+        ("G17", "운영 안내"),
+        ("G25", "주문번호"),
+        ("G26", "영업일"),
+        ("G28", "기간"),
+        ("G29", "본인 확인"),
+        ("G30", "본인 확인"),
+    ],
+)
+def test_blind_재작성은_원문에_없는_답이나_전제를_주입하지_않는다(
+    case_id: str, forbidden: str
+) -> None:
+    rewrites = load_rewritten_queries()
+
+    assert forbidden not in rewrites[case_id]
 
 
 @pytest.mark.parametrize(
@@ -271,7 +303,9 @@ def test_런타임_실행_경로는_재작성_평가_픽스처와_격리된다()
         "fixture = Path('data/rewritten_queries.jsonl')\n",
         "from .retrieval_eval import load_rewritten_queries as load\nload()\n",
         "from .retrieval_eval import DEFAULT_REWRITTEN_QUERIES_PATH as path\nfixture = path\n",
+        "from .retrieval_eval import DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH as path\nfixture = path\n",
         'fixture = Path("data") / ("rewritten_" + "queries.jsonl")\n',
+        'fixture = Path("data") / ("rewritten_queries_" + "oracle.jsonl")\n',
     ],
 )
 def test_런타임_격리_검사는_금지_참조_변이를_RED로_잡는다(mutant: str) -> None:

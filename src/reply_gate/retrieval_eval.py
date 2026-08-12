@@ -52,6 +52,7 @@ __all__ = [
     "DEFAULT_EMBEDDING_CACHE_DIR",
     "DEFAULT_EMBEDDING_CANDIDATES",
     "DEFAULT_NGRAM_SIZE",
+    "DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH",
     "DEFAULT_RERANK_MODEL",
     "DEFAULT_RETRIEVAL_REPORT_DIR",
     "DEFAULT_REWRITTEN_QUERIES_PATH",
@@ -72,6 +73,7 @@ __all__ = [
     "RetrievalQuery",
     "RetrievalScore",
     "RetrievedCase",
+    "RewriteCondition",
     "StrategyComparison",
     "StrategyCutoffKind",
     "StrategyCutoffs",
@@ -101,11 +103,21 @@ DEFAULT_RRF_K: Final = 60
 DEFAULT_RRF_CUTOFF: Final = 0.02
 DEFAULT_NGRAM_SIZE: Final = 2
 DEFAULT_REWRITTEN_QUERIES_PATH: Final = _ROOT / "data" / "rewritten_queries.jsonl"
+DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH: Final = _ROOT / "data" / "rewritten_queries_oracle.jsonl"
 _REWRITTEN_QUERY_ROW_KEYS: Final = frozenset({"id", "original", "rewritten", "note"})
 
 
 class RetrievalConfigurationError(ValueError):
     """외부 호출 전 발견한 실행 구성 오류."""
+
+
+class RewriteCondition(StrEnum):
+    """재작성 비교 입력의 생성 조건."""
+
+    BLIND = "blind"
+    ORACLE = "oracle_upper_bound"
+    CALLER_INJECTED = "caller_injected"
+    NOT_USED = "not_used"
 
 
 class EmbeddingProvider(StrEnum):
@@ -394,6 +406,8 @@ class StrategyComparison:
     rrf_k: int
     ngram_size: int
     rerank_model: str
+    rewrite_condition: RewriteCondition
+    rewrite_source: str
     strategies: tuple[StrategyEvaluation, ...]
 
 
@@ -1025,6 +1039,8 @@ def evaluate_strategy_ladder(
     cutoffs: StrategyCutoffs,
     reranker: GenerationClient | None,
     rerank_model: str,
+    rewrite_condition: RewriteCondition | None = None,
+    rewrite_source: str | None = None,
     cache_dir: Path,
     rerank_cache_dir: Path,
     rrf_k: int = 60,
@@ -1053,12 +1069,21 @@ def evaluate_strategy_ladder(
         ngram_size=ngram_size,
         strategies=strategies,
     )
+    uses_rewrite = any(RetrievalStage.REWRITE in result.strategy.stages for result in retrieved)
+    if uses_rewrite:
+        resolved_condition = rewrite_condition or RewriteCondition.CALLER_INJECTED
+        resolved_source = rewrite_source or "caller_injected"
+    else:
+        resolved_condition = RewriteCondition.NOT_USED
+        resolved_source = "not_used"
     return StrategyComparison(
         embedding_config=embedding_config,
         cutoffs=cutoffs,
         rrf_k=rrf_k,
         ngram_size=ngram_size,
         rerank_model=rerank_model,
+        rewrite_condition=resolved_condition,
+        rewrite_source=resolved_source,
         strategies=score_strategy_ladder(retrieved, labels),
     )
 
@@ -1361,9 +1386,6 @@ def _strategy_hit_json(hit: RankedHit) -> dict[str, object]:
 
 def _strategy_json_report(comparison: StrategyComparison) -> dict[str, object]:
     config = comparison.embedding_config
-    uses_rewrite = any(
-        RetrievalStage.REWRITE in result.strategy.stages for result in comparison.strategies
-    )
     warning = (
         "결정론 어휘 임베딩·리랭크 대역 수치는 실제 검색 품질이 아니다. "
         "외부 호출 없는 배관 검증용이다."
@@ -1386,7 +1408,8 @@ def _strategy_json_report(comparison: StrategyComparison) -> dict[str, object]:
         "run_conditions": {
             "database_used": False,
             "labels_used_for_retrieval": False,
-            "rewrite_source": "caller_injected" if uses_rewrite else "not_used",
+            "rewrite_condition": comparison.rewrite_condition.value,
+            "rewrite_source": comparison.rewrite_source,
             "warning": warning,
         },
         "strategies": [
@@ -1425,20 +1448,31 @@ def _strategy_json_report(comparison: StrategyComparison) -> dict[str, object]:
 
 def _strategy_markdown_report(comparison: StrategyComparison) -> str:
     config = comparison.embedding_config
-    uses_rewrite = any(
-        RetrievalStage.REWRITE in result.strategy.stages for result in comparison.strategies
-    )
+    uses_rewrite = comparison.rewrite_condition is not RewriteCondition.NOT_USED
+    if comparison.rewrite_condition is RewriteCondition.BLIND:
+        rewrite_line = (
+            "- 질의 재작성: blind/deployable — 원문만으로 의미를 보존한 고정 입력 "
+            f"(`{comparison.rewrite_source}`; 원문 검색을 항상 함께 유지)"
+        )
+    elif comparison.rewrite_condition is RewriteCondition.ORACLE:
+        rewrite_line = (
+            "- 질의 재작성: oracle/curated upper bound "
+            f"(`{comparison.rewrite_source}`; **배포 가능 개선폭이 아님**)"
+        )
+    elif uses_rewrite:
+        rewrite_line = (
+            f"- 질의 재작성: 호출자 주입 (`{comparison.rewrite_source}`; "
+            "원문 검색을 항상 함께 유지)"
+        )
+    else:
+        rewrite_line = "- 질의 재작성: 미사용"
     lines = [
         "# 정책 검색 전략 비교",
         "",
         "## 실행 조건",
         "",
         "- 코퍼스: 주입된 정책 파일 조항 (DB 미사용)",
-        (
-            "- 질의 재작성: 호출자 주입 (원문 검색을 항상 함께 유지)"
-            if uses_rewrite
-            else "- 질의 재작성: 미사용"
-        ),
+        rewrite_line,
         f"- 임베딩: `{config.model}` ({config.dimensions}차원)",
         f"- 벡터/재작성 코사인 컷: {comparison.cutoffs.cosine_similarity:.6f}",
         f"- 하이브리드 RRF 컷: {comparison.cutoffs.rrf_score:.6f}",
@@ -1635,6 +1669,7 @@ def run_retrieval_comparison(
     output_dir: Path = DEFAULT_RETRIEVAL_REPORT_DIR,
     cache_dir: Path = DEFAULT_EMBEDDING_CACHE_DIR,
     rewritten_queries: Mapping[str, str] | None = None,
+    rewrite_condition: RewriteCondition = RewriteCondition.BLIND,
     rrf_k: int = DEFAULT_RRF_K,
     rrf_cutoff: float = DEFAULT_RRF_CUTOFF,
     ngram_size: int = DEFAULT_NGRAM_SIZE,
@@ -1646,9 +1681,17 @@ def run_retrieval_comparison(
     strategy_tuple = tuple(strategies)
     if not strategy_tuple:
         raise RetrievalConfigurationError("검색 전략은 하나 이상이어야 한다")
+    if not isinstance(rewrite_condition, RewriteCondition):
+        raise RetrievalConfigurationError("rewrite_condition은 정해진 조건 enum이어야 한다")
+    if rewrite_condition in {RewriteCondition.CALLER_INJECTED, RewriteCondition.NOT_USED}:
+        raise RetrievalConfigurationError(
+            "파일 기반 비교의 rewrite_condition은 blind 또는 oracle_upper_bound여야 한다"
+        )
     cases = load_golden_set(golden_set_path)
     queries = tuple(RetrievalQuery(case_id=case.id, text=case.content) for case in cases)
     uses_rewrite = any(RetrievalStage.REWRITE in strategy.stages for strategy in strategy_tuple)
+    if not uses_rewrite and rewrite_condition is RewriteCondition.ORACLE:
+        raise RetrievalConfigurationError("oracle 재작성과 벡터 단독 전략을 함께 요청할 수 없다")
     rewrite_input = (
         load_rewritten_queries(
             rewritten_queries_path,
@@ -1662,6 +1705,19 @@ def run_retrieval_comparison(
         rewritten_queries=rewrite_input,
         strategies=strategy_tuple,
     )
+    resolved_rewrite_condition: RewriteCondition
+    if uses_rewrite and rewritten_queries is None:
+        try:
+            resolved_rewrite_source = rewritten_queries_path.relative_to(_ROOT).as_posix()
+        except ValueError:
+            resolved_rewrite_source = str(rewritten_queries_path)
+        resolved_rewrite_condition = rewrite_condition
+    elif uses_rewrite:
+        resolved_rewrite_source = "caller_injected"
+        resolved_rewrite_condition = RewriteCondition.CALLER_INJECTED
+    else:
+        resolved_rewrite_source = "not_used"
+        resolved_rewrite_condition = RewriteCondition.NOT_USED
 
     settings = get_settings()
     resolved_dimensions = (
@@ -1738,6 +1794,8 @@ def run_retrieval_comparison(
             if reranker is not None
             else "not_used"
         ),
+        rewrite_condition=resolved_rewrite_condition,
+        rewrite_source=resolved_rewrite_source,
         cache_dir=cache_dir,
         rerank_cache_dir=cache_dir / "rerank",
         rrf_k=rrf_k,

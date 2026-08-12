@@ -13,8 +13,8 @@
 {"id": "G13", "relevant_evidence_ids": ["policy:refund:2-4"], "note": "특정 주문 값은 주문 데이터가 필요하지만 환불 처리 시점과 완료까지의 기간을 직접 다루는 조항이다."}
 {"id": "G14", "relevant_evidence_ids": ["policy:exchange:3-5"], "note": "교환 접수 상태와 함께 상품 수거 절차가 필요한 문의다."}
 {"id": "G15", "relevant_evidence_ids": ["policy:refund:2-5"], "note": "반품 사유별 배송비 부담 주체를 정한 조항이다."}
-{"id": "G16", "relevant_evidence_ids": ["policy:support:4-1"], "note": "전화번호 값이 비어 있어도 고객센터 연락과 운영을 정면으로 다루는 조항이다."}
-{"id": "G17", "relevant_evidence_ids": ["policy:support:4-1"], "note": "구어체 표현이지만 상담 전화 문의를 정면으로 다루는 고객센터 조항이다."}
+{"id": "G16", "relevant_evidence_ids": ["policy:support:4-1", "policy:support:4-2"], "note": "전화번호 문의에 답하거나 없는 값을 안전하게 제한하려면 고객센터 운영 안내와 전화 상담 채널 조항이 모두 직접 필요하다."}
+{"id": "G17", "relevant_evidence_ids": ["policy:support:4-1", "policy:support:4-2"], "note": "구어체 전화 상담 문의에 답하거나 없는 값을 안전하게 제한하려면 고객센터 운영 안내와 전화 상담 채널 조항이 모두 직접 필요하다."}
 {"id": "G18", "relevant_evidence_ids": ["policy:refund:2-6"], "note": "이메일 값이 비어 있어도 하자 환불 서류 제출처를 정면으로 다루는 조항이다."}
 {"id": "G19", "relevant_evidence_ids": ["policy:support:4-2"], "note": "이메일 값이 비어 있어도 이메일 문의 접수를 정면으로 다루는 조항이다."}
 {"id": "G20", "relevant_evidence_ids": ["policy:support:4-1", "policy:support:4-2"], "note": "전화 상담과 이메일 접수를 각각 다루는 두 미끼 조항이 모두 관련 근거다."}
@@ -22,9 +22,9 @@
 {"id": "G22", "relevant_evidence_ids": [], "note": "정책 문서에 기업 대량 구매나 B2B 할인 조항이 없다."}
 {"id": "G23", "relevant_evidence_ids": [], "note": "정책 문서에 오프라인 매장 픽업 조항이 없다."}
 {"id": "G24", "relevant_evidence_ids": [], "note": "정책 문서에 선물 포장 서비스 조항이 없다."}
-{"id": "G25", "relevant_evidence_ids": ["policy:shipping:1-5"], "note": "주문번호가 빠졌어도 문의 주제인 배송 상태 조회를 직접 다루는 정책 조항이다."}
+{"id": "G25", "relevant_evidence_ids": ["policy:shipping:1-5"], "note": "주문번호가 빠져도 요청한 정보의 주제는 배송 상태 조회이며, 주문번호 안내 같은 단순 처리 전제는 검색 정답에서 제외한다."}
 {"id": "G26", "relevant_evidence_ids": ["policy:shipping:1-1"], "note": "주문번호가 빠졌어도 문의 주제인 출고 후 도착 소요 기간을 직접 다루는 정책 조항이다."}
 {"id": "G27", "relevant_evidence_ids": ["policy:shipping:1-5"], "note": "주문이 존재하지 않아도 문의 주제인 배송 상태 조회를 직접 다루는 정책 조항이다."}
-{"id": "G28", "relevant_evidence_ids": ["policy:refund:2-4"], "note": "주문이 존재하지 않아도 문의 주제인 환불 처리 절차와 기간을 직접 다루는 정책 조항이다."}
-{"id": "G29", "relevant_evidence_ids": ["policy:support:4-5"], "note": "주문 상세 정보 안내 전 본인 확인과 상세 정보 제한을 직접 다루는 정책 조항이다."}
-{"id": "G30", "relevant_evidence_ids": ["policy:support:4-5"], "note": "카드 번호 값은 보유하지 않지만 주문 상세 정보 안내의 본인 확인과 제한을 직접 다루는 정책 조항이다."}
+{"id": "G28", "relevant_evidence_ids": [], "note": "환불 실행 요청에 직접 답하거나 처리를 수행하는 정책 조항이 없으며, 환불 처리 기간 조항은 실행 요청의 직접 근거가 아니다."}
+{"id": "G29", "relevant_evidence_ids": ["policy:support:4-5"], "note": "주문 상세 주소와 연락처의 공개를 안전하게 제한하는 접근 통제 조항이 직접 필요하다."}
+{"id": "G30", "relevant_evidence_ids": ["policy:support:4-5"], "note": "카드 번호를 보유하거나 공개할 근거는 아니지만 주문 상세 정보의 공개 제한에 직접 적용되는 접근 통제 조항이다."}
