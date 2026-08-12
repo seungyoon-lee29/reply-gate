@@ -1,4 +1,4 @@
-"""DB 없는 정책 검색 전략 사다리 비교 실행 진입점.
+"""DB 없는 정책 벡터 단독 비교 실행 진입점.
 
     uv run python -m scripts.compare_retrieval --stub-embedding
     uv run python -m scripts.compare_retrieval --live  # 실제 임베딩 호출, 과금 가능
@@ -25,11 +25,17 @@ from reply_gate.retrieval_eval import (
     run_retrieval_comparison,
 )
 from reply_gate.retrieval_labels import DEFAULT_RETRIEVAL_LABELS_PATH
+from reply_gate.retrieval_strategies import RetrievalStage, StrategyDefinition
+
+_VECTOR_ONLY = (StrategyDefinition("vector", (RetrievalStage.VECTOR,)),)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="DB 없이 정책 조항과 골든셋 문의의 누적 검색 전략을 비교한다"
+        description=(
+            "DB 없이 정책 조항과 골든셋 문의의 벡터 단독 검색을 평가한다. "
+            "재작성 포함 사다리는 패키지 API에 재작성문을 주입해 실행한다."
+        )
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
@@ -101,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
             ngram_size=args.ngram_size,
             rerank_top_n=args.rerank_top_n,
             rerank_model=args.rerank_model,
+            strategies=_VECTOR_ONLY,
         )
     except (RetrievalConfigurationError, FileNotFoundError, ValueError) as exc:
         print(f"검색 비교 실행 실패: {exc}", file=sys.stderr)

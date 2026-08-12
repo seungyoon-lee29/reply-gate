@@ -541,11 +541,44 @@ def _ranked_fused_hits(hits: Sequence[FusedHit]) -> tuple[RankedHit, ...]:
     )
 
 
+def _validate_rewritten_queries(
+    *,
+    queries: Sequence[RetrievalQuery],
+    rewritten_queries: Mapping[str, str] | None,
+    strategies: Sequence[StrategyDefinition],
+) -> dict[str, str]:
+    if not any(RetrievalStage.REWRITE in strategy.stages for strategy in strategies):
+        return {}
+    if rewritten_queries is None:
+        raise RetrievalConfigurationError(
+            "재작성 전략에는 케이스별 rewritten_queries 호출자 주입이 필요하다"
+        )
+    query_id_list = [query.case_id for query in queries]
+    query_ids = set(query_id_list)
+    if len(query_ids) != len(query_id_list):
+        raise RetrievalConfigurationError("문의 케이스 ID가 중복되어 재작성문과 1:1 대응할 수 없다")
+    rewrite_ids = set(rewritten_queries)
+    if query_ids != rewrite_ids:
+        missing = ", ".join(sorted(query_ids - rewrite_ids)) or "없음"
+        extra = ", ".join(sorted(rewrite_ids - query_ids)) or "없음"
+        raise RetrievalConfigurationError(
+            f"문의와 주입된 재작성 ID가 다르다(누락={missing}, 추가={extra})"
+        )
+    empty_ids = sorted(
+        case_id
+        for case_id, text in rewritten_queries.items()
+        if not isinstance(text, str) or not text.strip()
+    )
+    if empty_ids:
+        raise RetrievalConfigurationError(f"주입된 재작성문이 비어 있다: {', '.join(empty_ids)}")
+    return dict(rewritten_queries)
+
+
 def retrieve_strategy_ladder(
     *,
     queries: Sequence[RetrievalQuery],
     policy_texts: Sequence[tuple[str, str]],
-    rewritten_queries: Mapping[str, str],
+    rewritten_queries: Mapping[str, str] | None,
     embedder: EmbeddingClient,
     embedding_config: RetrievalEvalConfig,
     cutoffs: StrategyCutoffs,
@@ -561,18 +594,19 @@ def retrieve_strategy_ladder(
     strategy_tuple = tuple(strategies)
     if not strategy_tuple:
         raise ValueError("검색 전략은 하나 이상이어야 한다")
-    if any(RetrievalStage.RERANK in strategy.stages for strategy in strategy_tuple):
+    uses_rewrite = any(RetrievalStage.REWRITE in strategy.stages for strategy in strategy_tuple)
+    uses_hybrid = any(RetrievalStage.HYBRID in strategy.stages for strategy in strategy_tuple)
+    uses_rerank = any(RetrievalStage.RERANK in strategy.stages for strategy in strategy_tuple)
+    injected_rewrites = _validate_rewritten_queries(
+        queries=queries,
+        rewritten_queries=rewritten_queries,
+        strategies=strategy_tuple,
+    )
+    if uses_rerank:
         if reranker is None:
             raise ValueError("리랭크 전략에는 GenerationClient가 필요하다")
         if not rerank_model.strip():
             raise ValueError("rerank_model은 비어 있지 않아야 한다")
-
-    query_ids = {query.case_id for query in queries}
-    rewrite_ids = set(rewritten_queries)
-    if query_ids != rewrite_ids:
-        missing = ", ".join(sorted(query_ids - rewrite_ids)) or "없음"
-        extra = ", ".join(sorted(rewrite_ids - query_ids)) or "없음"
-        raise ValueError(f"문의와 주입된 재작성 ID가 다르다(누락={missing}, 추가={extra})")
 
     original = retrieve_cases(
         queries=queries,
@@ -581,15 +615,19 @@ def retrieve_strategy_ladder(
         config=embedding_config,
         cache_dir=cache_dir,
     )
-    rewritten = retrieve_cases(
-        queries=tuple(
-            RetrievalQuery(case_id=query.case_id, text=rewritten_queries[query.case_id])
-            for query in queries
-        ),
-        policy_texts=policy_texts,
-        embedder=embedder,
-        config=embedding_config,
-        cache_dir=cache_dir,
+    rewritten = (
+        retrieve_cases(
+            queries=tuple(
+                RetrievalQuery(case_id=query.case_id, text=injected_rewrites[query.case_id])
+                for query in queries
+            ),
+            policy_texts=policy_texts,
+            embedder=embedder,
+            config=embedding_config,
+            cache_dir=cache_dir,
+        )
+        if uses_rewrite
+        else ()
     )
     original_by_id = {case.case_id: case for case in original}
     rewritten_by_id = {case.case_id: case for case in rewritten}
@@ -605,17 +643,34 @@ def retrieve_strategy_ladder(
             VectorHit(hit.rank, hit.evidence_id, hit.similarity)
             for hit in original_by_id[query.case_id].ranked_hits
         )
-        rewritten_vector = tuple(
-            VectorHit(hit.rank, hit.evidence_id, hit.similarity)
-            for hit in rewritten_by_id[query.case_id].ranked_hits
+        rewritten_vector = (
+            tuple(
+                VectorHit(hit.rank, hit.evidence_id, hit.similarity)
+                for hit in rewritten_by_id[query.case_id].ranked_hits
+            )
+            if uses_rewrite
+            else ()
         )
-        merged_vector = merge_rewritten_rankings(
-            original=original_vector, rewritten=rewritten_vector
+        merged_vector = (
+            merge_rewritten_rankings(original=original_vector, rewritten=rewritten_vector)
+            if uses_rewrite
+            else original_vector
         )
-        lexical = bm25_rank(query=query.text, documents=policy_texts, ngram_size=ngram_size)
-        fused = reciprocal_rank_fusion(vector=merged_vector, bm25=lexical, rrf_k=rrf_k)
-        hybrid_candidates = tuple(
-            hit for hit in fused[: embedding_config.top_k] if hit.rrf_score >= cutoffs.rrf_score
+        fused = (
+            reciprocal_rank_fusion(
+                vector=merged_vector,
+                bm25=bm25_rank(query=query.text, documents=policy_texts, ngram_size=ngram_size),
+                rrf_k=rrf_k,
+            )
+            if uses_hybrid
+            else ()
+        )
+        hybrid_candidates = (
+            tuple(
+                hit for hit in fused[: embedding_config.top_k] if hit.rrf_score >= cutoffs.rrf_score
+            )
+            if uses_hybrid
+            else ()
         )
         reranked = (
             llm_rerank(
@@ -626,7 +681,7 @@ def retrieve_strategy_ladder(
                 model=rerank_model,
                 cache_dir=rerank_cache_dir,
             )
-            if reranker is not None
+            if uses_rerank and reranker is not None
             else ()
         )
 
@@ -821,7 +876,7 @@ def evaluate_strategy_ladder(
     documents: Sequence[PolicyDocument],
     cases: Sequence[GoldenCase],
     labels: Sequence[RetrievalLabel],
-    rewritten_queries: Mapping[str, str],
+    rewritten_queries: Mapping[str, str] | None,
     embedder: EmbeddingClient,
     embedding_config: RetrievalEvalConfig,
     cutoffs: StrategyCutoffs,
@@ -1163,6 +1218,9 @@ def _strategy_hit_json(hit: RankedHit) -> dict[str, object]:
 
 def _strategy_json_report(comparison: StrategyComparison) -> dict[str, object]:
     config = comparison.embedding_config
+    uses_rewrite = any(
+        RetrievalStage.REWRITE in result.strategy.stages for result in comparison.strategies
+    )
     warning = (
         "결정론 어휘 임베딩·리랭크 대역 수치는 실제 검색 품질이 아니다. "
         "외부 호출 없는 배관 검증용이다."
@@ -1185,7 +1243,7 @@ def _strategy_json_report(comparison: StrategyComparison) -> dict[str, object]:
         "run_conditions": {
             "database_used": False,
             "labels_used_for_retrieval": False,
-            "rewrite_source": "caller_injected",
+            "rewrite_source": "caller_injected" if uses_rewrite else "not_used",
             "warning": warning,
         },
         "strategies": [
@@ -1224,13 +1282,20 @@ def _strategy_json_report(comparison: StrategyComparison) -> dict[str, object]:
 
 def _strategy_markdown_report(comparison: StrategyComparison) -> str:
     config = comparison.embedding_config
+    uses_rewrite = any(
+        RetrievalStage.REWRITE in result.strategy.stages for result in comparison.strategies
+    )
     lines = [
-        "# 정책 검색 전략 사다리 비교",
+        "# 정책 검색 전략 비교",
         "",
         "## 실행 조건",
         "",
         "- 코퍼스: 주입된 정책 파일 조항 (DB 미사용)",
-        "- 질의 재작성: 호출자 주입 (원문 검색을 항상 함께 유지)",
+        (
+            "- 질의 재작성: 호출자 주입 (원문 검색을 항상 함께 유지)"
+            if uses_rewrite
+            else "- 질의 재작성: 미사용"
+        ),
         f"- 임베딩: `{config.model}` ({config.dimensions}차원)",
         f"- 벡터/재작성 코사인 컷: {comparison.cutoffs.cosine_similarity:.6f}",
         f"- 하이브리드 RRF 컷: {comparison.cutoffs.rrf_score:.6f}",
@@ -1298,7 +1363,7 @@ def _next_strategy_report_paths(output_dir: Path, comparison: StrategyComparison
     config = comparison.embedding_config
     mode = "stub" if config.is_stub else "live"
     model = re.sub(r"[^a-z0-9]+", "-", config.model.lower()).strip("-") or "model"
-    stem = f"retrieval-ladder-{mode}-{model}-d{config.dimensions}"
+    stem = f"retrieval-strategies-{mode}-{model}-d{config.dimensions}"
     suffix: int | None = None
     while True:
         ending = "" if suffix is None else f"-{suffix}"
@@ -1370,8 +1435,20 @@ def run_retrieval_comparison(
     ngram_size: int = DEFAULT_NGRAM_SIZE,
     rerank_top_n: int = 5,
     rerank_model: str = DEFAULT_RERANK_MODEL,
+    strategies: Sequence[StrategyDefinition] = default_strategy_ladder(),
 ) -> ReportPaths:
     """CLI가 호출하는 전체 오프라인 사다리. 실제 모드만 외부 호출을 과금한다."""
+    strategy_tuple = tuple(strategies)
+    if not strategy_tuple:
+        raise RetrievalConfigurationError("검색 전략은 하나 이상이어야 한다")
+    cases = load_golden_set(golden_set_path)
+    queries = tuple(RetrievalQuery(case_id=case.id, text=case.content) for case in cases)
+    injected_rewrites = _validate_rewritten_queries(
+        queries=queries,
+        rewritten_queries=rewritten_queries,
+        strategies=strategy_tuple,
+    )
+
     settings = get_settings()
     resolved_dimensions = settings.embedding_dimensions if dimensions is None else dimensions
     sweep = _cutoff_sweep(start=sweep_start, end=sweep_end, step=sweep_step)
@@ -1387,15 +1464,23 @@ def run_retrieval_comparison(
             model=model,
             dimensions=resolved_dimensions,
         )
-        reranker: GenerationClient = OpenAIGenerationClient(
-            api_key=settings.openai_api_key,
-            model=rerank_model,
+        reranker: GenerationClient | None = (
+            OpenAIGenerationClient(
+                api_key=settings.openai_api_key,
+                model=rerank_model,
+            )
+            if any(RetrievalStage.RERANK in strategy.stages for strategy in strategy_tuple)
+            else None
         )
     else:
         model = STUB_EMBEDDING_MODEL
         resolved_cutoff = STUB_DEFAULT_CUTOFF if cutoff is None else cutoff
         embedder = LexicalEmbeddingClient(dimensions=resolved_dimensions)
-        reranker = _IdentityRerankClient()
+        reranker = (
+            _IdentityRerankClient()
+            if any(RetrievalStage.RERANK in strategy.stages for strategy in strategy_tuple)
+            else None
+        )
 
     config = RetrievalEvalConfig(
         model=model,
@@ -1407,18 +1492,12 @@ def run_retrieval_comparison(
     )
     # 세 입력은 각각의 단독 소유 로더에서 독립적으로 읽는다.
     documents = load_policy_documents(policy_dir)
-    cases = load_golden_set(golden_set_path)
     labels = load_retrieval_labels(labels_path)
-    injected_rewrites = (
-        {case.id: case.content for case in cases}
-        if rewritten_queries is None
-        else dict(rewritten_queries)
-    )
     comparison = evaluate_strategy_ladder(
         documents=documents,
         cases=cases,
         labels=labels,
-        rewritten_queries=injected_rewrites,
+        rewritten_queries=injected_rewrites if injected_rewrites else None,
         embedder=embedder,
         embedding_config=config,
         cutoffs=StrategyCutoffs(
@@ -1427,10 +1506,17 @@ def run_retrieval_comparison(
             rerank_top_n=rerank_top_n,
         ),
         reranker=reranker,
-        rerank_model=rerank_model if live else "stub-identity-reranker",
+        rerank_model=(
+            rerank_model
+            if live
+            else "stub-identity-reranker"
+            if reranker is not None
+            else "not_used"
+        ),
         cache_dir=cache_dir,
         rerank_cache_dir=cache_dir / "rerank",
         rrf_k=rrf_k,
         ngram_size=ngram_size,
+        strategies=strategy_tuple,
     )
     return write_strategy_report(comparison, output_dir=output_dir)
