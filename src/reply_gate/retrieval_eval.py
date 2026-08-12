@@ -1,4 +1,4 @@
-"""DB를 거치지 않는 정책 벡터 검색 비교와 채점."""
+"""DB를 거치지 않는 정책 검색 전략 사다리 비교와 채점."""
 
 from __future__ import annotations
 
@@ -6,16 +6,23 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
+from enum import StrEnum
 from pathlib import Path
 from statistics import fmean
-from typing import Final, cast
+from typing import Any, Final, cast
 
 from reply_gate.config import get_settings
 from reply_gate.evaluation import DEFAULT_GOLDEN_SET_PATH, GoldenCase, load_golden_set
-from reply_gate.llm import EmbeddingClient, OpenAIEmbeddingClient
+from reply_gate.llm import (
+    EmbeddingClient,
+    GenerationClient,
+    JsonCompletion,
+    OpenAIEmbeddingClient,
+    OpenAIGenerationClient,
+)
 from reply_gate.policy_index import (
     DEFAULT_POLICY_DIR,
     PolicyDocument,
@@ -26,11 +33,26 @@ from reply_gate.retrieval_labels import (
     RetrievalLabel,
     load_retrieval_labels,
 )
+from reply_gate.retrieval_strategies import (
+    FusedHit,
+    RetrievalStage,
+    StrategyDefinition,
+    VectorHit,
+    bm25_rank,
+    default_strategy_ladder,
+    llm_rerank,
+    merge_rewritten_rankings,
+    reciprocal_rank_fusion,
+)
 from reply_gate.testing import LexicalEmbeddingClient
 
 __all__ = [
     "DEFAULT_EMBEDDING_CACHE_DIR",
+    "DEFAULT_NGRAM_SIZE",
+    "DEFAULT_RERANK_MODEL",
     "DEFAULT_RETRIEVAL_REPORT_DIR",
+    "DEFAULT_RRF_CUTOFF",
+    "DEFAULT_RRF_K",
     "AggregateMetrics",
     "CaseScore",
     "CutoffSweepPoint",
@@ -42,11 +64,20 @@ __all__ = [
     "RetrievalQuery",
     "RetrievalScore",
     "RetrievedCase",
+    "StrategyComparison",
+    "StrategyCutoffKind",
+    "StrategyCutoffs",
+    "StrategyEvaluation",
+    "StrategyRetrievedCase",
     "evaluate_retrieval",
+    "evaluate_strategy_ladder",
     "retrieve_cases",
+    "retrieve_strategy_ladder",
     "run_retrieval_comparison",
     "score_retrieval",
+    "score_strategy_ladder",
     "write_report",
+    "write_strategy_report",
 ]
 
 DEFAULT_CUTOFF_SWEEP: Final = tuple(round(0.10 + index * 0.05, 2) for index in range(13))
@@ -55,10 +86,35 @@ DEFAULT_RETRIEVAL_REPORT_DIR: Final = _ROOT / "reports"
 DEFAULT_EMBEDDING_CACHE_DIR: Final = _ROOT / ".retrieval-cache"
 STUB_EMBEDDING_MODEL: Final = "lexical-2gram-v1"
 STUB_DEFAULT_CUTOFF: Final = 0.10
+DEFAULT_RERANK_MODEL: Final = "gpt-5.6-luna"
+DEFAULT_RRF_K: Final = 60
+DEFAULT_RRF_CUTOFF: Final = 0.02
+DEFAULT_NGRAM_SIZE: Final = 2
 
 
 class RetrievalConfigurationError(ValueError):
     """외부 호출 전 발견한 실행 구성 오류."""
+
+
+class _IdentityRerankClient:
+    """대역 사다리 배관용 무과금 리랭커. 입력 후보 순서를 그대로 돌려준다."""
+
+    def complete_json(self, **kwargs: Any) -> JsonCompletion:
+        raw: object = json.loads(cast(str, kwargs["user"]))
+        if not isinstance(raw, dict):
+            raise ValueError("리랭크 대역 입력이 object가 아니다")
+        candidates = cast(dict[str, object], raw).get("candidates")
+        if not isinstance(candidates, list):
+            raise ValueError("리랭크 대역 후보가 array가 아니다")
+        evidence_ids: list[str] = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                raise ValueError("리랭크 대역 후보가 object가 아니다")
+            evidence_id = cast(dict[str, object], candidate).get("evidence_id")
+            if not isinstance(evidence_id, str):
+                raise ValueError("리랭크 대역 후보 ID가 문자열이 아니다")
+            evidence_ids.append(evidence_id)
+        return JsonCompletion(data={"evidence_ids": evidence_ids}, input_tokens=0, output_tokens=0)
 
 
 @dataclass(frozen=True)
@@ -102,6 +158,10 @@ class RankedHit:
     rank: int
     evidence_id: str
     similarity: float
+    bm25_score: float | None = None
+    rrf_score: float | None = None
+    vector_rank: int | None = None
+    bm25_rank: int | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +170,88 @@ class RetrievedCase:
 
     case_id: str
     ranked_hits: tuple[RankedHit, ...]
+
+
+class StrategyCutoffKind(StrEnum):
+    """전략 단계마다 의미가 다른 채택 축."""
+
+    COSINE_SIMILARITY = "cosine_similarity"
+    RRF_SCORE = "rrf_score"
+    RANK_LIMIT = "rank_limit"
+
+
+@dataclass(frozen=True)
+class StrategyCutoffs:
+    """서로 단위가 다른 검색 전략 컷."""
+
+    cosine_similarity: float = 0.30
+    rrf_score: float = 0.02
+    rerank_top_n: int = 5
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.cosine_similarity <= 1.0:
+            raise ValueError("cosine_similarity는 0.0 이상 1.0 이하여야 한다")
+        if self.rrf_score < 0.0:
+            raise ValueError("rrf_score는 0.0 이상이어야 한다")
+        if self.rerank_top_n <= 0:
+            raise ValueError("rerank_top_n은 1 이상이어야 한다")
+
+
+@dataclass(frozen=True)
+class StrategyRetrievedCase:
+    """라벨을 보지 않고 검색·컷 적용까지 끝낸 전략별 케이스."""
+
+    case_id: str
+    ranked_hits: tuple[RankedHit, ...]
+    accepted_hits: tuple[RankedHit, ...]
+
+
+@dataclass(frozen=True)
+class StrategyRetrieval:
+    """한 전략의 라벨 없는 검색 결과."""
+
+    strategy: StrategyDefinition
+    cutoff_kind: StrategyCutoffKind
+    cutoff_value: float | int
+    cases: tuple[StrategyRetrievedCase, ...]
+
+
+@dataclass(frozen=True)
+class StrategyCaseScore:
+    """전략 검색 결과를 독립 라벨로 채점한 케이스."""
+
+    case_id: str
+    relevant_evidence_ids: frozenset[str]
+    ranked_hits: tuple[RankedHit, ...]
+    accepted_hits: tuple[RankedHit, ...]
+    recall_at_1: float | None
+    recall_at_3: float | None
+    recall_at_5: float | None
+    accepted_precision: float | None
+    accepted_recall: float | None
+
+
+@dataclass(frozen=True)
+class StrategyEvaluation:
+    """한 누적 전략의 컷·케이스·집계."""
+
+    strategy: StrategyDefinition
+    cutoff_kind: StrategyCutoffKind
+    cutoff_value: float | int
+    cases: tuple[StrategyCaseScore, ...]
+    aggregate: AggregateMetrics
+
+
+@dataclass(frozen=True)
+class StrategyComparison:
+    """동일 입력에 대한 네 단계 누적 전략 비교."""
+
+    embedding_config: RetrievalEvalConfig
+    cutoffs: StrategyCutoffs
+    rrf_k: int
+    ngram_size: int
+    rerank_model: str
+    strategies: tuple[StrategyEvaluation, ...]
 
 
 @dataclass(frozen=True)
@@ -372,6 +514,173 @@ def retrieve_cases(
     return tuple(retrieved)
 
 
+def _ranked_vector_hits(hits: Sequence[VectorHit]) -> tuple[RankedHit, ...]:
+    return tuple(
+        RankedHit(
+            rank=hit.rank,
+            evidence_id=hit.evidence_id,
+            similarity=hit.similarity,
+            vector_rank=hit.rank,
+        )
+        for hit in hits
+    )
+
+
+def _ranked_fused_hits(hits: Sequence[FusedHit]) -> tuple[RankedHit, ...]:
+    return tuple(
+        RankedHit(
+            rank=hit.rank,
+            evidence_id=hit.evidence_id,
+            similarity=hit.vector_similarity or 0.0,
+            bm25_score=hit.bm25_score,
+            rrf_score=hit.rrf_score,
+            vector_rank=hit.vector_rank,
+            bm25_rank=hit.bm25_rank,
+        )
+        for hit in hits
+    )
+
+
+def retrieve_strategy_ladder(
+    *,
+    queries: Sequence[RetrievalQuery],
+    policy_texts: Sequence[tuple[str, str]],
+    rewritten_queries: Mapping[str, str],
+    embedder: EmbeddingClient,
+    embedding_config: RetrievalEvalConfig,
+    cutoffs: StrategyCutoffs,
+    reranker: GenerationClient | None,
+    rerank_model: str,
+    cache_dir: Path,
+    rerank_cache_dir: Path,
+    rrf_k: int = 60,
+    ngram_size: int = 2,
+    strategies: Sequence[StrategyDefinition] = default_strategy_ladder(),
+) -> tuple[StrategyRetrieval, ...]:
+    """정답 라벨 없이 누적 전략 검색과 각 단계의 채택 컷을 적용한다."""
+    strategy_tuple = tuple(strategies)
+    if not strategy_tuple:
+        raise ValueError("검색 전략은 하나 이상이어야 한다")
+    if any(RetrievalStage.RERANK in strategy.stages for strategy in strategy_tuple):
+        if reranker is None:
+            raise ValueError("리랭크 전략에는 GenerationClient가 필요하다")
+        if not rerank_model.strip():
+            raise ValueError("rerank_model은 비어 있지 않아야 한다")
+
+    query_ids = {query.case_id for query in queries}
+    rewrite_ids = set(rewritten_queries)
+    if query_ids != rewrite_ids:
+        missing = ", ".join(sorted(query_ids - rewrite_ids)) or "없음"
+        extra = ", ".join(sorted(rewrite_ids - query_ids)) or "없음"
+        raise ValueError(f"문의와 주입된 재작성 ID가 다르다(누락={missing}, 추가={extra})")
+
+    original = retrieve_cases(
+        queries=queries,
+        policy_texts=policy_texts,
+        embedder=embedder,
+        config=embedding_config,
+        cache_dir=cache_dir,
+    )
+    rewritten = retrieve_cases(
+        queries=tuple(
+            RetrievalQuery(case_id=query.case_id, text=rewritten_queries[query.case_id])
+            for query in queries
+        ),
+        policy_texts=policy_texts,
+        embedder=embedder,
+        config=embedding_config,
+        cache_dir=cache_dir,
+    )
+    original_by_id = {case.case_id: case for case in original}
+    rewritten_by_id = {case.case_id: case for case in rewritten}
+    policy_by_id = dict(policy_texts)
+    if len(policy_by_id) != len(policy_texts):
+        raise ValueError("정책 근거 ID가 중복된다")
+
+    cases_by_strategy: dict[str, list[StrategyRetrievedCase]] = {
+        strategy.name: [] for strategy in strategy_tuple
+    }
+    for query in queries:
+        original_vector = tuple(
+            VectorHit(hit.rank, hit.evidence_id, hit.similarity)
+            for hit in original_by_id[query.case_id].ranked_hits
+        )
+        rewritten_vector = tuple(
+            VectorHit(hit.rank, hit.evidence_id, hit.similarity)
+            for hit in rewritten_by_id[query.case_id].ranked_hits
+        )
+        merged_vector = merge_rewritten_rankings(
+            original=original_vector, rewritten=rewritten_vector
+        )
+        lexical = bm25_rank(query=query.text, documents=policy_texts, ngram_size=ngram_size)
+        fused = reciprocal_rank_fusion(vector=merged_vector, bm25=lexical, rrf_k=rrf_k)
+        hybrid_candidates = tuple(
+            hit for hit in fused[: embedding_config.top_k] if hit.rrf_score >= cutoffs.rrf_score
+        )
+        reranked = (
+            llm_rerank(
+                query=query.text,
+                candidates=hybrid_candidates,
+                policy_texts=policy_by_id,
+                client=reranker,
+                model=rerank_model,
+                cache_dir=rerank_cache_dir,
+            )
+            if reranker is not None
+            else ()
+        )
+
+        for strategy in strategy_tuple:
+            if RetrievalStage.RERANK in strategy.stages:
+                ranked = _ranked_fused_hits(reranked)
+                accepted = ranked[: cutoffs.rerank_top_n]
+            elif RetrievalStage.HYBRID in strategy.stages:
+                ranked = _ranked_fused_hits(fused)
+                accepted = _ranked_fused_hits(hybrid_candidates)
+            elif RetrievalStage.REWRITE in strategy.stages:
+                ranked = _ranked_vector_hits(merged_vector)
+                accepted = tuple(
+                    hit
+                    for hit in ranked[: embedding_config.top_k]
+                    if hit.similarity >= cutoffs.cosine_similarity
+                )
+            else:
+                ranked = _ranked_vector_hits(original_vector)
+                accepted = tuple(
+                    hit
+                    for hit in ranked[: embedding_config.top_k]
+                    if hit.similarity >= cutoffs.cosine_similarity
+                )
+            cases_by_strategy[strategy.name].append(
+                StrategyRetrievedCase(
+                    case_id=query.case_id,
+                    ranked_hits=ranked,
+                    accepted_hits=accepted,
+                )
+            )
+
+    retrievals: list[StrategyRetrieval] = []
+    for strategy in strategy_tuple:
+        if RetrievalStage.RERANK in strategy.stages:
+            cutoff_kind = StrategyCutoffKind.RANK_LIMIT
+            cutoff_value: float | int = cutoffs.rerank_top_n
+        elif RetrievalStage.HYBRID in strategy.stages:
+            cutoff_kind = StrategyCutoffKind.RRF_SCORE
+            cutoff_value = cutoffs.rrf_score
+        else:
+            cutoff_kind = StrategyCutoffKind.COSINE_SIMILARITY
+            cutoff_value = cutoffs.cosine_similarity
+        retrievals.append(
+            StrategyRetrieval(
+                strategy=strategy,
+                cutoff_kind=cutoff_kind,
+                cutoff_value=cutoff_value,
+                cases=tuple(cases_by_strategy[strategy.name]),
+            )
+        )
+    return tuple(retrievals)
+
+
 def score_retrieval(
     retrieved: tuple[RetrievedCase, ...],
     labels: tuple[RetrievalLabel, ...],
@@ -440,6 +749,120 @@ def score_retrieval(
         recall_case_count=sum(case.accepted_recall is not None for case in cases),
     )
     return RetrievalScore(cutoff=cutoff, top_k=top_k, cases=tuple(cases), aggregate=aggregate)
+
+
+def score_strategy_ladder(
+    retrieved: Sequence[StrategyRetrieval], labels: Sequence[RetrievalLabel]
+) -> tuple[StrategyEvaluation, ...]:
+    """라벨 없는 전략 산출을 검색 완료 뒤 독립 채점한다."""
+    labels_tuple = tuple(labels)
+    label_by_id = {label.id: label for label in labels_tuple}
+    evaluations: list[StrategyEvaluation] = []
+    for strategy_result in retrieved:
+        retrieved_ids = {case.case_id for case in strategy_result.cases}
+        label_ids = set(label_by_id)
+        if retrieved_ids != label_ids:
+            missing = ", ".join(sorted(label_ids - retrieved_ids)) or "없음"
+            extra = ", ".join(sorted(retrieved_ids - label_ids)) or "없음"
+            raise ValueError(f"검색 결과와 라벨 ID가 다르다(누락={missing}, 추가={extra})")
+
+        cases: list[StrategyCaseScore] = []
+        for result in strategy_result.cases:
+            relevant = label_by_id[result.case_id].relevant_evidence_ids
+            accepted_ids = {hit.evidence_id for hit in result.accepted_hits}
+            if result.accepted_hits:
+                precision = len(accepted_ids & relevant) / len(result.accepted_hits)
+            elif not relevant:
+                precision = 1.0
+            else:
+                precision = None
+            accepted_recall = len(accepted_ids & relevant) / len(relevant) if relevant else None
+            cases.append(
+                StrategyCaseScore(
+                    case_id=result.case_id,
+                    relevant_evidence_ids=relevant,
+                    ranked_hits=result.ranked_hits,
+                    accepted_hits=result.accepted_hits,
+                    recall_at_1=_recall_at(result.ranked_hits, relevant, 1),
+                    recall_at_3=_recall_at(result.ranked_hits, relevant, 3),
+                    recall_at_5=_recall_at(result.ranked_hits, relevant, 5),
+                    accepted_precision=precision,
+                    accepted_recall=accepted_recall,
+                )
+            )
+
+        aggregate = AggregateMetrics(
+            recall_at_1=_mean([case.recall_at_1 for case in cases if case.recall_at_1 is not None]),
+            recall_at_3=_mean([case.recall_at_3 for case in cases if case.recall_at_3 is not None]),
+            recall_at_5=_mean([case.recall_at_5 for case in cases if case.recall_at_5 is not None]),
+            accepted_precision=_mean(
+                [case.accepted_precision for case in cases if case.accepted_precision is not None]
+            ),
+            accepted_recall=_mean(
+                [case.accepted_recall for case in cases if case.accepted_recall is not None]
+            ),
+            precision_case_count=sum(case.accepted_precision is not None for case in cases),
+            recall_case_count=sum(case.accepted_recall is not None for case in cases),
+        )
+        evaluations.append(
+            StrategyEvaluation(
+                strategy=strategy_result.strategy,
+                cutoff_kind=strategy_result.cutoff_kind,
+                cutoff_value=strategy_result.cutoff_value,
+                cases=tuple(cases),
+                aggregate=aggregate,
+            )
+        )
+    return tuple(evaluations)
+
+
+def evaluate_strategy_ladder(
+    *,
+    documents: Sequence[PolicyDocument],
+    cases: Sequence[GoldenCase],
+    labels: Sequence[RetrievalLabel],
+    rewritten_queries: Mapping[str, str],
+    embedder: EmbeddingClient,
+    embedding_config: RetrievalEvalConfig,
+    cutoffs: StrategyCutoffs,
+    reranker: GenerationClient | None,
+    rerank_model: str,
+    cache_dir: Path,
+    rerank_cache_dir: Path,
+    rrf_k: int = 60,
+    ngram_size: int = 2,
+    strategies: Sequence[StrategyDefinition] = default_strategy_ladder(),
+) -> StrategyComparison:
+    """정책·문의에 네 전략을 적용한 뒤에만 라벨로 채점한다."""
+    queries = tuple(RetrievalQuery(case_id=case.id, text=case.content) for case in cases)
+    policy_texts = tuple(
+        (chunk.evidence_id, chunk.embedding_text)
+        for document in documents
+        for chunk in document.chunks
+    )
+    retrieved = retrieve_strategy_ladder(
+        queries=queries,
+        policy_texts=policy_texts,
+        rewritten_queries=rewritten_queries,
+        embedder=embedder,
+        embedding_config=embedding_config,
+        cutoffs=cutoffs,
+        reranker=reranker,
+        rerank_model=rerank_model,
+        cache_dir=cache_dir,
+        rerank_cache_dir=rerank_cache_dir,
+        rrf_k=rrf_k,
+        ngram_size=ngram_size,
+        strategies=strategies,
+    )
+    return StrategyComparison(
+        embedding_config=embedding_config,
+        cutoffs=cutoffs,
+        rrf_k=rrf_k,
+        ngram_size=ngram_size,
+        rerank_model=rerank_model,
+        strategies=score_strategy_ladder(retrieved, labels),
+    )
 
 
 def _macro_f1(precision: float | None, recall: float | None) -> float | None:
@@ -726,6 +1149,188 @@ def write_report(evaluation: RetrievalEvaluation, *, output_dir: Path) -> Report
     return paths
 
 
+def _strategy_hit_json(hit: RankedHit) -> dict[str, object]:
+    return {
+        "rank": hit.rank,
+        "evidence_id": hit.evidence_id,
+        "vector_similarity": hit.similarity,
+        "vector_rank": hit.vector_rank,
+        "bm25_score": hit.bm25_score,
+        "bm25_rank": hit.bm25_rank,
+        "rrf_score": hit.rrf_score,
+    }
+
+
+def _strategy_json_report(comparison: StrategyComparison) -> dict[str, object]:
+    config = comparison.embedding_config
+    warning = (
+        "결정론 어휘 임베딩·리랭크 대역 수치는 실제 검색 품질이 아니다. "
+        "외부 호출 없는 배관 검증용이다."
+        if config.is_stub
+        else None
+    )
+    return {
+        "configuration": {
+            "embedding_model": config.model,
+            "dimensions": config.dimensions,
+            "top_k": config.top_k,
+            "cosine_similarity_cutoff": comparison.cutoffs.cosine_similarity,
+            "rrf_score_cutoff": comparison.cutoffs.rrf_score,
+            "rerank_top_n": comparison.cutoffs.rerank_top_n,
+            "rrf_k": comparison.rrf_k,
+            "ngram_size": comparison.ngram_size,
+            "rerank_model": comparison.rerank_model,
+            "stub": config.is_stub,
+        },
+        "run_conditions": {
+            "database_used": False,
+            "labels_used_for_retrieval": False,
+            "rewrite_source": "caller_injected",
+            "warning": warning,
+        },
+        "strategies": [
+            {
+                "name": result.strategy.name,
+                "stages": [stage.value for stage in result.strategy.stages],
+                "cutoff": {
+                    "kind": result.cutoff_kind.value,
+                    "value": result.cutoff_value,
+                },
+                "aggregate": _metrics_json(result.aggregate),
+                "cases": [
+                    {
+                        "id": case.case_id,
+                        "strategy": result.strategy.name,
+                        "cutoff": {
+                            "kind": result.cutoff_kind.value,
+                            "value": result.cutoff_value,
+                        },
+                        "relevant_evidence_ids": sorted(case.relevant_evidence_ids),
+                        "recall_at_1": case.recall_at_1,
+                        "recall_at_3": case.recall_at_3,
+                        "recall_at_5": case.recall_at_5,
+                        "accepted_precision": case.accepted_precision,
+                        "accepted_recall": case.accepted_recall,
+                        "accepted_hits": [_strategy_hit_json(hit) for hit in case.accepted_hits],
+                        "ranked_hits": [_strategy_hit_json(hit) for hit in case.ranked_hits],
+                    }
+                    for case in result.cases
+                ],
+            }
+            for result in comparison.strategies
+        ],
+    }
+
+
+def _strategy_markdown_report(comparison: StrategyComparison) -> str:
+    config = comparison.embedding_config
+    lines = [
+        "# 정책 검색 전략 사다리 비교",
+        "",
+        "## 실행 조건",
+        "",
+        "- 코퍼스: 주입된 정책 파일 조항 (DB 미사용)",
+        "- 질의 재작성: 호출자 주입 (원문 검색을 항상 함께 유지)",
+        f"- 임베딩: `{config.model}` ({config.dimensions}차원)",
+        f"- 벡터/재작성 코사인 컷: {comparison.cutoffs.cosine_similarity:.6f}",
+        f"- 하이브리드 RRF 컷: {comparison.cutoffs.rrf_score:.6f}",
+        f"- 리랭크 최종 순위 상한 n: {comparison.cutoffs.rerank_top_n}",
+        f"- RRF k: {comparison.rrf_k}",
+        f"- BM25 문자 n-gram: {comparison.ngram_size}",
+        f"- 리랭크 모델: `{comparison.rerank_model}`",
+        "- 라벨 사용 경계: 검색·컷·리랭크 완료 뒤 채점 단계에서만 사용",
+    ]
+    if config.is_stub:
+        lines.extend(
+            [
+                "- **경고: 결정론 어휘 임베딩·리랭크 대역 수치는 실제 검색 품질이 아니다. "
+                "외부 호출 없는 배관 검증용이다.**",
+                "- 대역 실행 조건: 과금 0회, DB 0회",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## 전략별 집계",
+            "",
+            "| strategy | stages | cutoff kind/value | r@1 | r@3 | r@5 | precision | recall |",
+            "|---|---|---|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for result in comparison.strategies:
+        aggregate = result.aggregate
+        stages = " + ".join(stage.value for stage in result.strategy.stages)
+        lines.append(
+            f"| {result.strategy.name} | {stages} | {result.cutoff_kind.value}="
+            f"{result.cutoff_value} | {_number(aggregate.recall_at_1)} | "
+            f"{_number(aggregate.recall_at_3)} | {_number(aggregate.recall_at_5)} | "
+            f"{_number(aggregate.accepted_precision)} | {_number(aggregate.accepted_recall)} |"
+        )
+    lines.extend(["", "## 케이스별 결과", ""])
+    for result in comparison.strategies:
+        lines.extend(
+            [
+                f"### {result.strategy.name}",
+                "",
+                f"컷: `{result.cutoff_kind.value}={result.cutoff_value}`",
+                "",
+                "| case | 채택 결과 | 순위 |",
+                "|---|---|---|",
+            ]
+        )
+        for case in result.cases:
+            accepted = (
+                "<br>".join(f"{hit.rank}. {hit.evidence_id}" for hit in case.accepted_hits)
+                or "없음"
+            )
+            ranking = "<br>".join(
+                f"{hit.rank}. {hit.evidence_id} "
+                f"(cos={hit.similarity:.6f}, bm25={_number(hit.bm25_score)}, "
+                f"rrf={_number(hit.rrf_score)})"
+                for hit in case.ranked_hits
+            )
+            lines.append(f"| {case.case_id} | {accepted} | {ranking} |")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _next_strategy_report_paths(output_dir: Path, comparison: StrategyComparison) -> ReportPaths:
+    config = comparison.embedding_config
+    mode = "stub" if config.is_stub else "live"
+    model = re.sub(r"[^a-z0-9]+", "-", config.model.lower()).strip("-") or "model"
+    stem = f"retrieval-ladder-{mode}-{model}-d{config.dimensions}"
+    suffix: int | None = None
+    while True:
+        ending = "" if suffix is None else f"-{suffix}"
+        paths = ReportPaths(
+            markdown=output_dir / f"{stem}{ending}.md",
+            json=output_dir / f"{stem}{ending}.json",
+        )
+        if not paths.markdown.exists() and not paths.json.exists():
+            return paths
+        suffix = 2 if suffix is None else suffix + 1
+
+
+def write_strategy_report(comparison: StrategyComparison, *, output_dir: Path) -> ReportPaths:
+    """전략 사다리 비교를 기존 산출물과 충돌하지 않는 두 형식으로 쓴다."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths = _next_strategy_report_paths(output_dir, comparison)
+    markdown = _strategy_markdown_report(comparison)
+    json_text = json.dumps(_strategy_json_report(comparison), ensure_ascii=False, indent=2) + "\n"
+    created_markdown = False
+    try:
+        with paths.markdown.open("x", encoding="utf-8") as handle:
+            handle.write(markdown)
+        created_markdown = True
+        with paths.json.open("x", encoding="utf-8") as handle:
+            handle.write(json_text)
+    except FileExistsError:
+        if created_markdown:
+            paths.markdown.unlink(missing_ok=True)
+        return write_strategy_report(comparison, output_dir=output_dir)
+    return paths
+
+
 def _cutoff_sweep(*, start: float, end: float, step: float) -> tuple[float, ...]:
     start_decimal = Decimal(str(start))
     end_decimal = Decimal(str(end))
@@ -759,8 +1364,14 @@ def run_retrieval_comparison(
     labels_path: Path = DEFAULT_RETRIEVAL_LABELS_PATH,
     output_dir: Path = DEFAULT_RETRIEVAL_REPORT_DIR,
     cache_dir: Path = DEFAULT_EMBEDDING_CACHE_DIR,
+    rewritten_queries: Mapping[str, str] | None = None,
+    rrf_k: int = DEFAULT_RRF_K,
+    rrf_cutoff: float = DEFAULT_RRF_CUTOFF,
+    ngram_size: int = DEFAULT_NGRAM_SIZE,
+    rerank_top_n: int = 5,
+    rerank_model: str = DEFAULT_RERANK_MODEL,
 ) -> ReportPaths:
-    """CLI가 호출하는 전체 오프라인 비교 흐름. 실제 모드만 외부 임베딩을 과금 호출한다."""
+    """CLI가 호출하는 전체 오프라인 사다리. 실제 모드만 외부 호출을 과금한다."""
     settings = get_settings()
     resolved_dimensions = settings.embedding_dimensions if dimensions is None else dimensions
     sweep = _cutoff_sweep(start=sweep_start, end=sweep_end, step=sweep_step)
@@ -776,10 +1387,15 @@ def run_retrieval_comparison(
             model=model,
             dimensions=resolved_dimensions,
         )
+        reranker: GenerationClient = OpenAIGenerationClient(
+            api_key=settings.openai_api_key,
+            model=rerank_model,
+        )
     else:
         model = STUB_EMBEDDING_MODEL
         resolved_cutoff = STUB_DEFAULT_CUTOFF if cutoff is None else cutoff
         embedder = LexicalEmbeddingClient(dimensions=resolved_dimensions)
+        reranker = _IdentityRerankClient()
 
     config = RetrievalEvalConfig(
         model=model,
@@ -793,12 +1409,28 @@ def run_retrieval_comparison(
     documents = load_policy_documents(policy_dir)
     cases = load_golden_set(golden_set_path)
     labels = load_retrieval_labels(labels_path)
-    evaluation = evaluate_retrieval(
+    injected_rewrites = (
+        {case.id: case.content for case in cases}
+        if rewritten_queries is None
+        else dict(rewritten_queries)
+    )
+    comparison = evaluate_strategy_ladder(
         documents=documents,
         cases=cases,
         labels=labels,
+        rewritten_queries=injected_rewrites,
         embedder=embedder,
-        config=config,
+        embedding_config=config,
+        cutoffs=StrategyCutoffs(
+            cosine_similarity=resolved_cutoff,
+            rrf_score=rrf_cutoff,
+            rerank_top_n=rerank_top_n,
+        ),
+        reranker=reranker,
+        rerank_model=rerank_model if live else "stub-identity-reranker",
         cache_dir=cache_dir,
+        rerank_cache_dir=cache_dir / "rerank",
+        rrf_k=rrf_k,
+        ngram_size=ngram_size,
     )
-    return write_report(evaluation, output_dir=output_dir)
+    return write_strategy_report(comparison, output_dir=output_dir)
