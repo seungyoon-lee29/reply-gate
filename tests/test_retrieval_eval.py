@@ -19,6 +19,7 @@ from reply_gate.llm import (
 from reply_gate.policy_index import load_policy_documents
 from reply_gate.retrieval_eval import (
     DEFAULT_EMBEDDING_CANDIDATES,
+    DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH,
     EmbeddingCandidate,
     EmbeddingProvider,
     RankedHit,
@@ -27,6 +28,7 @@ from reply_gate.retrieval_eval import (
     RetrievalEvalConfig,
     RetrievalQuery,
     RetrievedCase,
+    RewriteCondition,
     StrategyCutoffs,
     evaluate_retrieval,
     evaluate_strategy_ladder,
@@ -285,7 +287,58 @@ def test_run_retrieval_comparison_loads_committed_rewrites_for_default_ladder(
         "vector_rewrite_hybrid_rerank",
     ]
     assert all(len(strategy["cases"]) == 30 for strategy in payload["strategies"])
-    assert payload["run_conditions"]["rewrite_source"] == "caller_injected"
+    assert payload["run_conditions"]["rewrite_condition"] == "blind"
+    assert payload["run_conditions"]["rewrite_source"] == "data/rewritten_queries.jsonl"
+    markdown = paths.markdown.read_text(encoding="utf-8")
+    assert "정책·라벨을 생성 입력으로 주지 않고" in markdown
+    assert "별도 작성자" in markdown
+
+
+def test_run_retrieval_comparison_can_report_oracle_upper_bound_condition(
+    tmp_path: Path,
+) -> None:
+    paths = run_retrieval_comparison(
+        live=False,
+        dimensions=32,
+        top_k=5,
+        cutoff=0.10,
+        sweep_start=0.10,
+        sweep_end=0.20,
+        sweep_step=0.05,
+        output_dir=tmp_path / "reports",
+        cache_dir=tmp_path / "cache",
+        rewritten_queries_path=DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH,
+        rewrite_condition=RewriteCondition.ORACLE,
+    )
+
+    payload = json.loads(paths.json.read_text(encoding="utf-8"))
+    assert payload["run_conditions"]["rewrite_condition"] == "oracle_upper_bound"
+    assert payload["run_conditions"]["rewrite_source"] == "data/rewritten_queries_oracle.jsonl"
+    assert "배포 가능 개선폭이 아님" in paths.markdown.read_text(encoding="utf-8")
+
+
+def test_fixture_and_rewrite_configuration_fail_before_any_embedding_call(tmp_path: Path) -> None:
+    embedder = _FixedEmbedder({})
+
+    with pytest.raises(FileNotFoundError):
+        run_retrieval_comparison(
+            live=True,
+            embedding_client=cast(EmbeddingClient, embedder),
+            rewritten_queries_path=tmp_path / "missing.jsonl",
+            output_dir=tmp_path / "reports",
+            cache_dir=tmp_path / "cache",
+        )
+    assert embedder.calls == []
+
+    with pytest.raises(RetrievalConfigurationError, match="rewrite_condition"):
+        run_retrieval_comparison(
+            live=True,
+            embedding_client=cast(EmbeddingClient, embedder),
+            rewrite_condition=cast(Any, "oracle"),
+            output_dir=tmp_path / "reports",
+            cache_dir=tmp_path / "cache",
+        )
+    assert embedder.calls == []
 
 
 def test_run_vector_only_without_rewrites_reports_rewrite_not_used(tmp_path: Path) -> None:
@@ -305,6 +358,7 @@ def test_run_vector_only_without_rewrites_reports_rewrite_not_used(tmp_path: Pat
     payload = json.loads(paths.json.read_text(encoding="utf-8"))
     assert [strategy["name"] for strategy in payload["strategies"]] == ["vector"]
     assert payload["run_conditions"]["rewrite_source"] == "not_used"
+    assert payload["run_conditions"]["rewrite_condition"] == "not_used"
     assert "질의 재작성: 미사용" in paths.markdown.read_text(encoding="utf-8")
 
 
@@ -355,6 +409,7 @@ def test_strategy_ladder_completes_four_stub_combinations_and_reports_separate_c
     report = json.loads(paths.json.read_text(encoding="utf-8"))
     assert report["run_conditions"]["labels_used_for_retrieval"] is False
     assert report["run_conditions"]["rewrite_source"] == "caller_injected"
+    assert report["run_conditions"]["rewrite_condition"] == "caller_injected"
     assert "실제 검색 품질이 아니다" in report["run_conditions"]["warning"]
     case = report["strategies"][3]["cases"][0]
     assert case["strategy"] == "vector_rewrite_hybrid_rerank"

@@ -47,8 +47,17 @@ uv run pytest
    기각 유발 골든셋 문의, L1 픽스처, **L2 판정 픽스처**(`data/judge_fixtures.jsonl` —
    측정 3 의 유일한 입력이라, 사라지면 과금 실행이 판정 수치 없이 끝난다),
    **검색 정답 라벨**(`data/retrieval_labels.jsonl` — 검색 recall·precision 의 유일한 정답
-   입력), **재작성 질의 픽스처**(`data/rewritten_queries.jsonl` — 골든셋 검색 전략 비교의
-   고정 오프라인 입력). 제거하면 기각 장면과 검색 품질 측정이 재현되지 않는다.
+   입력), **blind 재작성 질의 픽스처**(`data/rewritten_queries.jsonl` — 정책·라벨 없이 원문만
+   생성 입력으로 준 독립 작성 조건)와 **oracle upper-bound 픽스처**
+   (`data/rewritten_queries_oracle.jsonl` —
+   정책·라벨 기반 상한 대조군). 제거하면 기각 장면과 검색 품질 측정이 재현되지 않는다.
+
+## 검색 관련성과 답변 충분성은 다른 계약이다
+
+검색 recall 의 정답은 문의에 답하거나 안전하게 제한하는 데 **직접 관련된 모든 정책 조항**이다.
+단순 처리 전제·입력 안내는 제외하고 접근 통제·공개 제한은 포함한다. 이 분모는 답변이 반드시
+모든 조항을 인용해야 한다는 뜻이 아니다. 답변 citation sufficiency는 L1·L2가 주어진 답변과
+인용 근거를 대상으로 별도 판정한다.
 
 ## 재시도 상한 — 전부 코드가 강제
 

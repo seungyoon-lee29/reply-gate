@@ -1,4 +1,4 @@
-"""DB 없는 정책 벡터 단독 비교 실행 진입점.
+"""DB 없는 정책 검색 전략 비교 실행 진입점.
 
     uv run python -m scripts.compare_retrieval --stub-embedding
     uv run python -m scripts.compare_retrieval --live  # 실제 임베딩 호출, 과금 가능
@@ -18,15 +18,22 @@ from reply_gate.policy_index import DEFAULT_POLICY_DIR
 from reply_gate.retrieval_eval import (
     DEFAULT_EMBEDDING_CACHE_DIR,
     DEFAULT_NGRAM_SIZE,
+    DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH,
     DEFAULT_RERANK_MODEL,
     DEFAULT_RETRIEVAL_REPORT_DIR,
+    DEFAULT_REWRITTEN_QUERIES_PATH,
     DEFAULT_RRF_CUTOFF,
     DEFAULT_RRF_K,
     RetrievalConfigurationError,
+    RewriteCondition,
     run_retrieval_comparison,
 )
 from reply_gate.retrieval_labels import DEFAULT_RETRIEVAL_LABELS_PATH
-from reply_gate.retrieval_strategies import RetrievalStage, StrategyDefinition
+from reply_gate.retrieval_strategies import (
+    RetrievalStage,
+    StrategyDefinition,
+    default_strategy_ladder,
+)
 
 _VECTOR_ONLY = (StrategyDefinition("vector", (RetrievalStage.VECTOR,)),)
 
@@ -34,8 +41,9 @@ _VECTOR_ONLY = (StrategyDefinition("vector", (RetrievalStage.VECTOR,)),)
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "DB 없이 정책 조항과 골든셋 문의의 벡터 단독 검색을 평가한다. "
-            "재작성 포함 사다리는 패키지 API에 재작성문을 주입해 실행한다."
+            "DB 없이 정책 조항과 골든셋 문의의 네 단계 검색 전략을 비교한다. "
+            "기본 재작성 입력은 정책·라벨 없이 원문만 생성 입력으로 준 "
+            "독립 blind/deployable 픽스처다."
         )
     )
     mode = parser.add_mutually_exclusive_group()
@@ -59,6 +67,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--labels", type=Path, default=DEFAULT_RETRIEVAL_LABELS_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_RETRIEVAL_REPORT_DIR)
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_EMBEDDING_CACHE_DIR)
+    strategy = parser.add_mutually_exclusive_group()
+    strategy.add_argument(
+        "--vector-only",
+        action="store_true",
+        help="재작성·하이브리드·리랭크를 제외한 벡터 기준선만 실행한다",
+    )
+    strategy.add_argument(
+        "--oracle-rewrite",
+        action="store_true",
+        help="정답 정책 어휘를 반영한 curated upper-bound 재작성 조건을 명시적으로 실행한다",
+    )
     parser.add_argument("--dimensions", type=int, default=None)
     parser.add_argument(
         "--embedding-model",
@@ -101,6 +120,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         local_embedder = BgeM3EmbeddingClient() if args.bge_m3 else None
+        rewrite_condition = (
+            RewriteCondition.ORACLE if args.oracle_rewrite else RewriteCondition.BLIND
+        )
         paths = run_retrieval_comparison(
             live=bool(args.live or args.bge_m3),
             embedding_model=(BgeM3EmbeddingClient.MODEL if args.bge_m3 else args.embedding_model),
@@ -118,6 +140,11 @@ def main(argv: list[str] | None = None) -> int:
             policy_dir=args.policy_dir,
             golden_set_path=args.golden_set,
             labels_path=args.labels,
+            rewritten_queries_path=(
+                DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH
+                if args.oracle_rewrite
+                else DEFAULT_REWRITTEN_QUERIES_PATH
+            ),
             output_dir=args.out_dir,
             cache_dir=args.cache_dir,
             rrf_k=args.rrf_k,
@@ -125,7 +152,8 @@ def main(argv: list[str] | None = None) -> int:
             ngram_size=args.ngram_size,
             rerank_top_n=args.rerank_top_n,
             rerank_model=args.rerank_model,
-            strategies=_VECTOR_ONLY,
+            rewrite_condition=rewrite_condition,
+            strategies=_VECTOR_ONLY if args.vector_only else default_strategy_ladder(),
         )
     except (
         OptionalEmbeddingDependencyError,
