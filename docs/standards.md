@@ -47,7 +47,8 @@ uv run pytest
    기각 유발 골든셋 문의, L1 픽스처, **L2 판정 픽스처**(`data/judge_fixtures.jsonl` —
    측정 3 의 유일한 입력이라, 사라지면 과금 실행이 판정 수치 없이 끝난다),
    **검색 정답 라벨**(`data/retrieval_labels.jsonl` — 검색 recall·precision 의 유일한 정답
-   입력). 제거하면 기각 장면과 검색 품질 측정이 재현되지 않는다.
+   입력), **재작성 질의 픽스처**(`data/rewritten_queries.jsonl` — 골든셋 검색 전략 비교의
+   고정 오프라인 입력). 제거하면 기각 장면과 검색 품질 측정이 재현되지 않는다.
 
 ## 재시도 상한 — 전부 코드가 강제
 
