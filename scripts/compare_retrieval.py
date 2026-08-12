@@ -202,7 +202,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.embedding_axis:
-            return _run_axis(compare=compare, paid_rerank=bool(args.rerank_with_openai))
+            # 축 경로도 비축 경로와 **같은 식**을 쓴다. 한 플래그가 자리에 따라 다른 뜻이면
+            # `--rerank-with-openai` 의 "--live 는 이미 포함한다"가 거짓이 되고, 4단 사다리를
+            # 기대한 실행이 조용히 3단으로 잘린다(실제로 그랬다).
+            return _run_axis(
+                compare=compare, paid_rerank=bool(args.live or args.rerank_with_openai)
+            )
         local_embedder = BgeM3EmbeddingClient() if args.bge_m3 else None
         paths = compare(
             # 로컬 임베딩도 "실제 임베딩"이므로 live 경로다. 유료 리랭크는 별개 축으로

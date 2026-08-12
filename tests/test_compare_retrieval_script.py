@@ -138,6 +138,35 @@ def test_임베딩_모델_축은_행마다_리포트를_내고_미설치_행은_
     assert "bge-m3-1024: 미측정 — BGE-M3 미측정" in printed
 
 
+def test_축_실행도_live면_리랭크를_함께_과금한다(monkeypatch: Any, tmp_path: Path) -> None:
+    """플래그의 뜻이 자리마다 달라지면 4단 사다리를 기대한 실행이 조용히 3단이 된다.
+
+    실제로 그랬다 — 축 경로만 `--live` 를 무시해 리랭크 단이 "미측정 + 사유"로 남았고,
+    `--rerank-with-openai` 의 "--live 는 이미 포함한다"는 안내가 거짓이었다.
+    """
+    calls = _capture_run(monkeypatch, tmp_path)
+
+    def fake_axis(**kwargs: Any) -> Any:
+        evaluate = cast(Any, kwargs["evaluate"])
+        candidate = DEFAULT_EMBEDDING_CANDIDATES[0]
+        return EmbeddingAxisResult(
+            rows=(
+                EmbeddingAxisRow(
+                    candidate=candidate,
+                    measured=True,
+                    reports=evaluate(candidate, None),
+                    reason=None,
+                ),
+            )
+        )
+
+    monkeypatch.setattr(compare_retrieval, "run_embedding_model_axis", fake_axis)
+
+    assert compare_retrieval.main(["--live", "--embedding-axis", "--out-dir", str(tmp_path)]) == 0
+
+    assert calls[0]["paid_rerank"] is True
+
+
 class _FakeLocalEmbedder:
     MODEL = "BAAI/bge-m3"
     DIMENSIONS = 1024
