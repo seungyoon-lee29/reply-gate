@@ -289,6 +289,9 @@ def test_run_retrieval_comparison_loads_committed_rewrites_for_default_ladder(
     assert all(len(strategy["cases"]) == 30 for strategy in payload["strategies"])
     assert payload["run_conditions"]["rewrite_condition"] == "blind"
     assert payload["run_conditions"]["rewrite_source"] == "data/rewritten_queries.jsonl"
+    markdown = paths.markdown.read_text(encoding="utf-8")
+    assert "정책·라벨을 생성 입력으로 주지 않고" in markdown
+    assert "별도 작성자" in markdown
 
 
 def test_run_retrieval_comparison_can_report_oracle_upper_bound_condition(

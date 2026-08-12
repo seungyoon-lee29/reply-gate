@@ -130,9 +130,16 @@ FastAPI 의존성 주입을 override 한 테스트는 클라이언트 **생성 �
 oracle query 의 상한이었다. 원문에 없던 결제 수단·운영시간·주문번호 필요성·본인 확인 결론도
 섞여 요청 유형과 단정 강도가 바뀌었다.
 
-기본 비교 입력은 정책·라벨을 보지 않고 원문 의미만 보존한 `data/rewritten_queries.jsonl` 이다.
-기존 curated 세트는 `data/rewritten_queries_oracle.jsonl` 로 별도 보존하고 리포트에서
-`oracle_upper_bound` 로 표시한다. 두 조건의 수치를 같은 의미로 해석하지 않는다.
+기본 비교 입력은 정책·라벨을 생성 입력으로 주지 않고 원문 30건만 제공한 별도 작성자의
+의미 보존 결과인 `data/rewritten_queries.jsonl` 이다. 기존 curated 세트는
+`data/rewritten_queries_oracle.jsonl` 로 별도 보존하고 리포트에서 `oracle_upper_bound` 로
+표시한다. 두 조건의 수치를 같은 의미로 해석하지 않는다.
+
+검색 정답 라벨은 recall 계산을 위한 **모든 직접 관련 조항**의 집합이다. 반면 L2 judge
+픽스처의 citation sufficiency는 주어진 답변이 최소한으로 충분히 뒷받침되는지를 판정한다.
+따라서 G16·G17 검색 라벨에 4-1과 4-2가 모두 들어가도, 4-1만 인용한 충분한 답변이 judge
+pass인 것과 모순되지 않는다. 두 계약을 합치면 검색기가 정당한 관련 조항을 찾은 결과와
+답변이 불필요한 조항까지 모두 인용해야 하는지를 같은 문제로 오채점하게 된다.
 
 ## 라이브 리포트를 기본 실행이 덮어썼다
 

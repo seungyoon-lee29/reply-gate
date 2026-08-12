@@ -1451,7 +1451,8 @@ def _strategy_markdown_report(comparison: StrategyComparison) -> str:
     uses_rewrite = comparison.rewrite_condition is not RewriteCondition.NOT_USED
     if comparison.rewrite_condition is RewriteCondition.BLIND:
         rewrite_line = (
-            "- 질의 재작성: blind/deployable — 원문만으로 의미를 보존한 고정 입력 "
+            "- 질의 재작성: blind/deployable — 정책·라벨을 생성 입력으로 주지 않고 "
+            "원문만 제공한 별도 작성자의 의미 보존 고정 입력 "
             f"(`{comparison.rewrite_source}`; 원문 검색을 항상 함께 유지)"
         )
     elif comparison.rewrite_condition is RewriteCondition.ORACLE:

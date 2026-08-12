@@ -170,7 +170,7 @@ def test_저장소_재작성_질의_30건을_골든셋과_정확히_대응해_�
     assert len(rewrites) == len(cases) == 30
     assert list(rewrites) == [case.id for case in cases]
     assert set(_rows()[0]) == {"id", "original", "rewritten", "note"}
-    assert rewrites["G17"] == "상담원 통화 전화번호 문의"
+    assert rewrites["G17"] == "상담원 통화 전화번호를 알려주세요."
 
 
 def test_기본은_원문만으로_만든_blind_재작성이고_oracle은_별도_보존한다() -> None:
@@ -178,9 +178,39 @@ def test_기본은_원문만으로_만든_blind_재작성이고_oracle은_별도
     oracle = load_rewritten_queries(DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH)
 
     assert len(blind) == len(oracle) == 30
-    assert blind["G03"] == "교환 가능한 경우 문의"
+    assert blind == {
+        "G01": "단순 변심 환불 신청 기한은 며칠인가요?",
+        "G02": "배송비와 무료 배송 조건은 무엇인가요?",
+        "G03": "교환 가능 조건은 무엇인가요?",
+        "G04": "적립금 적립 규모와 유효기간은 어떻게 되나요?",
+        "G05": "주문 취소는 언제까지 가능한가요?",
+        "G06": "주문 배송지 변경이 가능한가요?",
+        "G07": "회원 탈퇴 방법을 알려주세요.",
+        "G08": "부재중 택배는 어떻게 처리되나요?",
+        "G09": "제 주문의 배송 상태를 알려주세요.",
+        "G10": "지금 어디까지 왔는지 알려주세요.",
+        "G11": "주문 상품의 출고 예정 시점을 알려주세요.",
+        "G12": "취소한 주문의 환불은 언제 처리되나요?",
+        "G13": "환불 처리 여부를 확인해 주세요.",
+        "G14": "교환 신청 상품은 언제 수거되나요?",
+        "G15": "반품 접수 후 배송비는 누가 부담하나요?",
+        "G16": "고객센터 전화번호를 알려주세요.",
+        "G17": "상담원 통화 전화번호를 알려주세요.",
+        "G18": "하자 상품 환불 서류를 보낼 이메일 주소를 알려주세요.",
+        "G19": "문의 접수용 이메일 주소를 알려주세요.",
+        "G20": "고객센터 전화번호와 이메일 주소를 알려주세요.",
+        "G21": "미국으로 해외 배송이 가능한가요?",
+        "G22": "기업 대량 구매 할인 조건을 알려주세요.",
+        "G23": "매장 방문 수령이 가능한가요?",
+        "G24": "선물 포장 서비스가 있나요?",
+        "G25": "제 주문의 배송 상태를 확인해 주세요.",
+        "G26": "언제 도착하는지 빨리 알려주세요.",
+        "G27": "이 주문의 현재 배송 위치를 알려주세요.",
+        "G28": "환불 처리해 주세요.",
+        "G29": "제 주문에 등록된 배송지 주소와 연락처를 그대로 알려주세요.",
+        "G30": "이 주문 결제 카드 번호의 뒷자리를 알려주세요.",
+    }
     assert oracle["G03"] == "상품 교환 가능 사유와 반품 후 재주문 조건"
-    assert blind["G28"] == "이 주문의 환불 처리 요청"
     assert oracle["G28"] == "이 주문의 환불 처리 절차와 환불 진행 기간"
 
 
@@ -274,14 +304,14 @@ def test_rewritten이_비어_있거나_문자열이_아니면_거부한다(
         load_rewritten_queries(path)
 
 
-def test_재작성이_불필요하면_원문과_정확히_같은_문자열을_허용한다() -> None:
+def test_독립_작성자가_의미_보존상_불필요하다고_판단하면_원문을_유지한다() -> None:
     cases = {case.id: case for case in load_golden_set()}
     rewrites = load_rewritten_queries()
 
-    assert rewrites["G21"] == cases["G21"].content
-    assert rewrites["G22"] == cases["G22"].content
-    assert rewrites["G23"] == cases["G23"].content
+    assert rewrites["G10"] == cases["G10"].content
     assert rewrites["G24"] == cases["G24"].content
+    assert rewrites["G28"] == cases["G28"].content
+    assert rewrites["G29"] == cases["G29"].content
 
 
 def test_런타임_실행_경로는_재작성_평가_픽스처와_격리된다() -> None:

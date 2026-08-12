@@ -42,7 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "DB 없이 정책 조항과 골든셋 문의의 네 단계 검색 전략을 비교한다. "
-            "기본 재작성 입력은 원문만으로 만든 blind/deployable 픽스처다."
+            "기본 재작성 입력은 정책·라벨 없이 원문만 생성 입력으로 준 "
+            "독립 blind/deployable 픽스처다."
         )
     )
     mode = parser.add_mutually_exclusive_group()

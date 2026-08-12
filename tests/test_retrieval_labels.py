@@ -74,7 +74,8 @@ def test_직접_답하거나_제한할_정책이_없는_다섯_건은_빈_정답
     assert empty_ids == {"G21", "G22", "G23", "G24", "G28"}
 
 
-def test_처리_전제는_제외하고_직접_답변과_공개_제한_근거는_모두_라벨링한다() -> None:
+def test_검색_recall은_모든_직접_관련_조항을_세며_judge의_최소_citation과_분리된다() -> None:
+    """4-1만으로 충분한 답변도 pass지만 검색 recall 분모에는 직접 관련 4-2도 든다."""
     labels = {label.id: label for label in load_retrieval_labels()}
 
     assert labels["G16"].relevant_evidence_ids == frozenset(
