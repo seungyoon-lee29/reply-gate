@@ -8,7 +8,13 @@ from typing import Any, cast
 
 from scripts import compare_retrieval
 
-from reply_gate.retrieval_eval import ReportPaths, RewriteCondition
+from reply_gate.retrieval_eval import (
+    DEFAULT_EMBEDDING_CANDIDATES,
+    EmbeddingAxisResult,
+    EmbeddingAxisRow,
+    ReportPaths,
+    RewriteCondition,
+)
 from reply_gate.retrieval_strategies import RetrievalStage, StrategyDefinition
 
 
@@ -57,3 +63,85 @@ def test_oracle과_벡터_단독을_동시에_요청하면_실행_전에_거부�
         assert exc.code == 2
     else:
         raise AssertionError("상충 옵션이 파싱 단계에서 거부되지 않았다")
+
+
+def test_live는_유료_리랭크를_함께_승인한다(monkeypatch: Any, tmp_path: Path) -> None:
+    calls = _capture_run(monkeypatch, tmp_path)
+
+    assert compare_retrieval.main(["--live", "--out-dir", str(tmp_path)]) == 0
+
+    assert calls[0]["live"] is True
+    assert calls[0]["paid_rerank"] is True
+
+
+def test_로컬_임베딩은_유료_리랭크를_켜지_않는다(monkeypatch: Any, tmp_path: Path) -> None:
+    """`--bge-m3` 는 로컬 임베딩이다. 리랭크 과금은 별개 축으로 명시해야 켜진다."""
+    calls = _capture_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(compare_retrieval, "BgeM3EmbeddingClient", _FakeLocalEmbedder, raising=True)
+
+    assert compare_retrieval.main(["--bge-m3", "--out-dir", str(tmp_path)]) == 0
+
+    assert calls[0]["live"] is True
+    assert calls[0]["paid_rerank"] is False
+
+
+def test_로컬_임베딩도_명시하면_유료_리랭크를_켠다(monkeypatch: Any, tmp_path: Path) -> None:
+    calls = _capture_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(compare_retrieval, "BgeM3EmbeddingClient", _FakeLocalEmbedder, raising=True)
+
+    assert (
+        compare_retrieval.main(["--bge-m3", "--rerank-with-openai", "--out-dir", str(tmp_path)])
+        == 0
+    )
+
+    assert calls[0]["paid_rerank"] is True
+
+
+def test_임베딩_모델_축은_live_없이는_거부된다(tmp_path: Path) -> None:
+    assert compare_retrieval.main(["--embedding-axis", "--out-dir", str(tmp_path)]) == 2
+
+
+def test_임베딩_모델_축은_행마다_리포트를_내고_미설치_행은_사유를_남긴다(
+    monkeypatch: Any, tmp_path: Path, capsys: Any
+) -> None:
+    _capture_run(monkeypatch, tmp_path)
+    rows: list[str] = []
+
+    def fake_axis(**kwargs: Any) -> Any:
+        evaluate = cast(Any, kwargs["evaluate"])
+        measured = DEFAULT_EMBEDDING_CANDIDATES[0]
+        missing = DEFAULT_EMBEDDING_CANDIDATES[-1]
+        rows.append(measured.key)
+        return EmbeddingAxisResult(
+            rows=(
+                EmbeddingAxisRow(
+                    candidate=measured,
+                    measured=True,
+                    reports=evaluate(measured, _FakeLocalEmbedder()),
+                    reason=None,
+                ),
+                EmbeddingAxisRow(
+                    candidate=missing,
+                    measured=False,
+                    reports=None,
+                    reason="BGE-M3 미측정 — 로컬 의존성 미설치",
+                ),
+            )
+        )
+
+    monkeypatch.setattr(compare_retrieval, "run_embedding_model_axis", fake_axis)
+
+    assert compare_retrieval.main(["--live", "--embedding-axis", "--out-dir", str(tmp_path)]) == 0
+
+    printed = capsys.readouterr().out
+    assert "3-small-1536" in printed
+    assert "bge-m3-1024: 미측정 — BGE-M3 미측정" in printed
+
+
+class _FakeLocalEmbedder:
+    MODEL = "BAAI/bge-m3"
+    DIMENSIONS = 1024
+
+    @property
+    def dimensions(self) -> int:
+        return self.DIMENSIONS

@@ -484,23 +484,27 @@ class BgeM3EmbeddingClient:
 
     MODEL = "BAAI/bge-m3"
     DIMENSIONS = 1024
+    #: 허브 스냅샷을 고정한다. 리비전을 열어두면 같은 커밋이 다른 벡터를 만들고, 캐시 키가
+    #: 모델 이름만 담으므로 그 변경을 무효화하지도 못한다 — 재현성이 조용히 깨지는 경로다.
+    REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
 
     def __init__(self, *, model: _SentenceTransformerModel | None = None) -> None:
         if model is None:
             try:
                 module = import_module("sentence_transformers")
             except ModuleNotFoundError as exc:
-                if exc.name == "sentence_transformers":
-                    raise OptionalEmbeddingDependencyError(
-                        "BGE-M3 미측정 — 로컬 의존성 미설치 (`uv sync --extra rag-local`로 설치)"
-                    ) from exc
-                raise
+                # 하위 의존성(torch 등) 누락도 "선택 의존성 미설치"다. 그대로 전파하면
+                # 부분 설치 환경에서 그 행만 미측정이 아니라 실행 전체가 트레이스백으로 죽는다.
+                raise OptionalEmbeddingDependencyError(
+                    f"BGE-M3 미측정 — 로컬 의존성 미설치({exc.name}) "
+                    "(`uv sync --extra rag-local`로 설치)"
+                ) from exc
             model_type = getattr(module, "SentenceTransformer", None)
             if model_type is None:
                 raise OptionalEmbeddingDependencyError(
                     "BGE-M3 미측정 — sentence-transformers에 SentenceTransformer가 없다"
                 )
-            model = cast(_SentenceTransformerModel, model_type(self.MODEL))
+            model = cast(_SentenceTransformerModel, model_type(self.MODEL, revision=self.REVISION))
         self._model = model
 
     @property

@@ -689,12 +689,27 @@ def test_평가_보고서는_검색_실패_생성_문제_빈_정답_정상_경�
         reject_reasons=(RejectReason.UNSUPPORTED_CLAIM,),
         draft={},
     )
+    channel = Evidence(
+        id="policy:support:4-2",
+        source=EvidenceSource.POLICY,
+        content="문의 접수 채널",
+        evidence_text="문의 접수 채널",
+    )
+    # G01 은 정답이 2조항(2-1·2-2)인 케이스다 — 일부만 찾은 경로를 만들려면 분모가 2 여야 한다.
+    refund_period = Evidence(
+        id="policy:refund:2-1",
+        source=EvidenceSource.POLICY,
+        content="단순 변심 환불 기간",
+        evidence_text="단순 변심 환불 기간",
+    )
     escalated_statuses = (InquiryStatus.ESCALATED,)
     escalated_reasons = (EscalationReason.NO_EVIDENCE, EscalationReason.REJECTED_TWICE)
     agreement = measure_pipeline_agreement(
         cases=[
-            _case("G16", statuses=escalated_statuses, reasons=escalated_reasons),
+            _case("G01", statuses=escalated_statuses, reasons=escalated_reasons),
             _case("G17", statuses=escalated_statuses, reasons=escalated_reasons),
+            _case("G20", statuses=escalated_statuses, reasons=escalated_reasons),
+            _case("G19"),
             _case(
                 "G21",
                 statuses=escalated_statuses,
@@ -710,16 +725,27 @@ def test_평가_보고서는_검색_실패_생성_문제_빈_정답_정상_경�
         ],
         pipeline=ScriptedPipeline(
             [
+                # G01: 정답 2조항 중 1조항만 채택 — 필요한 조항이 빠진 채 생성했다.
                 _processed(
                     status=InquiryStatus.ESCALATED,
                     escalation=EscalationReason.REJECTED_TWICE,
                     attempts=(rejected,),
-                    evidence=(support,),
+                    evidence=(refund_period,),
                 ),
+                # G17: 정답 조항을 하나도 못 찾았다.
                 _processed(
                     status=InquiryStatus.ESCALATED,
                     escalation=EscalationReason.NO_EVIDENCE,
                 ),
+                # G20: 정답 2조항을 전부 채택했는데도 기각·인계 — 생성 문제.
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.REJECTED_TWICE,
+                    attempts=(rejected,),
+                    evidence=(support, channel),
+                ),
+                # G19: 정답 조항 없이 답변이 확정됐다 — 게이트를 통과한 근거 부족.
+                _processed(status=InquiryStatus.ANSWERED, evidence=(support,)),
                 _processed(
                     status=InquiryStatus.ESCALATED,
                     escalation=EscalationReason.NO_EVIDENCE,
@@ -742,10 +768,17 @@ def test_평가_보고서는_검색_실패_생성_문제_빈_정답_정상_경�
     assert breakdown["computed"] is True
     assert breakdown["generation_issue_count"] == 1
     assert breakdown["retrieval_failure_count"] == 1
+    assert breakdown["partial_retrieval_failure_count"] == 1
+    assert breakdown["retrieval_failure_total"] == 2
+    assert breakdown["answered_without_relevant_evidence_count"] == 1
     assert breakdown["expected_no_answer_count"] == 2
     by_id = {item["case_id"]: item for item in breakdown["cases"]}
-    assert by_id["G16"]["classification"] == "generation_issue"
+    # 정답 조항 일부만 찾은 것은 생성 문제가 아니다 — 필요한 근거가 빠져 있었다.
+    assert by_id["G01"]["classification"] == "partial_retrieval_failure"
+    assert by_id["G01"]["missing_relevant_evidence_ids"] == ["policy:refund:2-2"]
     assert by_id["G17"]["classification"] == "retrieval_failure"
+    assert by_id["G20"]["classification"] == "generation_issue"
+    assert by_id["G19"]["classification"] == "answered_without_relevant_evidence"
     assert by_id["G21"]["ended_with_zero_evidence"] is True
     assert by_id["G21"]["l2_caught_with_evidence"] is False
     assert by_id["G21"]["normal_behavior"] is True
@@ -760,7 +793,9 @@ def test_평가_보고서는_검색_실패_생성_문제_빈_정답_정상_경�
     markdown = markdown_path.read_text(encoding="utf-8")
     assert "### 검색 실패 / 생성 문제 분해" in markdown
     assert "생성 문제: **1건**" in markdown
-    assert "검색 실패: **1건**" in markdown
+    assert "검색 실패 합계: **2건**" in markdown
+    assert "일부 누락 1건" in markdown
+    assert "근거 없이 답변 확정: **1건**" in markdown
     assert "빈 정답 정상 인계: **2건**" in markdown
     assert "`G21`" in markdown and "검색 0건 종료" in markdown
     assert "`G22`" in markdown and "근거 채택 후 L2 검출" in markdown

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -17,36 +18,73 @@ from reply_gate.retrieval_eval import (
 )
 
 _ROOT = Path(__file__).resolve().parents[1]
-_RUNTIME_MODULES = (
-    "api.py",
-    "config.py",
-    "contracts.py",
-    "db.py",
-    "draft.py",
-    "evidence.py",
-    "gate.py",
-    "judge.py",
-    "llm.py",
-    "order_ref.py",
-    "pipeline.py",
-    "policy_index.py",
-    "records.py",
-    "sql_guard.py",
+_PACKAGE_DIR = _ROOT / "src" / "reply_gate"
+#: 평가 입력을 **읽는 것이 일인** 모듈만 면제한다. 나머지 패키지 파일은 전부 검사 대상이며,
+#: 목록을 손으로 관리하지 않는다 — 새 런타임 모듈이 조용히 검사 밖으로 나가지 않게 한다.
+_EVALUATION_MODULES = frozenset(
+    {
+        "__init__.py",
+        "evaluation.py",
+        "retrieval_eval.py",
+        "retrieval_labels.py",
+    }
 )
+
+
+def _runtime_module_names() -> tuple[str, ...]:
+    """패키지 디렉터리에서 검사 대상 런타임 모듈을 유도한다."""
+    return tuple(
+        sorted(
+            path.name for path in _PACKAGE_DIR.glob("*.py") if path.name not in _EVALUATION_MODULES
+        )
+    )
+
+
 _FORBIDDEN_MODULES = frozenset(
     {
         "reply_gate.retrieval_eval",
+        "reply_gate.retrieval_labels",
         "reply_gate.rewritten_queries",
     }
 )
 _FORBIDDEN_SYMBOLS = frozenset(
     {
         "DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH",
+        "DEFAULT_RETRIEVAL_LABELS_PATH",
         "DEFAULT_REWRITTEN_QUERIES_PATH",
+        "RetrievalLabel",
+        "load_retrieval_labels",
         "load_rewritten_queries",
     }
 )
-_FORBIDDEN_PATHS = ("rewritten_queries.jsonl", "rewritten_queries_oracle.jsonl")
+_FORBIDDEN_PATHS = (
+    "retrieval_labels.jsonl",
+    "rewritten_queries.jsonl",
+    "rewritten_queries_oracle.jsonl",
+)
+_DYNAMIC_IMPORTERS = frozenset({"import_module", "__import__"})
+#: 정답 조항에만 있는 값 — 어휘 정규화로는 나올 수 없고, 정답을 봐야만 재작성에 실린다.
+_POLICY_ONLY_VALUES = (
+    "policy:",
+    "7일",
+    "14일",
+    "30,000",
+    "50,000",
+    "3,000",
+    "4,000",
+    "6,000",
+    "09:00",
+    "18:00",
+    "12:00",
+    "13:00",
+    "2영업일",
+    "3영업일",
+    "1%",
+    "1년",
+)
+_CLAUSE_NUMBER = re.compile(r"[1-4]-[1-7]")
+#: f-string 의 치환부는 알 수 없는 값이다. 상수 조각만 이 표식으로 이어 붙여 우연한 결합을 막는다.
+_UNKNOWN_SEGMENT = "\x00"
 
 
 def _rows() -> list[dict[str, object]]:
@@ -81,6 +119,16 @@ def _fold_path_string(node: ast.AST) -> str | None:
     """금지 픽스처 경로 판정에 필요한 문자열·Path 조립만 접는다."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
+    if isinstance(node, ast.JoinedStr):
+        # f-string: 상수 조각만 모은다. 치환부가 섞여 있어도 상수 조각에 금지 파일명이
+        # 남아 있으면 잡힌다.
+        parts: list[str] = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            else:
+                parts.append(_UNKNOWN_SEGMENT)
+        return "".join(parts)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         left = _fold_path_string(node.left)
         right = _fold_path_string(node.right)
@@ -132,6 +180,19 @@ def _runtime_isolation_violations(sources: Mapping[str, str]) -> tuple[str, ...]
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 function = node.func
+                # 동적 import 로 금지 모듈을 우회하는 경로를 막는다.
+                importer = (
+                    function.id
+                    if isinstance(function, ast.Name)
+                    else function.attr
+                    if isinstance(function, ast.Attribute)
+                    else ""
+                )
+                if importer in _DYNAMIC_IMPORTERS:
+                    for argument in node.args:
+                        folded = _fold_path_string(argument)
+                        if folded is not None and folded in _FORBIDDEN_MODULES:
+                            violations.append(f"{filename}: 금지 모듈 동적 import {folded}")
                 if isinstance(function, ast.Name) and (
                     function.id in _FORBIDDEN_SYMBOLS
                     or function.id in forbidden_symbol_aliases
@@ -170,48 +231,32 @@ def test_저장소_재작성_질의_30건을_골든셋과_정확히_대응해_�
     assert len(rewrites) == len(cases) == 30
     assert list(rewrites) == [case.id for case in cases]
     assert set(_rows()[0]) == {"id", "original", "rewritten", "note"}
-    assert rewrites["G17"] == "상담원 통화 전화번호를 알려주세요."
+    # G17 은 이 사이클의 표적 케이스다 — 픽스처가 조용히 재생성되면 여기서 걸린다.
+    assert rewrites["G17"] == "고객센터 상담원 전화 연결 방법 및 대표번호"
 
 
-def test_기본은_원문만으로_만든_blind_재작성이고_oracle은_별도_보존한다() -> None:
+def test_기본_blind는_생성_모델_산출이고_oracle은_별도_조건으로_보존한다() -> None:
+    """blind 는 사람이 다듬은 문장이 아니다 — 정답을 모르는 재작성기의 실제 산출이다.
+
+    사람이 쓰면 "어디까지가 의미 보존이고 어디부터가 정답 어휘인가"를 사람이 판정하게 되고,
+    그 판정이 blind 조건의 이득에 그대로 실린다(결정 0010).
+    """
+    blind_rows = {row["id"]: row for row in _rows()}
     blind = load_rewritten_queries(DEFAULT_REWRITTEN_QUERIES_PATH)
     oracle = load_rewritten_queries(DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH)
 
     assert len(blind) == len(oracle) == 30
-    assert blind == {
-        "G01": "단순 변심 환불 신청 기한은 며칠인가요?",
-        "G02": "배송비와 무료 배송 조건은 무엇인가요?",
-        "G03": "교환 가능 조건은 무엇인가요?",
-        "G04": "적립금 적립 규모와 유효기간은 어떻게 되나요?",
-        "G05": "주문 취소는 언제까지 가능한가요?",
-        "G06": "주문 배송지 변경이 가능한가요?",
-        "G07": "회원 탈퇴 방법을 알려주세요.",
-        "G08": "부재중 택배는 어떻게 처리되나요?",
-        "G09": "제 주문의 배송 상태를 알려주세요.",
-        "G10": "지금 어디까지 왔는지 알려주세요.",
-        "G11": "주문 상품의 출고 예정 시점을 알려주세요.",
-        "G12": "취소한 주문의 환불은 언제 처리되나요?",
-        "G13": "환불 처리 여부를 확인해 주세요.",
-        "G14": "교환 신청 상품은 언제 수거되나요?",
-        "G15": "반품 접수 후 배송비는 누가 부담하나요?",
-        "G16": "고객센터 전화번호를 알려주세요.",
-        "G17": "상담원 통화 전화번호를 알려주세요.",
-        "G18": "하자 상품 환불 서류를 보낼 이메일 주소를 알려주세요.",
-        "G19": "문의 접수용 이메일 주소를 알려주세요.",
-        "G20": "고객센터 전화번호와 이메일 주소를 알려주세요.",
-        "G21": "미국으로 해외 배송이 가능한가요?",
-        "G22": "기업 대량 구매 할인 조건을 알려주세요.",
-        "G23": "매장 방문 수령이 가능한가요?",
-        "G24": "선물 포장 서비스가 있나요?",
-        "G25": "제 주문의 배송 상태를 확인해 주세요.",
-        "G26": "언제 도착하는지 빨리 알려주세요.",
-        "G27": "이 주문의 현재 배송 위치를 알려주세요.",
-        "G28": "환불 처리해 주세요.",
-        "G29": "제 주문에 등록된 배송지 주소와 연락처를 그대로 알려주세요.",
-        "G30": "이 주문 결제 카드 번호의 뒷자리를 알려주세요.",
-    }
+    notes = {row["note"] for row in blind_rows.values()}
+    assert len(notes) == 1, "blind 픽스처는 한 번의 생성 실행 산출이어야 한다"
+    note = next(iter(notes))
+    assert isinstance(note, str)
+    assert "생성 모델" in note and "라벨을 입력으로 받지 않았다" in note
+
+    # 두 조건이 실제로 갈라져 있어야 blind 대비 oracle gap 이 의미를 갖는다.
+    assert sum(blind[case_id] != oracle[case_id] for case_id in blind) >= 25
     assert oracle["G03"] == "상품 교환 가능 사유와 반품 후 재주문 조건"
-    assert oracle["G28"] == "이 주문의 환불 처리 절차와 환불 진행 기간"
+    # 정답이 빈 케이스의 상한은 "아무것도 채택하지 않는 것" 이므로 원문을 유지한다.
+    assert oracle["G28"] == "환불 처리해 주세요."
 
 
 @pytest.mark.parametrize(
@@ -304,24 +349,76 @@ def test_rewritten이_비어_있거나_문자열이_아니면_거부한다(
         load_rewritten_queries(path)
 
 
-def test_독립_작성자가_의미_보존상_불필요하다고_판단하면_원문을_유지한다() -> None:
-    cases = {case.id: case for case in load_golden_set()}
+def test_blind_재작성에는_정답_조항_고유값이_없다() -> None:
+    """어휘 정규화는 blind 재작성기가 실제로 하는 일이지만, 고유값은 정답을 봐야만 나온다.
+
+    구어체를 문서체로 옮기며 정답 조항과 같은 낱말을 쓰는 것 자체는 누출이 아니다 —
+    이 픽스처를 만든 모델은 정책 문서를 입력으로 받은 적이 없다. 갈라야 하는 것은
+    **정답 조항에만 있는 값**(조항 번호·근거 ID·정책 고유 수치)이고, 그것만 여기서 막는다.
+    """
     rewrites = load_rewritten_queries()
 
-    assert rewrites["G10"] == cases["G10"].content
-    assert rewrites["G24"] == cases["G24"].content
-    assert rewrites["G28"] == cases["G28"].content
-    assert rewrites["G29"] == cases["G29"].content
+    for case_id, text in rewrites.items():
+        for value in _POLICY_ONLY_VALUES:
+            assert value not in text, f"{case_id}: 정책 고유값 {value!r} 이 재작성에 있다"
+        assert not _CLAUSE_NUMBER.search(text), f"{case_id}: 조항 번호가 재작성에 있다"
+
+
+def test_blind_재작성_생성기는_정답과_정책_원문을_읽지_않는다() -> None:
+    """blind 조건은 생성기의 입력 목록이 지킨다 — 픽스처를 다시 만들 때도 같아야 한다."""
+    source = (_ROOT / "scripts" / "generate_blind_rewrites.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    referenced: set[str] = set()
+    for node in ast.walk(tree):
+        # import 만 하고 쓰지 않아도 잡는다 — 쓰임(Name)만 보면 반입 자체가 빠져나간다.
+        if isinstance(node, ast.ImportFrom):
+            referenced.add(node.module or "")
+            referenced.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.Import):
+            referenced.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.Name):
+            referenced.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            referenced.add(node.attr)
+    assert not referenced & _FORBIDDEN_SYMBOLS
+    assert not referenced & _FORBIDDEN_MODULES
+    assert not referenced & {
+        "DEFAULT_POLICY_DIR",
+        "load_policy_documents",
+        "reply_gate.policy_index",
+    }
+
+    for node in ast.walk(tree):
+        folded = _fold_path_string(node)
+        if folded is None:
+            continue
+        assert "retrieval_labels" not in folded
+        assert "rewritten_queries_oracle" not in folded
+        assert "policies" not in folded
 
 
 def test_런타임_실행_경로는_재작성_평가_픽스처와_격리된다() -> None:
-    package_dir = _ROOT / "src" / "reply_gate"
     sources = {
-        filename: (package_dir / filename).read_text(encoding="utf-8")
-        for filename in _RUNTIME_MODULES
+        filename: (_PACKAGE_DIR / filename).read_text(encoding="utf-8")
+        for filename in _runtime_module_names()
     }
 
     _assert_runtime_isolated(sources)
+
+
+def test_격리_검사_대상은_패키지에서_유도되어_새_모듈을_자동으로_덮는다() -> None:
+    """검사 대상이 손으로 관리되는 목록이면 새 런타임 모듈이 조용히 빠져나간다."""
+    checked = set(_runtime_module_names())
+    present = {path.name for path in _PACKAGE_DIR.glob("*.py")}
+
+    # 면제 목록에 있는 파일만 빠지고, 그 밖의 모든 패키지 파일이 검사된다.
+    assert checked == present - _EVALUATION_MODULES
+    # 런타임에서 같은 구현을 재사용한다고 선언한 전략 모듈도 대상에 들어 있어야 한다.
+    assert "retrieval_strategies.py" in checked
+    assert "gate.py" in checked
+    # 면제 목록은 실제로 존재하는 파일만 담는다 — 오타로 검사 구멍을 만들지 않는다.
+    assert present >= _EVALUATION_MODULES
 
 
 @pytest.mark.parametrize(
@@ -336,6 +433,15 @@ def test_런타임_실행_경로는_재작성_평가_픽스처와_격리된다()
         "from .retrieval_eval import DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH as path\nfixture = path\n",
         'fixture = Path("data") / ("rewritten_" + "queries.jsonl")\n',
         'fixture = Path("data") / ("rewritten_queries_" + "oracle.jsonl")\n',
+        # 정답 라벨은 재작성문보다 강한 치트다 — 같은 자격으로 막는다.
+        "from reply_gate.retrieval_labels import load_retrieval_labels\nload_retrieval_labels()\n",
+        "from reply_gate.retrieval_labels import DEFAULT_RETRIEVAL_LABELS_PATH as p\nx = p\n",
+        "fixture = Path('data/retrieval_labels.jsonl')\n",
+        # f-string 과 동적 import 우회.
+        'fixture = Path(f"data/{prefix}retrieval_labels.jsonl")\n',
+        'fixture = f"data/rewritten_queries.jsonl"\n',
+        'module = importlib.import_module("reply_gate.retrieval_eval")\n',
+        'module = __import__("reply_gate.retrieval_labels")\n',
     ],
 )
 def test_런타임_격리_검사는_금지_참조_변이를_RED로_잡는다(mutant: str) -> None:

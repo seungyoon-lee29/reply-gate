@@ -175,6 +175,50 @@ L2 켜짐 실측의 기본 이름은 코드가 `evaluation-live-l2-<n>` 으로 *
 임베딩을 덮어쓰지 않는다. 대역으로 낸 수치는 실제 수치가 아니고, 리포트가 실행 조건과 함께
 그 사실을 찍는다.
 
+## 9. 검색 전략 비교 — **DB 불필요**
+
+정책 검색만 따로 재는 오프라인 하네스다. `scripts.evaluate` 와 다른 진입점이고 DB 를 쓰지 않는다.
+
+```bash
+uv run python -m scripts.compare_retrieval --stub-embedding   # 기본 — 외부 호출 0회, 배관 검증
+uv run python -m scripts.compare_retrieval --live             # 실제 임베딩 + 리랭크 — 과금
+uv run python -m scripts.compare_retrieval --bge-m3           # 로컬 임베딩 — 리랭크 단은 미측정
+uv run python -m scripts.compare_retrieval --live --embedding-axis  # 모델 축 4행 — 과금
+```
+
+산출물은 `reports/retrieval-strategies-<모드>-<모델>-d<차원>-<재작성조건>-k<top_k>-c<컷>.{md,json}`
+이다. 이름에 재작성 조건(blind/oracle)과 컷·top_k 가 들어가므로 결정 기록이 인용할 파일을
+이름으로 식별할 수 있다. 기존 산출물은 덮어쓰지 않는다.
+
+**과금 축은 둘이다.** 임베딩을 실제로 부르는지(`--live`/`--bge-m3`)와 LLM 리랭크를 실제로
+부르는지(`--live` 또는 `--rerank-with-openai`)가 별개다. `--bge-m3` 는 로컬 임베딩만 쓰고,
+리랭크 과금을 승인하지 않으면 그 단을 **0 이 아니라 "미측정 + 사유"** 로 리포트에 남긴다.
+BGE-M3 는 선택 의존성이므로 `uv sync --extra rag-local` 이 필요하고, 미설치는 `--embedding-axis`
+에서 그 행만 미측정으로 남는다.
+
+**채택 판정은 전 전략이 코사인 유사도 하나를 쓴다**(결정 0009). 리포트는 전략마다 컷 스윕과
+자기 최적 컷을 함께 싣고, precision·recall 분모를 값과 같은 표에 인쇄한다. 컷 스윕은 검색을
+다시 돌리지 않으므로 추가 과금이 없다.
+
+`--policy-dir`·`--golden-set`·`--labels` 로 입력을 바꿀 수 있고, 검색 정답 라벨은 **그 실행이
+실제로 쓸** 코퍼스·골든셋 기준으로 교차검증된다 — 없는 조항이 정답으로 남아 recall 이 조용히
+0 으로 계상되지 않는다.
+
+### blind 재작성 픽스처 재생성 — 상시 실행 경로가 아니다
+
+`data/rewritten_queries.jsonl` 은 **정책·라벨을 본 적 없는 생성 모델**이 문의 원문만 보고
+만든 것을 한 번 생성해 커밋한 입력이다(결정 0010). 다시 만들 일이 생기면:
+
+```bash
+uv run python -m scripts.generate_blind_rewrites --out /tmp/rewrites.jsonl        # 프롬프트만 — 무과금
+uv run python -m scripts.generate_blind_rewrites --live --out /tmp/rewrites.jsonl # 30건 생성 — 과금
+```
+
+**기존 픽스처를 스크립트가 직접 덮어쓰지 않는다.** `--out` 경로에만 쓰고, 사람이 산출을 읽은
+뒤 옮긴다. 옮기면 구조 테스트가 G17 문장에 걸려 빨개지므로, 교체는 **의도했을 때만** 통과한다.
+생성 모델은 런타임 의도 해석과 같은 등급(`generation_model`)이어야 한다 — 상위 모델은
+배포 가능한 이득이 아니라 또 하나의 상한이다.
+
 ## 정리
 
 ```bash

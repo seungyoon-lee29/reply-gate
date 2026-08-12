@@ -71,6 +71,11 @@ def policy_evidence_id(*, document_slug: str, article: str) -> str:
     return f"policy:{document_slug}:{article}"
 
 
+def is_policy_evidence_id(evidence_id: str) -> bool:
+    """정책 조항 근거인지 판정한다. SQL 조회 근거와 섞어 세지 않기 위한 경계다."""
+    return evidence_id.startswith("policy:")
+
+
 def sql_evidence_id(*, inquiry_id: str, sequence: int) -> str:
     """채택된 SQL 조회 1건의 식별자: `sql:<문의 ID>:<실행 순번>`.
 

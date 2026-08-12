@@ -15,19 +15,21 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import cast
+from typing import Final, cast
 
 from reply_gate.llm import GenerationClient
 
 __all__ = [
     "Bm25Hit",
     "FusedHit",
+    "RerankOutcome",
     "RetrievalStage",
     "StrategyDefinition",
     "VectorHit",
     "bm25_rank",
     "default_strategy_ladder",
     "llm_rerank",
+    "merge_rewritten_bm25",
     "merge_rewritten_rankings",
     "reciprocal_rank_fusion",
 ]
@@ -218,24 +220,60 @@ _RERANK_SCHEMA: dict[str, object] = {
 }
 
 
+_RERANK_SYSTEM: Final = (
+    "문의에 답하는 데 직접 관련된 정책 조항부터 정렬한다. "
+    "후보 evidence_id를 빠짐없이 정확히 한 번씩 반환한다."
+)
+
+
+@dataclass(frozen=True)
+class RerankOutcome:
+    """리랭크 한 건의 결과와 관측 기록.
+
+    폴백은 조용히 지나가지 않는다. 실패 사유와 실비용 토큰이 호출자에게 그대로 올라가고,
+    평가 리포트가 그것을 집계한다(spec §8-1).
+    """
+
+    hits: tuple[FusedHit, ...]
+    fell_back: bool
+    fallback_reason: str | None
+    input_tokens: int
+    output_tokens: int
+    served_from_cache: bool
+
+
 def _rerank_input(
-    *, query: str, candidates: Sequence[FusedHit], policy_texts: Mapping[str, str]
+    *,
+    query: str,
+    rewritten_query: str | None,
+    candidates: Sequence[FusedHit],
+    policy_texts: Mapping[str, str],
 ) -> dict[str, object]:
     missing = [hit.evidence_id for hit in candidates if hit.evidence_id not in policy_texts]
     if missing:
         raise ValueError(f"리랭크 후보 본문이 없다: {', '.join(missing)}")
-    return {
+    payload: dict[str, object] = {
         "query": query,
         "candidates": [
             {"evidence_id": hit.evidence_id, "text": policy_texts[hit.evidence_id]}
             for hit in candidates
         ],
     }
+    # 재작성 단이 켜진 전략에서는 재작성문도 리랭크 입력에 얹는다. 원문을 지우지 않는 것이
+    # 누적 사다리 계약이고, 두 문장이 함께 캐시 키에 들어가 조건이 섞이지 않는다.
+    if rewritten_query is not None:
+        payload["rewritten_query"] = rewritten_query
+    return payload
 
 
 def _rerank_cache_path(*, cache_dir: Path, model: str, input_hash: str) -> Path:
     cache_key = json.dumps(
-        {"model": model, "input_hash": input_hash},
+        # 지시문을 고치면 캐시가 무효화되어야 한다 — 프롬프트도 입력이다.
+        {
+            "model": model,
+            "input_hash": input_hash,
+            "system_hash": hashlib.sha256(_RERANK_SYSTEM.encode("utf-8")).hexdigest(),
+        },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -287,6 +325,11 @@ def _write_rerank_cache(
     temporary.replace(path)
 
 
+def _truncated(message: str, *, limit: int = 200) -> str:
+    collapsed = " ".join(message.split())
+    return collapsed if len(collapsed) <= limit else collapsed[:limit] + "…"
+
+
 def llm_rerank(
     *,
     query: str,
@@ -295,8 +338,9 @@ def llm_rerank(
     client: GenerationClient,
     model: str,
     cache_dir: Path,
-) -> tuple[FusedHit, ...]:
-    """후보를 OpenAI 생성 경계로 재정렬하고 실패하면 입력 순위를 유지한다."""
+    rewritten_query: str | None = None,
+) -> RerankOutcome:
+    """후보를 생성 경계로 재정렬한다. 실패하면 입력 순위를 유지하고 그 사실을 기록한다."""
     if not model.strip():
         raise ValueError("리랭크 model은 비어 있지 않아야 한다")
     candidates_tuple = tuple(candidates)
@@ -304,10 +348,20 @@ def llm_rerank(
     if len(expected) != len(set(expected)):
         raise ValueError("리랭크 후보의 정책 근거 ID는 중복될 수 없다")
     if not candidates_tuple:
-        return ()
+        return RerankOutcome(
+            hits=(),
+            fell_back=False,
+            fallback_reason=None,
+            input_tokens=0,
+            output_tokens=0,
+            served_from_cache=False,
+        )
 
     rerank_input = _rerank_input(
-        query=query, candidates=candidates_tuple, policy_texts=policy_texts
+        query=query,
+        rewritten_query=rewritten_query,
+        candidates=candidates_tuple,
+        policy_texts=policy_texts,
     )
     canonical_input = json.dumps(
         rerank_input, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -315,35 +369,67 @@ def llm_rerank(
     input_hash = hashlib.sha256(canonical_input.encode("utf-8")).hexdigest()
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = _rerank_cache_path(cache_dir=cache_dir, model=model, input_hash=input_hash)
-    evidence_ids = _read_rerank_cache(
+    cached = _read_rerank_cache(
         path=cache_path, model=model, input_hash=input_hash, expected=expected
     )
-    if evidence_ids is None:
-        try:
-            completion = client.complete_json(
-                stage="retrieval_rerank",
-                system=(
-                    "문의에 답하는 데 직접 관련된 정책 조항부터 정렬한다. "
-                    "후보 evidence_id를 빠짐없이 정확히 한 번씩 반환한다."
-                ),
-                user=canonical_input,
-                schema=_RERANK_SCHEMA,
-                schema_name="retrieval_rerank",
-                max_output_tokens=2000,
-            )
-        except Exception:
-            return candidates_tuple
-        evidence_ids = _validated_order(completion.data, expected=expected)
-        if evidence_ids is None:
-            return candidates_tuple
-        _write_rerank_cache(
-            path=cache_path,
-            model=model,
-            input_hash=input_hash,
-            evidence_ids=evidence_ids,
+    if cached is not None:
+        return RerankOutcome(
+            hits=_reordered(candidates_tuple, cached),
+            fell_back=False,
+            fallback_reason=None,
+            input_tokens=0,
+            output_tokens=0,
+            served_from_cache=True,
         )
 
-    by_id = {hit.evidence_id: hit for hit in candidates_tuple}
+    try:
+        completion = client.complete_json(
+            stage="retrieval_rerank",
+            system=_RERANK_SYSTEM,
+            user=canonical_input,
+            schema=_RERANK_SCHEMA,
+            schema_name="retrieval_rerank",
+            max_output_tokens=2000,
+        )
+    except Exception as exc:
+        # 실패한 호출이 쓴 토큰은 관측 경계 밖이지만, 폴백 사실은 리포트에 남는다.
+        return RerankOutcome(
+            hits=candidates_tuple,
+            fell_back=True,
+            fallback_reason=f"호출 실패({type(exc).__name__}): {_truncated(str(exc))}",
+            input_tokens=0,
+            output_tokens=0,
+            served_from_cache=False,
+        )
+
+    evidence_ids = _validated_order(completion.data, expected=expected)
+    if evidence_ids is None:
+        return RerankOutcome(
+            hits=candidates_tuple,
+            fell_back=True,
+            fallback_reason="산출 해석 불가: 후보 evidence_id 집합과 일치하지 않는다",
+            input_tokens=completion.input_tokens,
+            output_tokens=completion.output_tokens,
+            served_from_cache=False,
+        )
+    _write_rerank_cache(
+        path=cache_path,
+        model=model,
+        input_hash=input_hash,
+        evidence_ids=evidence_ids,
+    )
+    return RerankOutcome(
+        hits=_reordered(candidates_tuple, evidence_ids),
+        fell_back=False,
+        fallback_reason=None,
+        input_tokens=completion.input_tokens,
+        output_tokens=completion.output_tokens,
+        served_from_cache=False,
+    )
+
+
+def _reordered(candidates: Sequence[FusedHit], evidence_ids: Sequence[str]) -> tuple[FusedHit, ...]:
+    by_id = {hit.evidence_id: hit for hit in candidates}
     return tuple(
         replace(by_id[evidence_id], rank=rank)
         for rank, evidence_id in enumerate(evidence_ids, start=1)
@@ -363,4 +449,22 @@ def merge_rewritten_rankings(
     return tuple(
         VectorHit(rank=rank, evidence_id=evidence_id, similarity=similarity)
         for rank, (evidence_id, similarity) in enumerate(ordered, start=1)
+    )
+
+
+def merge_rewritten_bm25(
+    *, original: Sequence[Bm25Hit], rewritten: Sequence[Bm25Hit]
+) -> tuple[Bm25Hit, ...]:
+    """원문·재작성문 어휘 순위를 합치고 같은 근거에는 더 큰 BM25 점수를 쓴다.
+
+    벡터 다리와 같은 합침 규칙이다. 재작성 단이 켜진 전략에서 어휘 다리만 원문을 쓰면
+    누적 사다리가 성립하지 않고, 재작성의 기여가 상위 단에서 체계적으로 과소평가된다.
+    """
+    max_score: dict[str, float] = {}
+    for hit in (*original, *rewritten):
+        max_score[hit.evidence_id] = max(hit.score, max_score.get(hit.evidence_id, float("-inf")))
+    ordered = sorted(max_score.items(), key=lambda item: (-item[1], item[0]))
+    return tuple(
+        Bm25Hit(rank=rank, evidence_id=evidence_id, score=score)
+        for rank, (evidence_id, score) in enumerate(ordered, start=1)
     )

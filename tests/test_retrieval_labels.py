@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from reply_gate.evaluation import DEFAULT_GOLDEN_SET_PATH
+from reply_gate.policy_index import DEFAULT_POLICY_DIR
 from reply_gate.retrieval_labels import (
     DEFAULT_RETRIEVAL_LABELS_PATH,
     load_retrieval_labels,
@@ -48,9 +50,9 @@ def test_저장소_검색_라벨_30건을_정책_원문_기준으로_읽는다()
         "G13": frozenset({"policy:refund:2-4"}),
         "G14": frozenset({"policy:exchange:3-5"}),
         "G15": frozenset({"policy:refund:2-5"}),
-        "G16": frozenset({"policy:support:4-1", "policy:support:4-2"}),
-        "G17": frozenset({"policy:support:4-1", "policy:support:4-2"}),
-        "G18": frozenset({"policy:refund:2-6"}),
+        "G16": frozenset({"policy:support:4-1"}),
+        "G17": frozenset({"policy:support:4-1"}),
+        "G18": frozenset({"policy:refund:2-6", "policy:refund:2-4"}),
         "G19": frozenset({"policy:support:4-2"}),
         "G20": frozenset({"policy:support:4-1", "policy:support:4-2"}),
         "G21": frozenset(),
@@ -74,15 +76,24 @@ def test_직접_답하거나_제한할_정책이_없는_다섯_건은_빈_정답
     assert empty_ids == {"G21", "G22", "G23", "G24", "G28"}
 
 
-def test_검색_recall은_모든_직접_관련_조항을_세며_judge의_최소_citation과_분리된다() -> None:
-    """4-1만으로 충분한 답변도 pass지만 검색 recall 분모에는 직접 관련 4-2도 든다."""
+def test_직접_관련은_정면_조항과_그것과_상충하는_조항까지다() -> None:
+    """정답 경계는 두 겹이다(결정 0010) — 정면으로 답하는 조항 + 같은 사안의 상충 조항.
+
+    표현만 다른 G16·G17 이 같은 정답을 갖는 것이 이 규칙의 시금석이다. 전화만 묻는 문의에
+    이메일 접수 채널(4-2)까지 넣으면 정답을 하나 찾고도 r@1 이 0.5 로 기록돼 표적 케이스
+    판독이 흐려진다. 반대로 G18 은 2-6 과 상충하는 2-4 를 함께 세야 한다 — 검색이 둘을
+    올려야 L2 가 모순을 잡는데, 라벨이 2-6 만이면 그 동작이 precision 을 깎는다.
+    """
     labels = {label.id: label for label in load_retrieval_labels()}
 
-    assert labels["G16"].relevant_evidence_ids == frozenset(
+    assert labels["G16"].relevant_evidence_ids == frozenset({"policy:support:4-1"})
+    assert labels["G17"].relevant_evidence_ids == labels["G16"].relevant_evidence_ids
+    assert labels["G19"].relevant_evidence_ids == frozenset({"policy:support:4-2"})
+    assert labels["G20"].relevant_evidence_ids == frozenset(
         {"policy:support:4-1", "policy:support:4-2"}
     )
-    assert labels["G17"].relevant_evidence_ids == frozenset(
-        {"policy:support:4-1", "policy:support:4-2"}
+    assert labels["G18"].relevant_evidence_ids == frozenset(
+        {"policy:refund:2-6", "policy:refund:2-4"}
     )
     assert labels["G25"].relevant_evidence_ids == frozenset({"policy:shipping:1-5"})
     assert labels["G29"].relevant_evidence_ids == frozenset({"policy:support:4-5"})
@@ -169,3 +180,34 @@ def test_한_라벨_안의_근거_ID가_중복되면_거부한다(tmp_path: Path
 
     with pytest.raises(ValueError, match=r"근거 ID가 중복.*policy:refund:2-1"):
         load_retrieval_labels(path)
+
+
+def test_교차검증은_호출자가_실제로_쓸_코퍼스를_기준으로_한다(tmp_path: Path) -> None:
+    """기본 경로로만 검사하면 축소된 코퍼스로 돌릴 때 recall 이 조용히 0 으로 계상된다."""
+    reduced = tmp_path / "policies"
+    reduced.mkdir()
+    source = DEFAULT_POLICY_DIR / "shipping.md"
+    (reduced / "shipping.md").write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+    # 기본 코퍼스 기준으로는 통과하는 라벨이,
+    assert len(load_retrieval_labels(DEFAULT_RETRIEVAL_LABELS_PATH)) == 30
+
+    # 실제로 검색할 코퍼스에 없는 조항을 정답으로 담고 있으면 로드 시점에 거부된다.
+    with pytest.raises(ValueError, match="정책 문서에 없는 근거 ID"):
+        load_retrieval_labels(DEFAULT_RETRIEVAL_LABELS_PATH, policy_dir=reduced)
+
+
+def test_교차검증은_호출자가_준_골든셋을_기준으로_한다(tmp_path: Path) -> None:
+    golden = tmp_path / "golden.jsonl"
+    rows = [
+        json.loads(line)
+        for line in DEFAULT_GOLDEN_SET_PATH.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    golden.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows[:5]),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="골든셋에 없는 ID"):
+        load_retrieval_labels(DEFAULT_RETRIEVAL_LABELS_PATH, golden_set_path=golden)

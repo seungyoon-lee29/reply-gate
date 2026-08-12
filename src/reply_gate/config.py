@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     generation_effort: str | None = None
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 1536
+    #: 오프라인 검색 비교의 LLM 리랭크 모델. 다른 모델 기본값과 같은 자리에서 소유한다.
+    rerank_model: str = "gpt-5.6-luna"
 
     # ── L2 판정 ─────────────────────────────────────────────────────────────
     #: L2 판정 스위치 — 기본 켜짐.

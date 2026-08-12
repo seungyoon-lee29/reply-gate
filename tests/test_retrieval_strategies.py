@@ -1,19 +1,23 @@
 """정답 라벨과 분리된 재사용 가능 검색 전략의 공개 동작."""
 
+import json
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
+from reply_gate import retrieval_strategies
 from reply_gate.llm import GenerationClient, JsonCompletion, LLMCallError
 from reply_gate.retrieval_strategies import (
     Bm25Hit,
     FusedHit,
+    RerankOutcome,
     RetrievalStage,
     VectorHit,
     bm25_rank,
     default_strategy_ladder,
     llm_rerank,
+    merge_rewritten_bm25,
     merge_rewritten_rankings,
     reciprocal_rank_fusion,
 )
@@ -139,7 +143,7 @@ def test_llm_rerank_uses_returned_order_without_sampling_parameters(tmp_path: Pa
         ]
     )
 
-    reranked = llm_rerank(
+    outcome = llm_rerank(
         query="환불 문의",
         candidates=_fused_candidates(),
         policy_texts={
@@ -152,15 +156,96 @@ def test_llm_rerank_uses_returned_order_without_sampling_parameters(tmp_path: Pa
         cache_dir=tmp_path,
     )
 
-    assert [hit.evidence_id for hit in reranked] == [
+    assert [hit.evidence_id for hit in outcome.hits] == [
         "policy:c:1",
         "policy:a:1",
         "policy:b:1",
     ]
-    assert [hit.rank for hit in reranked] == [1, 2, 3]
+    assert [hit.rank for hit in outcome.hits] == [1, 2, 3]
+    assert not outcome.fell_back
+    assert outcome.fallback_reason is None
+    assert (outcome.input_tokens, outcome.output_tokens) == (10, 4)
     assert "temperature" not in client.calls[0]
     assert "top_p" not in client.calls[0]
     assert "top_k" not in client.calls[0]
+
+
+def test_리랭크_입력에_재작성문이_함께_실리고_원문을_지우지_않는다(tmp_path: Path) -> None:
+    client = _RecordingGenerationClient(
+        [
+            JsonCompletion(
+                data={"evidence_ids": ["policy:a:1", "policy:b:1", "policy:c:1"]},
+                input_tokens=1,
+                output_tokens=1,
+            )
+        ]
+    )
+
+    llm_rerank(
+        query="환불 언제 되나요",
+        rewritten_query="환불 처리 기간",
+        candidates=_fused_candidates(),
+        policy_texts={
+            "policy:a:1": "A 조항",
+            "policy:b:1": "B 조항",
+            "policy:c:1": "C 조항",
+        },
+        client=cast(GenerationClient, client),
+        model="gpt-cheap",
+        cache_dir=tmp_path,
+    )
+
+    payload = json.loads(cast(str, client.calls[0]["user"]))
+    assert payload["query"] == "환불 언제 되나요"
+    assert payload["rewritten_query"] == "환불 처리 기간"
+
+
+def test_리랭크_캐시는_지시문이_바뀌면_무효화된다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """지시문도 입력이다 — 프롬프트를 고친 재실행이 옛 순위를 조용히 재사용하면 안 된다."""
+    policy_texts = {"policy:a:1": "A 조항", "policy:b:1": "B 조항", "policy:c:1": "C 조항"}
+
+    def rerank_once(client: _RecordingGenerationClient) -> RerankOutcome:
+        return llm_rerank(
+            query="환불 문의",
+            candidates=_fused_candidates(),
+            policy_texts=policy_texts,
+            client=cast(GenerationClient, client),
+            model="gpt-cheap",
+            cache_dir=tmp_path,
+        )
+
+    first_client = _RecordingGenerationClient(
+        [
+            JsonCompletion(
+                data={"evidence_ids": ["policy:b:1", "policy:c:1", "policy:a:1"]},
+                input_tokens=10,
+                output_tokens=4,
+            )
+        ]
+    )
+    rerank_once(first_client)
+
+    monkeypatch.setattr(retrieval_strategies, "_RERANK_SYSTEM", "다른 지시문")
+    second_client = _RecordingGenerationClient(
+        [
+            JsonCompletion(
+                data={"evidence_ids": ["policy:c:1", "policy:b:1", "policy:a:1"]},
+                input_tokens=10,
+                output_tokens=4,
+            )
+        ]
+    )
+    second = rerank_once(second_client)
+
+    assert len(second_client.calls) == 1
+    assert not second.served_from_cache
+    assert [hit.evidence_id for hit in second.hits] == [
+        "policy:c:1",
+        "policy:b:1",
+        "policy:a:1",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -175,7 +260,7 @@ def test_llm_rerank_failure_or_unparseable_output_keeps_previous_order(
 ) -> None:
     client = _RecordingGenerationClient([outcome])
 
-    reranked = llm_rerank(
+    result = llm_rerank(
         query="환불 문의",
         candidates=_fused_candidates(),
         policy_texts={
@@ -188,7 +273,54 @@ def test_llm_rerank_failure_or_unparseable_output_keeps_previous_order(
         cache_dir=tmp_path,
     )
 
-    assert reranked == _fused_candidates()
+    assert result.hits == _fused_candidates()
+    # 폴백은 순위를 지키지만 조용히 지나가지 않는다 — 사유가 호출자에게 올라간다.
+    assert result.fell_back
+    assert result.fallback_reason is not None
+    assert not result.served_from_cache
+
+
+def test_리랭크_폴백은_캐시에_기록되지_않는다(tmp_path: Path) -> None:
+    """실패한 순위를 캐시에 남기면 다음 실행이 그것을 성공으로 재사용한다."""
+    failing = _RecordingGenerationClient(
+        [LLMCallError(stage="retrieval_rerank", reason="transport_error", attempts=2)]
+    )
+    policy_texts = {"policy:a:1": "A 조항", "policy:b:1": "B 조항", "policy:c:1": "C 조항"}
+    first = llm_rerank(
+        query="환불 문의",
+        candidates=_fused_candidates(),
+        policy_texts=policy_texts,
+        client=cast(GenerationClient, failing),
+        model="gpt-cheap",
+        cache_dir=tmp_path,
+    )
+    assert first.fell_back
+
+    succeeding = _RecordingGenerationClient(
+        [
+            JsonCompletion(
+                data={"evidence_ids": ["policy:c:1", "policy:b:1", "policy:a:1"]},
+                input_tokens=2,
+                output_tokens=2,
+            )
+        ]
+    )
+    second = llm_rerank(
+        query="환불 문의",
+        candidates=_fused_candidates(),
+        policy_texts=policy_texts,
+        client=cast(GenerationClient, succeeding),
+        model="gpt-cheap",
+        cache_dir=tmp_path,
+    )
+
+    assert len(succeeding.calls) == 1
+    assert not second.fell_back
+    assert [hit.evidence_id for hit in second.hits] == [
+        "policy:c:1",
+        "policy:b:1",
+        "policy:a:1",
+    ]
 
 
 def test_llm_rerank_reuses_cache_for_same_input_and_model(tmp_path: Path) -> None:
@@ -224,5 +356,29 @@ def test_llm_rerank_reuses_cache_for_same_input_and_model(tmp_path: Path) -> Non
         cache_dir=tmp_path,
     )
 
-    assert second == first
+    assert second.hits == first.hits
     assert len(client.calls) == 1
+    # 캐시 재사용은 과금이 아니다 — 토큰 0 과 재사용 표시가 함께 올라간다.
+    assert second.served_from_cache
+    assert (second.input_tokens, second.output_tokens) == (0, 0)
+    assert not first.served_from_cache
+    assert (first.input_tokens, first.output_tokens) == (10, 4)
+
+
+def test_재작성_어휘_순위는_더_큰_점수로_합쳐진다() -> None:
+    original = (
+        Bm25Hit(rank=1, evidence_id="policy:a:1", score=3.0),
+        Bm25Hit(rank=2, evidence_id="policy:b:1", score=1.0),
+    )
+    rewritten = (
+        Bm25Hit(rank=1, evidence_id="policy:b:1", score=5.0),
+        Bm25Hit(rank=2, evidence_id="policy:c:1", score=2.0),
+    )
+
+    merged = merge_rewritten_bm25(original=original, rewritten=rewritten)
+
+    assert [(hit.rank, hit.evidence_id, hit.score) for hit in merged] == [
+        (1, "policy:b:1", 5.0),
+        (2, "policy:a:1", 3.0),
+        (3, "policy:c:1", 2.0),
+    ]

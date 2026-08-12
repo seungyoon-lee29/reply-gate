@@ -36,8 +36,16 @@ class RetrievalLabel:
 
 def load_retrieval_labels(
     path: Path = DEFAULT_RETRIEVAL_LABELS_PATH,
+    *,
+    golden_set_path: Path = DEFAULT_GOLDEN_SET_PATH,
+    policy_dir: Path = DEFAULT_POLICY_DIR,
 ) -> tuple[RetrievalLabel, ...]:
-    """검색 정답 라벨을 읽는다."""
+    """검색 정답 라벨을 읽는다.
+
+    교차검증 대상은 **호출자가 실제로 쓸** 골든셋과 정책 코퍼스다. 기본 경로로만 검사하면
+    다른 코퍼스로 평가할 때 존재하지 않는 조항이 정답으로 남아 recall 이 조용히 0 으로
+    계상된다(fail-closed 가 fail-open 이 되는 경로).
+    """
     labels: list[RetrievalLabel] = []
     seen: set[str] = set()
     with path.open(encoding="utf-8") as handle:
@@ -89,7 +97,7 @@ def load_retrieval_labels(
                     note=note,
                 )
             )
-    golden_ids = {case.id for case in load_golden_set(DEFAULT_GOLDEN_SET_PATH)}
+    golden_ids = {case.id for case in load_golden_set(golden_set_path)}
     unknown_ids = {label.id for label in labels} - golden_ids
     if unknown_ids:
         raise ValueError(f"골든셋에 없는 ID가 검색 라벨에 있다: {', '.join(sorted(unknown_ids))}")
@@ -98,7 +106,7 @@ def load_retrieval_labels(
         raise ValueError(f"검색 라벨에서 빠진 골든셋 ID가 있다: {', '.join(sorted(missing_ids))}")
     policy_ids = {
         chunk.evidence_id
-        for document in load_policy_documents(DEFAULT_POLICY_DIR)
+        for document in load_policy_documents(policy_dir)
         for chunk in document.chunks
     }
     unknown_evidence_ids = {

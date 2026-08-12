@@ -48,6 +48,7 @@ from reply_gate.contracts import (
     InquiryStatus,
     RejectReason,
     Verdict,
+    is_policy_evidence_id,
 )
 from reply_gate.gate import DEFAULT_PII_PATTERNS, REASON_ORDER, evaluate_draft
 from reply_gate.judge import L2_REJECT_REASONS
@@ -1294,7 +1295,10 @@ class FailureAttributionCase:
     missing_relevant_evidence_ids: tuple[str, ...]
     rejected_at_least_once: bool
     escalated: bool
+    #: 채택 근거 전체가 0건. SQL 조회 근거도 함께 센다.
     ended_with_zero_evidence: bool
+    #: 정책 조항 근거가 0건 — "검색 0건"의 정확한 의미. SQL 근거는 검색 결과가 아니다.
+    ended_with_zero_policy_evidence: bool
     l2_caught_with_evidence: bool
     #: 빈 정답 케이스에서만 bool. 다른 두 분류에서는 해당 없음.
     normal_behavior: bool | None
@@ -1308,10 +1312,20 @@ class FailureAttribution:
 
     labels_path: str
     generation_issue_count: int
+    #: 정답 조항을 하나도 채택하지 못한 기각·인계.
     retrieval_failure_count: int
+    #: 정답 조항 중 일부만 채택한 기각·인계. 검색 실패 합계에 포함된다.
+    partial_retrieval_failure_count: int
+    #: 정답 조항이 빠진 채 답변이 확정된 케이스 — 게이트를 통과한 근거 부족.
+    answered_without_relevant_evidence_count: int
     expected_no_answer_count: int
     expected_no_answer_anomaly_count: int
     cases: tuple[FailureAttributionCase, ...]
+
+    @property
+    def retrieval_failure_total(self) -> int:
+        """전부 누락 + 일부 누락. 헤드라인이 검색 실패를 과소 보고하지 않게 한다."""
+        return self.retrieval_failure_count + self.partial_retrieval_failure_count
 
 
 @dataclass(frozen=True)
@@ -1405,21 +1419,21 @@ def _build_failure_attribution(
         load_retrieval_labels,
     )
 
+    # 측정 2 미실행이 더 근본적인 사유다. 라벨 로드를 먼저 시도하면 둘 다 성립할 때
+    # 미산출 사유가 라벨 실패로 덮여 진짜 원인이 사라진다.
+    if isinstance(pipeline, SkippedMeasurement):
+        return UnavailableBreakdown(reason=f"측정 2 미실행: {pipeline.reason}")
+
     path = DEFAULT_RETRIEVAL_LABELS_PATH if retrieval_labels_path is None else retrieval_labels_path
     try:
         labels = load_retrieval_labels(path)
     except (KeyError, OSError, TypeError, ValueError) as exc:
         return UnavailableBreakdown(reason=f"검색 정답 라벨 로드 실패({type(exc).__name__}): {exc}")
 
-    if isinstance(pipeline, SkippedMeasurement):
-        return UnavailableBreakdown(reason=f"측정 2 미실행: {pipeline.reason}")
-
     relevant_by_id = {label.id: tuple(sorted(label.relevant_evidence_ids)) for label in labels}
-    candidates = tuple(
-        outcome
-        for outcome in pipeline.outcomes
-        if outcome.rejected_at_least_once or outcome.status is InquiryStatus.ESCALATED
-    )
+    # 후보는 기각·인계만이 아니다. 정답 조항을 못 찾았는데도 답변이 확정된 케이스가 이
+    # 제품에서 가장 위험한 실패이고, 그것이 분해표에서 빠지면 검색 실패가 과소 집계된다.
+    candidates = tuple(pipeline.outcomes)
     missing_labels = sorted(
         outcome.case_id for outcome in candidates if outcome.case_id not in relevant_by_id
     )
@@ -1433,6 +1447,13 @@ def _build_failure_attribution(
         relevant = relevant_by_id[outcome.case_id]
         adopted = outcome.adopted_evidence_ids
         adopted_set = set(adopted)
+        policy_adopted = tuple(
+            evidence_id for evidence_id in adopted if is_policy_evidence_id(evidence_id)
+        )
+        is_failure = outcome.rejected_at_least_once or outcome.status is InquiryStatus.ESCALATED
+        if relevant and not is_failure and set(relevant) <= adopted_set:
+            # 정답 조항을 전부 채택하고 정상 답변한 케이스는 분해 대상이 아니다.
+            continue
         l2_rejected = bool(set(outcome.reject_reasons).intersection(L2_REJECT_REASONS))
         normal_behavior: bool | None = None
         normal_behavior_path: str | None = None
@@ -1462,8 +1483,15 @@ def _build_failure_attribution(
                 anomaly_reason = "근거를 채택했지만 L2 기각 사유 없음"
             else:
                 anomaly_reason = "L2 기각 사유가 있지만 rejected_twice 인계가 아님"
-        elif adopted_set.intersection(relevant):
+        elif not is_failure:
+            # 답변이 확정됐는데 정답 조항이 빠졌다 — 게이트를 통과한 근거 부족이다.
+            classification = "answered_without_relevant_evidence"
+        elif set(relevant) <= adopted_set:
             classification = "generation_issue"
+        elif adopted_set.intersection(relevant):
+            # 정답 조항 중 일부만 찾았다. 필요한 조항이 빠진 채 생성한 것이므로 생성 문제로
+            # 세면 검색 실패가 과소 집계된다.
+            classification = "partial_retrieval_failure"
         else:
             classification = "retrieval_failure"
 
@@ -1479,6 +1507,7 @@ def _build_failure_attribution(
                 rejected_at_least_once=outcome.rejected_at_least_once,
                 escalated=outcome.status is InquiryStatus.ESCALATED,
                 ended_with_zero_evidence=not adopted,
+                ended_with_zero_policy_evidence=not policy_adopted,
                 l2_caught_with_evidence=bool(adopted) and l2_rejected,
                 normal_behavior=normal_behavior,
                 normal_behavior_path=normal_behavior_path,
@@ -1493,6 +1522,12 @@ def _build_failure_attribution(
         ),
         retrieval_failure_count=sum(
             item.classification == "retrieval_failure" for item in attributed
+        ),
+        partial_retrieval_failure_count=sum(
+            item.classification == "partial_retrieval_failure" for item in attributed
+        ),
+        answered_without_relevant_evidence_count=sum(
+            item.classification == "answered_without_relevant_evidence" for item in attributed
         ),
         expected_no_answer_count=sum(
             item.classification == "expected_no_answer" and item.normal_behavior is True
@@ -1791,11 +1826,14 @@ def _render_failure_attribution(
         [
             f"- 검색 정답 라벨: `{attribution.labels_path}`",
             f"- 생성 문제: **{attribution.generation_issue_count}건** — "
-            "정답 조항을 채택했지만 기각·인계",
-            f"- 검색 실패: **{attribution.retrieval_failure_count}건** — "
-            "정답 조항을 채택하지 못해 기각·인계",
+            "정답 조항을 **전부** 채택했지만 기각·인계",
+            f"- 검색 실패 합계: **{attribution.retrieval_failure_total}건** "
+            f"(전부 누락 {attribution.retrieval_failure_count}건 · "
+            f"일부 누락 {attribution.partial_retrieval_failure_count}건)",
+            f"- 근거 없이 답변 확정: **{attribution.answered_without_relevant_evidence_count}건** "
+            "— 정답 조항이 빠진 채 게이트를 통과했다",
             f"- 빈 정답 정상 인계: **{attribution.expected_no_answer_count}건** — "
-            "앞의 두 분류에 포함하지 않음",
+            "앞의 분류에 포함하지 않음",
             f"- 빈 정답 비정상 종결: **{attribution.expected_no_answer_anomaly_count}건** — "
             "정상 인계 집계에서 제외",
             "",
@@ -1805,7 +1843,9 @@ def _render_failure_attribution(
     )
     labels = {
         "generation_issue": "생성 문제",
-        "retrieval_failure": "검색 실패",
+        "retrieval_failure": "검색 실패(전부 누락)",
+        "partial_retrieval_failure": "검색 실패(일부 누락)",
+        "answered_without_relevant_evidence": "근거 없이 답변 확정",
         "expected_no_answer": "빈 정답 정상 인계",
     }
     for item in attribution.cases:
@@ -2053,6 +2093,11 @@ def _failure_attribution_json(
         "labels_path": attribution.labels_path,
         "generation_issue_count": attribution.generation_issue_count,
         "retrieval_failure_count": attribution.retrieval_failure_count,
+        "partial_retrieval_failure_count": attribution.partial_retrieval_failure_count,
+        "retrieval_failure_total": attribution.retrieval_failure_total,
+        "answered_without_relevant_evidence_count": (
+            attribution.answered_without_relevant_evidence_count
+        ),
         "expected_no_answer_count": attribution.expected_no_answer_count,
         "expected_no_answer_anomaly_count": attribution.expected_no_answer_anomaly_count,
         "cases": [
@@ -2065,6 +2110,7 @@ def _failure_attribution_json(
                 "rejected_at_least_once": item.rejected_at_least_once,
                 "escalated": item.escalated,
                 "ended_with_zero_evidence": item.ended_with_zero_evidence,
+                "ended_with_zero_policy_evidence": item.ended_with_zero_policy_evidence,
                 "l2_caught_with_evidence": item.l2_caught_with_evidence,
                 "normal_behavior": item.normal_behavior,
                 "normal_behavior_path": item.normal_behavior_path,
