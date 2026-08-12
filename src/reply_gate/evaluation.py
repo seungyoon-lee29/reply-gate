@@ -1296,6 +1296,10 @@ class FailureAttributionCase:
     escalated: bool
     ended_with_zero_evidence: bool
     l2_caught_with_evidence: bool
+    #: 빈 정답 케이스에서만 bool. 다른 두 분류에서는 해당 없음.
+    normal_behavior: bool | None
+    normal_behavior_path: str | None
+    anomaly_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -1306,6 +1310,7 @@ class FailureAttribution:
     generation_issue_count: int
     retrieval_failure_count: int
     expected_no_answer_count: int
+    expected_no_answer_anomaly_count: int
     cases: tuple[FailureAttributionCase, ...]
 
 
@@ -1428,18 +1433,40 @@ def _build_failure_attribution(
         relevant = relevant_by_id[outcome.case_id]
         adopted = outcome.adopted_evidence_ids
         adopted_set = set(adopted)
+        l2_rejected = bool(set(outcome.reject_reasons).intersection(L2_REJECT_REASONS))
+        normal_behavior: bool | None = None
+        normal_behavior_path: str | None = None
+        anomaly_reason: str | None = None
         if not relevant:
-            # G21~G24 는 정답이 "근거 없음"이다. 인계된 경우만 정상
-            # 동작으로 기록하고 검색 실패/생성 문제 카운트에서 뺀다.
-            if outcome.status is not InquiryStatus.ESCALATED:
-                continue
             classification = "expected_no_answer"
+            zero_evidence_normal = (
+                outcome.status is InquiryStatus.ESCALATED
+                and outcome.escalation_reason is EscalationReason.NO_EVIDENCE
+                and not adopted
+                and not outcome.attempt_verdicts
+            )
+            l2_rejection_normal = (
+                outcome.status is InquiryStatus.ESCALATED
+                and outcome.escalation_reason is EscalationReason.REJECTED_TWICE
+                and bool(adopted)
+                and l2_rejected
+            )
+            normal_behavior = zero_evidence_normal or l2_rejection_normal
+            if zero_evidence_normal:
+                normal_behavior_path = "retrieval_zero_evidence"
+            elif l2_rejection_normal:
+                normal_behavior_path = "l2_rejected_with_evidence"
+            elif not adopted:
+                anomaly_reason = "검색 0건이지만 no_evidence·시도 0건 종료가 아님"
+            elif not l2_rejected:
+                anomaly_reason = "근거를 채택했지만 L2 기각 사유 없음"
+            else:
+                anomaly_reason = "L2 기각 사유가 있지만 rejected_twice 인계가 아님"
         elif adopted_set.intersection(relevant):
             classification = "generation_issue"
         else:
             classification = "retrieval_failure"
 
-        l2_rejected = bool(set(outcome.reject_reasons).intersection(L2_REJECT_REASONS))
         attributed.append(
             FailureAttributionCase(
                 case_id=outcome.case_id,
@@ -1453,6 +1480,9 @@ def _build_failure_attribution(
                 escalated=outcome.status is InquiryStatus.ESCALATED,
                 ended_with_zero_evidence=not adopted,
                 l2_caught_with_evidence=bool(adopted) and l2_rejected,
+                normal_behavior=normal_behavior,
+                normal_behavior_path=normal_behavior_path,
+                anomaly_reason=anomaly_reason,
             )
         )
 
@@ -1465,7 +1495,12 @@ def _build_failure_attribution(
             item.classification == "retrieval_failure" for item in attributed
         ),
         expected_no_answer_count=sum(
-            item.classification == "expected_no_answer" for item in attributed
+            item.classification == "expected_no_answer" and item.normal_behavior is True
+            for item in attributed
+        ),
+        expected_no_answer_anomaly_count=sum(
+            item.classification == "expected_no_answer" and item.normal_behavior is False
+            for item in attributed
         ),
         cases=tuple(attributed),
     )
@@ -1761,6 +1796,8 @@ def _render_failure_attribution(
             "정답 조항을 채택하지 못해 기각·인계",
             f"- 빈 정답 정상 인계: **{attribution.expected_no_answer_count}건** — "
             "앞의 두 분류에 포함하지 않음",
+            f"- 빈 정답 비정상 종결: **{attribution.expected_no_answer_anomaly_count}건** — "
+            "정상 인계 집계에서 제외",
             "",
             "#### 케이스별 판정 근거",
             "",
@@ -1776,15 +1813,19 @@ def _render_failure_attribution(
         adopted = ", ".join(f"`{value}`" for value in item.adopted_evidence_ids) or "없음"
         route = ""
         if item.classification == "expected_no_answer":
-            if item.ended_with_zero_evidence:
+            if item.normal_behavior is False:
+                route = f" / 비정상: {item.anomaly_reason}"
+            elif item.normal_behavior_path == "retrieval_zero_evidence":
                 route = " / 검색 0건 종료"
-            elif item.l2_caught_with_evidence:
+            elif item.normal_behavior_path == "l2_rejected_with_evidence":
                 route = " / 근거 채택 후 L2 검출"
-            else:
-                route = " / 근거를 채택했지만 L2 기각 없음"
+        label = (
+            "빈 정답 비정상 종결"
+            if item.classification == "expected_no_answer" and item.normal_behavior is False
+            else labels[item.classification]
+        )
         lines.append(
-            f"- `{item.case_id}`: **{labels[item.classification]}** — "
-            f"정답 근거 {relevant} / 채택 근거 {adopted}{route}"
+            f"- `{item.case_id}`: **{label}** — 정답 근거 {relevant} / 채택 근거 {adopted}{route}"
         )
     lines.append("")
     return lines
@@ -2013,6 +2054,7 @@ def _failure_attribution_json(
         "generation_issue_count": attribution.generation_issue_count,
         "retrieval_failure_count": attribution.retrieval_failure_count,
         "expected_no_answer_count": attribution.expected_no_answer_count,
+        "expected_no_answer_anomaly_count": attribution.expected_no_answer_anomaly_count,
         "cases": [
             {
                 "case_id": item.case_id,
@@ -2024,6 +2066,9 @@ def _failure_attribution_json(
                 "escalated": item.escalated,
                 "ended_with_zero_evidence": item.ended_with_zero_evidence,
                 "l2_caught_with_evidence": item.l2_caught_with_evidence,
+                "normal_behavior": item.normal_behavior,
+                "normal_behavior_path": item.normal_behavior_path,
+                "anomaly_reason": item.anomaly_reason,
             }
             for item in attribution.cases
         ],

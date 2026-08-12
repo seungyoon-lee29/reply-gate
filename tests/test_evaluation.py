@@ -103,6 +103,7 @@ def _processed(
     judge_input_tokens: int = 0,
     judge_output_tokens: int = 0,
     evidence: tuple[Evidence, ...] = (),
+    failed_stage: str | None = None,
 ) -> ProcessedInquiry:
     return ProcessedInquiry(
         inquiry_id="00000000-0000-4000-8000-000000000000",
@@ -113,7 +114,7 @@ def _processed(
         answer="답변" if status is InquiryStatus.ANSWERED else None,
         claims=(Claim(text="답변", citation_ids=("policy:refund:2-1",)),),
         escalation_reason=escalation,
-        failed_stage=None,
+        failed_stage=failed_stage,
         evidence=evidence,
         sql_snapshots=(),
         sql_failures=(),
@@ -747,8 +748,12 @@ def test_평가_보고서는_검색_실패_생성_문제_빈_정답_정상_경�
     assert by_id["G17"]["classification"] == "retrieval_failure"
     assert by_id["G21"]["ended_with_zero_evidence"] is True
     assert by_id["G21"]["l2_caught_with_evidence"] is False
+    assert by_id["G21"]["normal_behavior"] is True
+    assert by_id["G21"]["normal_behavior_path"] == "retrieval_zero_evidence"
     assert by_id["G22"]["ended_with_zero_evidence"] is False
     assert by_id["G22"]["l2_caught_with_evidence"] is True
+    assert by_id["G22"]["normal_behavior"] is True
+    assert by_id["G22"]["normal_behavior_path"] == "l2_rejected_with_evidence"
     assert by_id["G21"]["classification"] == "expected_no_answer"
     assert by_id["G22"]["classification"] == "expected_no_answer"
 
@@ -759,6 +764,75 @@ def test_평가_보고서는_검색_실패_생성_문제_빈_정답_정상_경�
     assert "빈 정답 정상 인계: **2건**" in markdown
     assert "`G21`" in markdown and "검색 0건 종료" in markdown
     assert "`G22`" in markdown and "근거 채택 후 L2 검출" in markdown
+
+
+def test_빈_정답의_LLM_실패와_L1만_기각은_정상_인계로_위장하지_않는다(
+    tmp_path: Path,
+) -> None:
+    unrelated = Evidence(
+        id="policy:support:4-1",
+        source=EvidenceSource.POLICY,
+        content="고객센터 운영 안내",
+        evidence_text="고객센터 운영 안내",
+    )
+    l1_rejected = AttemptRecord(
+        attempt_no=1,
+        verdict=Verdict.REJECT,
+        reject_reasons=(RejectReason.PII_DETECTED,),
+        draft={},
+    )
+    agreement = measure_pipeline_agreement(
+        cases=[
+            _case(
+                "G23",
+                statuses=(InquiryStatus.ESCALATED,),
+                reasons=(EscalationReason.LLM_CALL_FAILED,),
+                category="no_evidence",
+            ),
+            _case(
+                "G24",
+                statuses=(InquiryStatus.ESCALATED,),
+                reasons=(EscalationReason.REJECTED_TWICE,),
+                category="no_evidence",
+            ),
+        ],
+        pipeline=ScriptedPipeline(
+            [
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.LLM_CALL_FAILED,
+                    failed_stage="intent",
+                ),
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.REJECTED_TWICE,
+                    attempts=(l1_rejected,),
+                    evidence=(unrelated,),
+                ),
+            ]
+        ),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    markdown_path, json_path = write_report(_report(pipeline=agreement), out_dir=tmp_path)
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    breakdown = payload["failure_attribution"]
+    assert breakdown["expected_no_answer_count"] == 0
+    assert breakdown["expected_no_answer_anomaly_count"] == 2
+    by_id = {item["case_id"]: item for item in breakdown["cases"]}
+    assert by_id["G23"]["classification"] == "expected_no_answer"
+    assert by_id["G23"]["normal_behavior"] is False
+    assert by_id["G23"]["anomaly_reason"] == ("검색 0건이지만 no_evidence·시도 0건 종료가 아님")
+    assert by_id["G24"]["classification"] == "expected_no_answer"
+    assert by_id["G24"]["normal_behavior"] is False
+    assert by_id["G24"]["anomaly_reason"] == "근거를 채택했지만 L2 기각 사유 없음"
+
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert "빈 정답 정상 인계: **0건**" in markdown
+    assert "빈 정답 비정상 종결: **2건**" in markdown
+    assert "`G23`: **빈 정답 비정상 종결**" in markdown
+    assert "`G24`: **빈 정답 비정상 종결**" in markdown
 
 
 def test_검색_라벨이_없으면_분해만_미산출하고_측정_1_2_3은_유지한다(
