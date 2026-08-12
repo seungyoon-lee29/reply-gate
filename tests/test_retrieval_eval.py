@@ -2,16 +2,27 @@
 
 import inspect
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
 from reply_gate.evaluation import load_golden_set
-from reply_gate.llm import EmbeddingClient, EmbeddingResult, GenerationClient, JsonCompletion
+from reply_gate.llm import (
+    EmbeddingClient,
+    EmbeddingResult,
+    GenerationClient,
+    JsonCompletion,
+    OptionalEmbeddingDependencyError,
+)
 from reply_gate.policy_index import load_policy_documents
 from reply_gate.retrieval_eval import (
+    DEFAULT_EMBEDDING_CANDIDATES,
+    EmbeddingCandidate,
+    EmbeddingProvider,
     RankedHit,
+    ReportPaths,
     RetrievalConfigurationError,
     RetrievalEvalConfig,
     RetrievalQuery,
@@ -21,6 +32,7 @@ from reply_gate.retrieval_eval import (
     evaluate_strategy_ladder,
     retrieve_cases,
     retrieve_strategy_ladder,
+    run_embedding_model_axis,
     run_retrieval_comparison,
     score_retrieval,
     write_report,
@@ -40,7 +52,7 @@ class _FixedEmbedder:
     def dimensions(self) -> int:
         return 2
 
-    def embed(self, *, stage: str, texts: list[str]) -> EmbeddingResult:
+    def embed(self, *, stage: str, texts: Sequence[str]) -> EmbeddingResult:
         self.calls.append((stage, tuple(texts)))
         return EmbeddingResult(vectors=[self._vectors[text] for text in texts], total_tokens=0)
 
@@ -473,3 +485,53 @@ def test_hybrid_and_rerank_keep_rrf_cut_separate_from_cosine_cut(tmp_path: Path)
     assert [hit.evidence_id for hit in by_name["vector_rewrite_hybrid_rerank"].ranked_hits] == [
         "policy:a:1"
     ]
+
+
+class _CandidateEmbedder:
+    def __init__(self, dimensions: int) -> None:
+        self._dimensions = dimensions
+
+    @property
+    def dimensions(self) -> int:
+        return self._dimensions
+
+    def embed(self, *, stage: str, texts: Sequence[str]) -> EmbeddingResult:
+        del stage
+        return EmbeddingResult(vectors=[[0.0] * self._dimensions for _ in texts], total_tokens=0)
+
+
+def test_embedding_model_axis_has_four_documented_candidates() -> None:
+    assert [
+        (candidate.model, candidate.dimensions, candidate.provider)
+        for candidate in DEFAULT_EMBEDDING_CANDIDATES
+    ] == [
+        ("text-embedding-3-small", 1536, EmbeddingProvider.OPENAI),
+        ("text-embedding-3-large", 1536, EmbeddingProvider.OPENAI),
+        ("text-embedding-3-large", 3072, EmbeddingProvider.OPENAI),
+        ("BAAI/bge-m3", 1024, EmbeddingProvider.LOCAL),
+    ]
+
+
+def test_missing_BGE_dependency_marks_only_that_axis_row_unmeasured(tmp_path: Path) -> None:
+    evaluated: list[str] = []
+
+    def factory(candidate: EmbeddingCandidate, api_key: str) -> EmbeddingClient:
+        assert api_key == "test-key"
+        if candidate.provider is EmbeddingProvider.LOCAL:
+            raise OptionalEmbeddingDependencyError("미측정 — 로컬 의존성 미설치")
+        return _CandidateEmbedder(candidate.dimensions)
+
+    def evaluate(candidate: EmbeddingCandidate, client: EmbeddingClient) -> ReportPaths:
+        assert client.dimensions == candidate.dimensions
+        evaluated.append(candidate.key)
+        return ReportPaths(
+            markdown=tmp_path / f"{candidate.key}.md",
+            json=tmp_path / f"{candidate.key}.json",
+        )
+
+    result = run_embedding_model_axis(api_key="test-key", evaluate=evaluate, client_factory=factory)
+
+    assert evaluated == ["3-small-1536", "3-large-1536", "3-large-3072"]
+    assert [row.measured for row in result.rows] == [True, True, True, False]
+    assert result.rows[-1].reports is None
+    assert result.rows[-1].reason == "미측정 — 로컬 의존성 미설치"

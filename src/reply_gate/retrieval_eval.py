@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
@@ -17,11 +17,13 @@ from typing import Any, Final, cast
 from reply_gate.config import get_settings
 from reply_gate.evaluation import DEFAULT_GOLDEN_SET_PATH, GoldenCase, load_golden_set
 from reply_gate.llm import (
+    BgeM3EmbeddingClient,
     EmbeddingClient,
     GenerationClient,
     JsonCompletion,
     OpenAIEmbeddingClient,
     OpenAIGenerationClient,
+    OptionalEmbeddingDependencyError,
 )
 from reply_gate.policy_index import (
     DEFAULT_POLICY_DIR,
@@ -48,6 +50,7 @@ from reply_gate.testing import LexicalEmbeddingClient
 
 __all__ = [
     "DEFAULT_EMBEDDING_CACHE_DIR",
+    "DEFAULT_EMBEDDING_CANDIDATES",
     "DEFAULT_NGRAM_SIZE",
     "DEFAULT_RERANK_MODEL",
     "DEFAULT_RETRIEVAL_REPORT_DIR",
@@ -57,6 +60,10 @@ __all__ = [
     "AggregateMetrics",
     "CaseScore",
     "CutoffSweepPoint",
+    "EmbeddingAxisResult",
+    "EmbeddingAxisRow",
+    "EmbeddingCandidate",
+    "EmbeddingProvider",
     "RankedHit",
     "ReportPaths",
     "RetrievalConfigurationError",
@@ -75,6 +82,7 @@ __all__ = [
     "load_rewritten_queries",
     "retrieve_cases",
     "retrieve_strategy_ladder",
+    "run_embedding_model_axis",
     "run_retrieval_comparison",
     "score_retrieval",
     "score_strategy_ladder",
@@ -98,6 +106,68 @@ _REWRITTEN_QUERY_ROW_KEYS: Final = frozenset({"id", "original", "rewritten", "no
 
 class RetrievalConfigurationError(ValueError):
     """외부 호출 전 발견한 실행 구성 오류."""
+
+
+class EmbeddingProvider(StrEnum):
+    """비교 임베딩의 실행 위치."""
+
+    OPENAI = "openai"
+    LOCAL = "local"
+
+
+@dataclass(frozen=True)
+class EmbeddingCandidate:
+    """임베딩 모델 축 한 행."""
+
+    key: str
+    model: str
+    dimensions: int
+    provider: EmbeddingProvider
+
+
+DEFAULT_EMBEDDING_CANDIDATES: Final = (
+    EmbeddingCandidate(
+        key="3-small-1536",
+        model="text-embedding-3-small",
+        dimensions=1536,
+        provider=EmbeddingProvider.OPENAI,
+    ),
+    EmbeddingCandidate(
+        key="3-large-1536",
+        model="text-embedding-3-large",
+        dimensions=1536,
+        provider=EmbeddingProvider.OPENAI,
+    ),
+    EmbeddingCandidate(
+        key="3-large-3072",
+        model="text-embedding-3-large",
+        dimensions=3072,
+        provider=EmbeddingProvider.OPENAI,
+    ),
+    EmbeddingCandidate(
+        key="bge-m3-1024",
+        model=BgeM3EmbeddingClient.MODEL,
+        dimensions=BgeM3EmbeddingClient.DIMENSIONS,
+        provider=EmbeddingProvider.LOCAL,
+    ),
+)
+
+
+@dataclass(frozen=True)
+class EmbeddingAxisRow:
+    """모델 축 한 행의 실행 결과. 미실행은 0이 아니라 사유를 가진다."""
+
+    candidate: EmbeddingCandidate
+    measured: bool
+    reports: ReportPaths | None
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class EmbeddingAxisResult:
+    """다른 행의 미실행에 막히지 않는 임베딩 모델 축 결과."""
+
+    rows: tuple[EmbeddingAxisRow, ...]
 
 
 def load_rewritten_queries(
@@ -1488,9 +1558,70 @@ def _cutoff_sweep(*, start: float, end: float, step: float) -> tuple[float, ...]
     return values
 
 
+def _build_embedding_candidate_client(
+    candidate: EmbeddingCandidate, *, api_key: str
+) -> EmbeddingClient:
+    if candidate.provider is EmbeddingProvider.OPENAI:
+        if not api_key:
+            raise RetrievalConfigurationError(f"{candidate.key} 미실행 — OPENAI_API_KEY가 없다")
+        return OpenAIEmbeddingClient(
+            api_key=api_key,
+            model=candidate.model,
+            dimensions=candidate.dimensions,
+        )
+    return BgeM3EmbeddingClient()
+
+
+def run_embedding_model_axis(
+    *,
+    api_key: str,
+    evaluate: Callable[[EmbeddingCandidate, EmbeddingClient], ReportPaths],
+    candidates: Sequence[EmbeddingCandidate] = DEFAULT_EMBEDDING_CANDIDATES,
+    client_factory: Callable[[EmbeddingCandidate, str], EmbeddingClient] | None = None,
+) -> EmbeddingAxisResult:
+    """후속 격자 실행이 쓰는 모델 축.
+
+    BGE-M3 선택 의존성이 없으면 그 행만 사유와 함께 미실행으로 남기고 나머지 행은 계속
+    돈다. API 키 부재나 실제 비교 실패는 전체 실행의 구성/실행 오류이므로 숨기지 않는다.
+    """
+    factory = client_factory or (
+        lambda candidate, key: _build_embedding_candidate_client(candidate, api_key=key)
+    )
+    rows: list[EmbeddingAxisRow] = []
+    for candidate in candidates:
+        try:
+            client = factory(candidate, api_key)
+        except OptionalEmbeddingDependencyError as exc:
+            rows.append(
+                EmbeddingAxisRow(
+                    candidate=candidate,
+                    measured=False,
+                    reports=None,
+                    reason=str(exc),
+                )
+            )
+            continue
+        if client.dimensions != candidate.dimensions:
+            raise RetrievalConfigurationError(
+                f"{candidate.key} 클라이언트 차원 불일치: "
+                f"{client.dimensions} != {candidate.dimensions}"
+            )
+        rows.append(
+            EmbeddingAxisRow(
+                candidate=candidate,
+                measured=True,
+                reports=evaluate(candidate, client),
+                reason=None,
+            )
+        )
+    return EmbeddingAxisResult(rows=tuple(rows))
+
+
 def run_retrieval_comparison(
     *,
     live: bool,
+    embedding_model: str | None = None,
+    embedding_client: EmbeddingClient | None = None,
     dimensions: int | None = None,
     top_k: int = 5,
     cutoff: float | None = None,
@@ -1533,19 +1664,26 @@ def run_retrieval_comparison(
     )
 
     settings = get_settings()
-    resolved_dimensions = settings.embedding_dimensions if dimensions is None else dimensions
+    resolved_dimensions = (
+        embedding_client.dimensions
+        if embedding_client is not None and dimensions is None
+        else settings.embedding_dimensions
+        if dimensions is None
+        else dimensions
+    )
     sweep = _cutoff_sweep(start=sweep_start, end=sweep_end, step=sweep_step)
     if live:
-        if not settings.openai_api_key:
+        needs_openai = embedding_client is None or any(
+            RetrievalStage.RERANK in strategy.stages for strategy in strategy_tuple
+        )
+        if needs_openai and not settings.openai_api_key:
             raise RetrievalConfigurationError(
-                "OPENAI_API_KEY가 없다 — 실제 임베딩 비교는 과금되므로 키를 선검사한다"
+                "OPENAI_API_KEY가 없다 — 실제 임베딩·리랭크 비교는 과금되므로 키를 선검사한다"
             )
-        model = settings.embedding_model
+        model = embedding_model or settings.embedding_model
         resolved_cutoff = settings.vector_similarity_threshold if cutoff is None else cutoff
-        embedder: EmbeddingClient = OpenAIEmbeddingClient(
-            api_key=settings.openai_api_key,
-            model=model,
-            dimensions=resolved_dimensions,
+        embedder: EmbeddingClient = embedding_client or OpenAIEmbeddingClient(
+            api_key=settings.openai_api_key, model=model, dimensions=resolved_dimensions
         )
         reranker: GenerationClient | None = (
             OpenAIGenerationClient(
@@ -1556,6 +1694,10 @@ def run_retrieval_comparison(
             else None
         )
     else:
+        if embedding_client is not None or embedding_model is not None:
+            raise RetrievalConfigurationError(
+                "대역 모드에는 실제 embedding_client/embedding_model을 주입할 수 없다"
+            )
         model = STUB_EMBEDDING_MODEL
         resolved_cutoff = STUB_DEFAULT_CUTOFF if cutoff is None else cutoff
         embedder = LexicalEmbeddingClient(dimensions=resolved_dimensions)

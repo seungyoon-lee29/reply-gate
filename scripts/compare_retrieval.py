@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from reply_gate.evaluation import DEFAULT_GOLDEN_SET_PATH
+from reply_gate.llm import BgeM3EmbeddingClient, OptionalEmbeddingDependencyError
 from reply_gate.policy_index import DEFAULT_POLICY_DIR
 from reply_gate.retrieval_eval import (
     DEFAULT_EMBEDDING_CACHE_DIR,
@@ -48,12 +49,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="결정론 임베딩·리랭크 대역을 쓴다 (기본값, 배관 검증 전용)",
     )
+    mode.add_argument(
+        "--bge-m3",
+        action="store_true",
+        help="선택 설치한 로컬 BGE-M3 1024차원 임베딩을 쓴다 (DB·외부 API 없음)",
+    )
     parser.add_argument("--policy-dir", type=Path, default=DEFAULT_POLICY_DIR)
     parser.add_argument("--golden-set", type=Path, default=DEFAULT_GOLDEN_SET_PATH)
     parser.add_argument("--labels", type=Path, default=DEFAULT_RETRIEVAL_LABELS_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_RETRIEVAL_REPORT_DIR)
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_EMBEDDING_CACHE_DIR)
     parser.add_argument("--dimensions", type=int, default=None)
+    parser.add_argument(
+        "--embedding-model",
+        default=None,
+        help="--live에서 비교할 OpenAI 임베딩 모델 (기본: 환경 설정값)",
+    )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument(
         "--cutoff",
@@ -89,9 +100,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        local_embedder = BgeM3EmbeddingClient() if args.bge_m3 else None
         paths = run_retrieval_comparison(
-            live=bool(args.live),
-            dimensions=args.dimensions,
+            live=bool(args.live or args.bge_m3),
+            embedding_model=(BgeM3EmbeddingClient.MODEL if args.bge_m3 else args.embedding_model),
+            embedding_client=local_embedder,
+            dimensions=(
+                BgeM3EmbeddingClient.DIMENSIONS
+                if args.bge_m3 and args.dimensions is None
+                else args.dimensions
+            ),
             top_k=args.top_k,
             cutoff=args.cutoff,
             sweep_start=args.sweep_start,
@@ -109,7 +127,12 @@ def main(argv: list[str] | None = None) -> int:
             rerank_model=args.rerank_model,
             strategies=_VECTOR_ONLY,
         )
-    except (RetrievalConfigurationError, FileNotFoundError, ValueError) as exc:
+    except (
+        OptionalEmbeddingDependencyError,
+        RetrievalConfigurationError,
+        FileNotFoundError,
+        ValueError,
+    ) as exc:
         print(f"검색 비교 실행 실패: {exc}", file=sys.stderr)
         return 2
     print(f"검색 비교 완료: {paths.markdown}")

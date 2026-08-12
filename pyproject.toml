@@ -20,6 +20,12 @@ dependencies = [
     "anthropic>=0.120.2",
 ]
 
+[project.optional-dependencies]
+# BGE-M3 비교만 필요할 때 설치한다. 기본 설치에 torch 계열을 포함하지 않는다.
+rag-local = [
+    "sentence-transformers>=5.1",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",

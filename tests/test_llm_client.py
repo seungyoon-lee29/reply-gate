@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -14,6 +15,7 @@ import pytest
 from reply_gate.llm import (
     MAX_ATTEMPTS,
     AnthropicGenerationClient,
+    BgeM3EmbeddingClient,
     LLMCallError,
     LLMFormatError,
     OpenAIEmbeddingClient,
@@ -387,3 +389,32 @@ def test_빈_입력은_호출하지_않는다() -> None:
 
     assert result.vectors == []
     assert embeddings.calls == []
+
+
+class _LocalEmbeddingModel:
+    def __init__(self, vectors: list[list[float]]) -> None:
+        self.vectors = vectors
+        self.calls: list[tuple[tuple[str, ...], bool]] = []
+
+    def encode(self, sentences: Sequence[str], *, normalize_embeddings: bool) -> object:
+        self.calls.append((tuple(sentences), normalize_embeddings))
+        return self.vectors
+
+
+def test_BGE_M3_는_선택_모델_경계에서_1024차원_dense_벡터를_만든다() -> None:
+    model = _LocalEmbeddingModel([[0.0] * 1024, [1.0] * 1024])
+    client = BgeM3EmbeddingClient(model=model)
+
+    result = client.embed(stage="retrieval", texts=["문의", "정책"])
+
+    assert client.dimensions == 1024
+    assert result.vectors == model.vectors
+    assert result.total_tokens == 0
+    assert model.calls == [(("문의", "정책"), True)]
+
+
+def test_BGE_M3_는_잘못된_차원을_거부한다() -> None:
+    client = BgeM3EmbeddingClient(model=_LocalEmbeddingModel([[0.0] * 1536]))
+
+    with pytest.raises(ValueError, match="1024차원"):
+        client.embed(stage="retrieval", texts=["문의"])

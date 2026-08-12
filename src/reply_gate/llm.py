@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from importlib import import_module
 from typing import Any, Protocol, cast
 
 import anthropic
@@ -31,6 +32,7 @@ from openai.types.responses import Response
 
 __all__ = [
     "AnthropicGenerationClient",
+    "BgeM3EmbeddingClient",
     "EmbeddingClient",
     "EmbeddingResult",
     "GenerationClient",
@@ -39,6 +41,7 @@ __all__ = [
     "LLMFormatError",
     "OpenAIEmbeddingClient",
     "OpenAIGenerationClient",
+    "OptionalEmbeddingDependencyError",
 ]
 
 #: 최초 호출 + 재시도 1회 = 최대 2회 전송 시도 (docs/standards.md "재시도 상한").
@@ -142,6 +145,14 @@ class EmbeddingClient(Protocol):
     def dimensions(self) -> int: ...
 
     def embed(self, *, stage: str, texts: Sequence[str]) -> EmbeddingResult: ...
+
+
+class OptionalEmbeddingDependencyError(RuntimeError):
+    """선택 설치인 로컬 임베딩 의존성이 없어 해당 비교 행만 실행할 수 없음."""
+
+
+class _SentenceTransformerModel(Protocol):
+    def encode(self, sentences: Sequence[str], *, normalize_embeddings: bool) -> object: ...
 
 
 def _call_with_one_retry[T](
@@ -462,3 +473,55 @@ class OpenAIEmbeddingClient:
             vectors=[list(item.embedding) for item in ordered],
             total_tokens=response.usage.total_tokens,
         )
+
+
+class BgeM3EmbeddingClient:
+    """선택 설치인 Sentence Transformers 경계로 BGE-M3 dense 임베딩을 만든다.
+
+    모듈 import와 모델 로드는 생성 시점까지 미룬다. 기본 설치가 torch 계열을 끌어들이거나,
+    선택 의존성이 없는 환경에서 다른 비교 행까지 함께 죽는 것을 막기 위해서다.
+    """
+
+    MODEL = "BAAI/bge-m3"
+    DIMENSIONS = 1024
+
+    def __init__(self, *, model: _SentenceTransformerModel | None = None) -> None:
+        if model is None:
+            try:
+                module = import_module("sentence_transformers")
+            except ModuleNotFoundError as exc:
+                if exc.name == "sentence_transformers":
+                    raise OptionalEmbeddingDependencyError(
+                        "BGE-M3 미측정 — 로컬 의존성 미설치 (`uv sync --extra rag-local`로 설치)"
+                    ) from exc
+                raise
+            model_type = getattr(module, "SentenceTransformer", None)
+            if model_type is None:
+                raise OptionalEmbeddingDependencyError(
+                    "BGE-M3 미측정 — sentence-transformers에 SentenceTransformer가 없다"
+                )
+            model = cast(_SentenceTransformerModel, model_type(self.MODEL))
+        self._model = model
+
+    @property
+    def dimensions(self) -> int:
+        return self.DIMENSIONS
+
+    def embed(self, *, stage: str, texts: Sequence[str]) -> EmbeddingResult:
+        del stage
+        if not texts:
+            return EmbeddingResult(vectors=[], total_tokens=0)
+        encoded = self._model.encode(list(texts), normalize_embeddings=True)
+        tolist = getattr(encoded, "tolist", None)
+        raw = tolist() if callable(tolist) else encoded
+        if not isinstance(raw, list) or len(raw) != len(texts):
+            raise ValueError("BGE-M3 임베딩 개수가 입력 텍스트 수와 다르다")
+        vectors: list[list[float]] = []
+        for vector in raw:
+            if not isinstance(vector, list) or len(vector) != self.DIMENSIONS:
+                raise ValueError(f"BGE-M3 임베딩은 {self.DIMENSIONS}차원이어야 한다")
+            if any(not isinstance(value, int | float) for value in vector):
+                raise ValueError("BGE-M3 임베딩 값은 숫자여야 한다")
+            vectors.append([float(value) for value in vector])
+        # 로컬 추론은 provider 토큰 과금이 없으므로 기존 EmbeddingResult 계약에서 0이다.
+        return EmbeddingResult(vectors=vectors, total_tokens=0)
