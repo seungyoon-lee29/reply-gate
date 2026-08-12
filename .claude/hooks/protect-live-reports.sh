@@ -20,10 +20,22 @@
 # 출력: 차단할 때만 permissionDecision=deny JSON. 그 밖에는 아무것도 쓰지 않고 exit 0.
 # 실패 방향: 판단할 수 없으면 **통과시킨다**(fail-open). 훅이 개발을 멈추게 하면 안 되고,
 #            진짜 불변식은 커밋 리뷰와 위 하네스 가드가 함께 지킨다.
+#
+# 하네스 두 곳에서 불린다 — 인자로 갈린다:
+#   (없음) | claude : Claude Code. 페이로드 스키마가 확인된 경로다.
+#   codex             : Codex(.codex/config.toml). **스키마 미확인**이라 도구 이름으로
+#                       분기하지 않고 페이로드 전문에서 잠긴 경로와 변경 신호를 함께 찾는다.
+#                       거부는 JSON 과 exit 2 **양쪽**으로 낸다 — 어느 규약이든 걸리게.
+# 디버그: RG_HOOK_DEBUG=<파일경로> 를 주면 원본 페이로드를 그 파일에 덧붙인다(스키마 확인용).
 
 set -uo pipefail
 
+harness=${1:-claude}
 payload=$(cat)
+
+if [ -n "${RG_HOOK_DEBUG:-}" ]; then
+	printf '=== %s ===\n%s\n' "$harness" "$payload" >>"$RG_HOOK_DEBUG" 2>/dev/null || :
+fi
 
 root=$(git rev-parse --show-toplevel 2>/dev/null) || root="${CLAUDE_PROJECT_DIR:-$PWD}"
 
@@ -35,6 +47,12 @@ deny() {
 			permissionDecisionReason: $reason
 		}
 	}'
+	# Codex 의 거부 규약을 확인하지 못했다 — JSON 을 무시하는 구현이라도 막히게
+	# 비정상 종료로도 알린다. Claude Code 는 확인된 JSON 경로를 그대로 쓴다.
+	if [ "$harness" = "codex" ]; then
+		printf '%s\n' "$1" >&2
+		exit 2
+	fi
 	exit 0
 }
 
@@ -71,6 +89,39 @@ reason_for() {
   * 정말 고쳐야 한다면 사용자에게 먼저 확인받는다"
 }
 
+# ── Codex 경로 ──────────────────────────────────────────────────────────────
+# 도구 이름·인자 키를 확인하지 못했으므로 **페이로드 전문**을 본다.
+#   (1) 잠긴 리포트 경로가 페이로드 어딘가에 나오는가
+#   (2) 그 페이로드가 변경을 뜻하는가
+# 둘 다일 때만 거부한다. 읽기(cat·jq·Read)는 (2)에서 걸러져 그대로 통과한다.
+if [ "$harness" = "codex" ]; then
+	locked_hit=""
+	while IFS= read -r candidate; do
+		[ -n "$candidate" ] || continue
+		if is_locked "$(to_relative "$candidate")"; then
+			locked_hit=$candidate
+			break
+		fi
+	done <<<"$(printf '%s' "$payload" | grep -oE '[^[:space:]"'"'"';|&()\\]*reports/[^[:space:]"'"'"';|&()\\]+' || true)"
+
+	[ -n "$locked_hit" ] || exit 0
+
+	# 앞자리 문자 집합에 `"` `:` `,` `{` 를 넣는다 — 페이로드 전문을 보므로 명령이
+	# `"command":"rm reports/..."` 처럼 JSON 인용부호 뒤에 온다. 여는 문자를 공백·세미콜론
+	# 으로만 잡으면 그 형태가 통째로 새고, 실제로 한 번 샜다.
+	if printf '%s' "$payload" | grep -qiE \
+		-e '(^|[;&|(",:{[]|[[:space:]])(rm|mv|cp|tee|shred|truncate|dd|install)[[:space:]]' \
+		-e '(^|[;&|(",:{[]|[[:space:]])(sed|perl|ruby)[^;&|]*[[:space:]]-i' \
+		-e '(^|[;&|(",:{[]|[[:space:]])git[[:space:]]+(rm|mv|restore|checkout)[[:space:]]' \
+		-e '>[[:space:]]*[^[:space:];&|]*reports/' \
+		-e 'apply_patch|\*\*\*[[:space:]]*(update|delete|add)[[:space:]]+file' \
+		-e '"(write|edit|create|update|delete|patch|replace)[a-z_]*"'; then
+		deny "$(reason_for "$locked_hit")"
+	fi
+	exit 0
+fi
+
+# ── Claude Code 경로 (스키마 확인됨) ─────────────────────────────────────────
 tool=$(printf '%s' "$payload" | jq -r '.tool_name // ""')
 
 case "$tool" in
