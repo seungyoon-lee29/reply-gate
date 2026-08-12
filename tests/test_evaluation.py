@@ -102,6 +102,8 @@ def _processed(
     embedding_tokens: int = 0,
     judge_input_tokens: int = 0,
     judge_output_tokens: int = 0,
+    evidence: tuple[Evidence, ...] = (),
+    failed_stage: str | None = None,
 ) -> ProcessedInquiry:
     return ProcessedInquiry(
         inquiry_id="00000000-0000-4000-8000-000000000000",
@@ -112,8 +114,8 @@ def _processed(
         answer="답변" if status is InquiryStatus.ANSWERED else None,
         claims=(Claim(text="답변", citation_ids=("policy:refund:2-1",)),),
         escalation_reason=escalation,
-        failed_stage=None,
-        evidence=(),
+        failed_stage=failed_stage,
+        evidence=evidence,
         sql_snapshots=(),
         sql_failures=(),
         attempts=attempts,
@@ -641,6 +643,236 @@ def test_L2_기각도_미끼_기각_재현율에_들어간다() -> None:
     assert agreement.bait_reject_reproduced == 1
     assert agreement.bait_reject_recall == 1.0
     assert agreement.outcomes[0].matched is True
+
+
+def test_골든_산출물은_파이프라인이_채택한_근거_ID를_보존한다() -> None:
+    evidence = Evidence(
+        id="policy:support:4-1",
+        source=EvidenceSource.POLICY,
+        content="고객센터 운영 안내",
+        evidence_text="고객센터 운영 안내",
+    )
+    agreement = measure_pipeline_agreement(
+        cases=[_case("G17")],
+        pipeline=ScriptedPipeline([_processed(evidence=(evidence,))]),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    assert agreement.outcomes[0].adopted_evidence_ids == ("policy:support:4-1",)
+    payload = report_to_json(_report(pipeline=agreement))
+    outcome = payload["measurement_2_pipeline_agreement"]["outcomes"][0]
+    assert outcome["adopted_evidence_ids"] == ["policy:support:4-1"]
+    markdown = render_markdown(_report(pipeline=agreement))
+    assert "### 케이스별 채택 근거" in markdown
+    assert "`G17`: `policy:support:4-1`" in markdown
+
+
+def test_평가_보고서는_검색_실패_생성_문제_빈_정답_정상_경로를_분해한다(
+    tmp_path: Path,
+) -> None:
+    support = Evidence(
+        id="policy:support:4-1",
+        source=EvidenceSource.POLICY,
+        content="고객센터 운영 안내",
+        evidence_text="고객센터 운영 안내",
+    )
+    rejected = AttemptRecord(
+        attempt_no=1,
+        verdict=Verdict.REJECT,
+        reject_reasons=(RejectReason.PII_DETECTED,),
+        draft={},
+    )
+    l2_rejected = AttemptRecord(
+        attempt_no=1,
+        verdict=Verdict.REJECT,
+        reject_reasons=(RejectReason.UNSUPPORTED_CLAIM,),
+        draft={},
+    )
+    escalated_statuses = (InquiryStatus.ESCALATED,)
+    escalated_reasons = (EscalationReason.NO_EVIDENCE, EscalationReason.REJECTED_TWICE)
+    agreement = measure_pipeline_agreement(
+        cases=[
+            _case("G16", statuses=escalated_statuses, reasons=escalated_reasons),
+            _case("G17", statuses=escalated_statuses, reasons=escalated_reasons),
+            _case(
+                "G21",
+                statuses=escalated_statuses,
+                reasons=escalated_reasons,
+                category="no_evidence",
+            ),
+            _case(
+                "G22",
+                statuses=escalated_statuses,
+                reasons=escalated_reasons,
+                category="no_evidence",
+            ),
+        ],
+        pipeline=ScriptedPipeline(
+            [
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.REJECTED_TWICE,
+                    attempts=(rejected,),
+                    evidence=(support,),
+                ),
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.NO_EVIDENCE,
+                ),
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.NO_EVIDENCE,
+                ),
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.REJECTED_TWICE,
+                    attempts=(l2_rejected,),
+                    evidence=(support,),
+                ),
+            ]
+        ),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    markdown_path, json_path = write_report(_report(pipeline=agreement), out_dir=tmp_path)
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    breakdown = payload["failure_attribution"]
+    assert breakdown["computed"] is True
+    assert breakdown["generation_issue_count"] == 1
+    assert breakdown["retrieval_failure_count"] == 1
+    assert breakdown["expected_no_answer_count"] == 2
+    by_id = {item["case_id"]: item for item in breakdown["cases"]}
+    assert by_id["G16"]["classification"] == "generation_issue"
+    assert by_id["G17"]["classification"] == "retrieval_failure"
+    assert by_id["G21"]["ended_with_zero_evidence"] is True
+    assert by_id["G21"]["l2_caught_with_evidence"] is False
+    assert by_id["G21"]["normal_behavior"] is True
+    assert by_id["G21"]["normal_behavior_path"] == "retrieval_zero_evidence"
+    assert by_id["G22"]["ended_with_zero_evidence"] is False
+    assert by_id["G22"]["l2_caught_with_evidence"] is True
+    assert by_id["G22"]["normal_behavior"] is True
+    assert by_id["G22"]["normal_behavior_path"] == "l2_rejected_with_evidence"
+    assert by_id["G21"]["classification"] == "expected_no_answer"
+    assert by_id["G22"]["classification"] == "expected_no_answer"
+
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert "### 검색 실패 / 생성 문제 분해" in markdown
+    assert "생성 문제: **1건**" in markdown
+    assert "검색 실패: **1건**" in markdown
+    assert "빈 정답 정상 인계: **2건**" in markdown
+    assert "`G21`" in markdown and "검색 0건 종료" in markdown
+    assert "`G22`" in markdown and "근거 채택 후 L2 검출" in markdown
+
+
+def test_빈_정답의_LLM_실패와_L1만_기각은_정상_인계로_위장하지_않는다(
+    tmp_path: Path,
+) -> None:
+    unrelated = Evidence(
+        id="policy:support:4-1",
+        source=EvidenceSource.POLICY,
+        content="고객센터 운영 안내",
+        evidence_text="고객센터 운영 안내",
+    )
+    l1_rejected = AttemptRecord(
+        attempt_no=1,
+        verdict=Verdict.REJECT,
+        reject_reasons=(RejectReason.PII_DETECTED,),
+        draft={},
+    )
+    agreement = measure_pipeline_agreement(
+        cases=[
+            _case(
+                "G23",
+                statuses=(InquiryStatus.ESCALATED,),
+                reasons=(EscalationReason.LLM_CALL_FAILED,),
+                category="no_evidence",
+            ),
+            _case(
+                "G24",
+                statuses=(InquiryStatus.ESCALATED,),
+                reasons=(EscalationReason.REJECTED_TWICE,),
+                category="no_evidence",
+            ),
+        ],
+        pipeline=ScriptedPipeline(
+            [
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.LLM_CALL_FAILED,
+                    failed_stage="intent",
+                ),
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.REJECTED_TWICE,
+                    attempts=(l1_rejected,),
+                    evidence=(unrelated,),
+                ),
+            ]
+        ),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    markdown_path, json_path = write_report(_report(pipeline=agreement), out_dir=tmp_path)
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    breakdown = payload["failure_attribution"]
+    assert breakdown["expected_no_answer_count"] == 0
+    assert breakdown["expected_no_answer_anomaly_count"] == 2
+    by_id = {item["case_id"]: item for item in breakdown["cases"]}
+    assert by_id["G23"]["classification"] == "expected_no_answer"
+    assert by_id["G23"]["normal_behavior"] is False
+    assert by_id["G23"]["anomaly_reason"] == ("검색 0건이지만 no_evidence·시도 0건 종료가 아님")
+    assert by_id["G24"]["classification"] == "expected_no_answer"
+    assert by_id["G24"]["normal_behavior"] is False
+    assert by_id["G24"]["anomaly_reason"] == "근거를 채택했지만 L2 기각 사유 없음"
+
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert "빈 정답 정상 인계: **0건**" in markdown
+    assert "빈 정답 비정상 종결: **2건**" in markdown
+    assert "`G23`: **빈 정답 비정상 종결**" in markdown
+    assert "`G24`: **빈 정답 비정상 종결**" in markdown
+
+
+def test_검색_라벨이_없으면_분해만_미산출하고_측정_1_2_3은_유지한다(
+    tmp_path: Path,
+) -> None:
+    agreement = measure_pipeline_agreement(
+        cases=[_case("G17")],
+        pipeline=ScriptedPipeline([_processed()]),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+    judge_accuracy = measure_judge_accuracy(
+        fixtures=JUDGE_FIXTURES,
+        judge=OracleJudge(JUDGE_FIXTURES),
+    )
+    report = build_report(
+        conditions=_conditions(judge_is_real=True),
+        gate_accuracy=measure_gate_accuracy(FIXTURES),
+        pipeline=agreement,
+        judge_accuracy=judge_accuracy,
+        retrieval_labels_path=tmp_path / "missing-retrieval-labels.jsonl",
+    )
+
+    markdown_path, json_path = write_report(report, out_dir=tmp_path, stem="missing-labels")
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    breakdown = payload["failure_attribution"]
+    assert breakdown["computed"] is False
+    assert "FileNotFoundError" in breakdown["reason"]
+    assert "generation_issue_count" not in breakdown
+    assert payload["measurement_1_l1_gate_accuracy"]["total"] == len(FIXTURES)
+    assert payload["measurement_2_pipeline_agreement"]["executed"] is True
+    assert payload["measurement_2_pipeline_agreement"]["total"] == 1
+    assert payload["measurement_3_l2_judge_accuracy"]["executed"] is True
+    assert payload["measurement_3_l2_judge_accuracy"]["total"] == len(JUDGE_FIXTURES)
+
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert "**미산출 (사유: 검색 정답 라벨 로드 실패(FileNotFoundError):" in markdown
+    assert "## 측정 1 —" in markdown
+    assert "## 측정 2 —" in markdown
+    assert "## 측정 3 —" in markdown
 
 
 # ── 측정 3 — L2 판정 단위 정확도 (확률 층·과금) ─────────────────────────────
