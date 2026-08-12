@@ -51,6 +51,7 @@ __all__ = [
     "DEFAULT_NGRAM_SIZE",
     "DEFAULT_RERANK_MODEL",
     "DEFAULT_RETRIEVAL_REPORT_DIR",
+    "DEFAULT_REWRITTEN_QUERIES_PATH",
     "DEFAULT_RRF_CUTOFF",
     "DEFAULT_RRF_K",
     "AggregateMetrics",
@@ -71,6 +72,7 @@ __all__ = [
     "StrategyRetrievedCase",
     "evaluate_retrieval",
     "evaluate_strategy_ladder",
+    "load_rewritten_queries",
     "retrieve_cases",
     "retrieve_strategy_ladder",
     "run_retrieval_comparison",
@@ -90,10 +92,81 @@ DEFAULT_RERANK_MODEL: Final = "gpt-5.6-luna"
 DEFAULT_RRF_K: Final = 60
 DEFAULT_RRF_CUTOFF: Final = 0.02
 DEFAULT_NGRAM_SIZE: Final = 2
+DEFAULT_REWRITTEN_QUERIES_PATH: Final = _ROOT / "data" / "rewritten_queries.jsonl"
+_REWRITTEN_QUERY_ROW_KEYS: Final = frozenset({"id", "original", "rewritten", "note"})
 
 
 class RetrievalConfigurationError(ValueError):
     """외부 호출 전 발견한 실행 구성 오류."""
+
+
+def load_rewritten_queries(
+    path: Path = DEFAULT_REWRITTEN_QUERIES_PATH,
+    *,
+    golden_set_path: Path = DEFAULT_GOLDEN_SET_PATH,
+) -> dict[str, str]:
+    """골든셋 전용 재작성 질의를 읽고 원문과의 1:1 계약을 검증한다."""
+    rows: list[tuple[int, str, str, str]] = []
+    seen: set[str] = set()
+    with path.open(encoding="utf-8") as handle:
+        for lineno, line in enumerate(handle, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                raw: object = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{lineno} JSON 파싱 실패: {exc}") from exc
+            if not isinstance(raw, dict):
+                raise ValueError(f"{path}:{lineno} 각 줄은 JSON 객체여야 한다")
+            row = cast(dict[str, object], raw)
+            row_keys = set(row)
+            if row_keys != _REWRITTEN_QUERY_ROW_KEYS:
+                missing = ", ".join(sorted(_REWRITTEN_QUERY_ROW_KEYS - row_keys)) or "없음"
+                extra = ", ".join(sorted(row_keys - _REWRITTEN_QUERY_ROW_KEYS)) or "없음"
+                raise ValueError(
+                    f"{path}:{lineno} 행 키가 계약과 다르다(누락={missing}, 추가={extra})"
+                )
+
+            case_id = row["id"]
+            if not isinstance(case_id, str) or not case_id.strip():
+                raise ValueError(f"{path}:{lineno} id는 비어 있지 않은 문자열이어야 한다")
+            if case_id in seen:
+                raise ValueError(f"재작성 ID가 중복된다: {case_id}")
+            seen.add(case_id)
+
+            original = row["original"]
+            if not isinstance(original, str):
+                raise ValueError(f"{path}:{lineno} original은 문자열이어야 한다")
+            rewritten = row["rewritten"]
+            if not isinstance(rewritten, str) or not rewritten.strip():
+                raise ValueError(
+                    f"{path}:{lineno} rewritten은 비어 있지 않은 문자열이어야 한다: {case_id}"
+                )
+            note = row["note"]
+            if not isinstance(note, str):
+                raise ValueError(f"{path}:{lineno} note는 문자열이어야 한다")
+            rows.append((lineno, case_id, original, rewritten))
+
+    cases = load_golden_set(golden_set_path)
+    golden_by_id = {case.id: case for case in cases}
+    fixture_ids = {case_id for _, case_id, _, _ in rows}
+    golden_ids = set(golden_by_id)
+    unknown_ids = fixture_ids - golden_ids
+    if unknown_ids:
+        raise ValueError(
+            "골든셋에 없는 ID가 재작성 픽스처에 있다: " + ", ".join(sorted(unknown_ids))
+        )
+    missing_ids = golden_ids - fixture_ids
+    if missing_ids:
+        raise ValueError(
+            "재작성 픽스처에서 빠진 골든셋 ID가 있다: " + ", ".join(sorted(missing_ids))
+        )
+
+    for lineno, case_id, original, _ in rows:
+        if original != golden_by_id[case_id].content:
+            raise ValueError(f"{path}:{lineno} original이 골든셋 content와 다르다: {case_id}")
+    return {case_id: rewritten for _, case_id, _, rewritten in rows}
 
 
 class _IdentityRerankClient:
@@ -1427,6 +1500,7 @@ def run_retrieval_comparison(
     policy_dir: Path = DEFAULT_POLICY_DIR,
     golden_set_path: Path = DEFAULT_GOLDEN_SET_PATH,
     labels_path: Path = DEFAULT_RETRIEVAL_LABELS_PATH,
+    rewritten_queries_path: Path = DEFAULT_REWRITTEN_QUERIES_PATH,
     output_dir: Path = DEFAULT_RETRIEVAL_REPORT_DIR,
     cache_dir: Path = DEFAULT_EMBEDDING_CACHE_DIR,
     rewritten_queries: Mapping[str, str] | None = None,
@@ -1443,9 +1517,18 @@ def run_retrieval_comparison(
         raise RetrievalConfigurationError("검색 전략은 하나 이상이어야 한다")
     cases = load_golden_set(golden_set_path)
     queries = tuple(RetrievalQuery(case_id=case.id, text=case.content) for case in cases)
+    uses_rewrite = any(RetrievalStage.REWRITE in strategy.stages for strategy in strategy_tuple)
+    rewrite_input = (
+        load_rewritten_queries(
+            rewritten_queries_path,
+            golden_set_path=golden_set_path,
+        )
+        if uses_rewrite and rewritten_queries is None
+        else rewritten_queries
+    )
     injected_rewrites = _validate_rewritten_queries(
         queries=queries,
-        rewritten_queries=rewritten_queries,
+        rewritten_queries=rewrite_input,
         strategies=strategy_tuple,
     )
 
@@ -1490,7 +1573,7 @@ def run_retrieval_comparison(
         cutoff_sweep=sweep,
         is_stub=not live,
     )
-    # 세 입력은 각각의 단독 소유 로더에서 독립적으로 읽는다.
+    # 정책·라벨·재작성문은 각각의 로더에서 읽고, 검색에는 라벨 없이 재작성 mapping만 주입한다.
     documents = load_policy_documents(policy_dir)
     labels = load_retrieval_labels(labels_path)
     comparison = evaluate_strategy_ladder(

@@ -250,25 +250,30 @@ def test_stub_completes_30_cases_writes_both_reports_and_never_overwrites(
     assert '"labels_used_for_retrieval": false' in json_before
 
 
-@pytest.mark.parametrize("live", [False, True])
-def test_run_retrieval_comparison_requires_rewrites_for_default_ladder(
-    tmp_path: Path, live: bool
+def test_run_retrieval_comparison_loads_committed_rewrites_for_default_ladder(
+    tmp_path: Path,
 ) -> None:
-    with pytest.raises(RetrievalConfigurationError, match="재작성"):
-        run_retrieval_comparison(
-            live=live,
-            dimensions=32,
-            top_k=5,
-            cutoff=0.10,
-            sweep_start=0.10,
-            sweep_end=0.20,
-            sweep_step=0.05,
-            output_dir=tmp_path / "reports",
-            cache_dir=tmp_path / "cache",
-        )
+    paths = run_retrieval_comparison(
+        live=False,
+        dimensions=32,
+        top_k=5,
+        cutoff=0.10,
+        sweep_start=0.10,
+        sweep_end=0.20,
+        sweep_step=0.05,
+        output_dir=tmp_path / "reports",
+        cache_dir=tmp_path / "cache",
+    )
 
-    assert not (tmp_path / "reports").exists()
-    assert not (tmp_path / "cache").exists()
+    payload = json.loads(paths.json.read_text(encoding="utf-8"))
+    assert [strategy["name"] for strategy in payload["strategies"]] == [
+        "vector",
+        "vector_rewrite",
+        "vector_rewrite_hybrid",
+        "vector_rewrite_hybrid_rerank",
+    ]
+    assert all(len(strategy["cases"]) == 30 for strategy in payload["strategies"])
+    assert payload["run_conditions"]["rewrite_source"] == "caller_injected"
 
 
 def test_run_vector_only_without_rewrites_reports_rewrite_not_used(tmp_path: Path) -> None:
