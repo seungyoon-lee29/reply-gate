@@ -48,6 +48,7 @@ from reply_gate.contracts import (
     IntentSource,
     sql_evidence_id,
 )
+from reply_gate.gate import DEFAULT_PII_PATTERNS
 from reply_gate.llm import (
     EmbeddingClient,
     GenerationClient,
@@ -450,17 +451,38 @@ def _render_rows(rows: Sequence[Mapping[str, Any]], *, limit: int | None = None)
     return "\n".join(lines)
 
 
-def _sql_evidence_texts(*, sql: str, rows: Sequence[Mapping[str, Any]]) -> tuple[str, str]:
+def _sql_evidence_texts(
+    *, sql: str, rows: Sequence[Mapping[str, Any]], pii_safe_output_columns: Sequence[str]
+) -> tuple[str, str]:
     """(표시용 `content`, 대조용 `evidence_text`).
 
-    **`evidence_text` 는 어떤 값도 요약·마스킹하지 않는다.** L1 의 PII allowlist 가 초안의
-    연락처·이메일을 이 텍스트와 대조하므로, 여기서 값을 가리면 근거에 있는 값의 정상
-    에코까지 `pii_detected` 로 오기각된다(docs/business-rules.md "PII 규칙").
+    실행 SQL 은 표시용 `content` 에만 둔다. `evidence_text` 는 결과 행을 담되, 계산 출력의
+    패턴형 PII 는 LLM 리터럴 합성일 수 있어 제외한다. 비PII 계산 결과는 L2 근거로 유지하고,
+    검증기가 `orders` 직접 컬럼으로 증명한 값은 PII 여부와 무관하게 **요약·마스킹하지 않고**
+    그대로 둬 정상 에코 계약을 지킨다.
+
+    **컬럼 이름도 값과 같은 자격으로 거른다.** 출력 이름은 LLM 이 정하는 별칭이라
+    `SELECT status AS "010-9999-9999"` 처럼 이름 자리에 값을 심을 수 있고, 이름이
+    `key=value` 로 렌더되는 순간 allowlist 근거가 된다. 스키마 컬럼 이름은 PII 패턴에
+    걸리지 않으므로, 걸리는 이름은 별칭이라는 뜻이다.
     """
     header = f"실행 쿼리: {sql}\n결과 {len(rows)}건"
+    safe_names = frozenset(pii_safe_output_columns)
+
+    def _pii_shaped(text: str) -> bool:
+        return any(pattern.regex.search(text) for pattern in DEFAULT_PII_PATTERNS)
+
+    evidence_rows = tuple(
+        {
+            key: value
+            for key, value in row.items()
+            if not _pii_shaped(key) and (key in safe_names or not _pii_shaped(_render_value(value)))
+        }
+        for row in rows
+    )
     return (
         f"{header}\n{_render_rows(rows, limit=CONTENT_ROW_LIMIT)}",
-        f"{header}\n{_render_rows(rows)}",
+        _render_rows(evidence_rows),
     )
 
 
@@ -759,7 +781,7 @@ class EvidenceCollector:
 
             if rows:
                 self._adopt_sql_evidence(
-                    ledger=ledger, inquiry_id=inquiry_id, sql=query.sql, rows=rows
+                    ledger=ledger, inquiry_id=inquiry_id, query=query, rows=rows
                 )
             # 정상 실행 0건은 실패가 아니라 "주문 소스 근거 0건"이다 — 재시도하지 않는다.
             return None
@@ -771,13 +793,17 @@ class EvidenceCollector:
         *,
         ledger: _Ledger,
         inquiry_id: str,
-        sql: str,
+        query: ValidatedQuery,
         rows: tuple[dict[str, Any], ...],
     ) -> None:
         """채택된 쿼리에만 순번과 근거 ID 를 매긴다 (docs/contracts.md "답변 계약")."""
         sequence = len(ledger.snapshots) + 1
         evidence_id = sql_evidence_id(inquiry_id=inquiry_id, sequence=sequence)
-        content, evidence_text = _sql_evidence_texts(sql=sql, rows=rows)
+        content, evidence_text = _sql_evidence_texts(
+            sql=query.sql,
+            rows=rows,
+            pii_safe_output_columns=query.pii_safe_output_columns,
+        )
         ledger.evidence.append(
             Evidence(
                 id=evidence_id,
@@ -790,7 +816,7 @@ class EvidenceCollector:
             SqlEvidenceSnapshot(
                 evidence_id=evidence_id,
                 sequence=sequence,
-                query_sql=sql,
+                query_sql=query.sql,
                 result_rows=rows,
             )
         )

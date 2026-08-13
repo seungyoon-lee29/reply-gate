@@ -19,6 +19,7 @@ from reply_gate.contracts import (
     EscalationReason,
     EvidenceSource,
     IntentSource,
+    RejectReason,
     Verdict,
 )
 from reply_gate.db import readonly_connect
@@ -28,6 +29,7 @@ from reply_gate.evidence import (
     SQL_GENERATION_STAGE,
     EvidenceCollector,
     SqlFailureKind,
+    _sql_evidence_texts,
     classify_intent,
     generate_sql,
     order_exists,
@@ -492,6 +494,82 @@ def test_상위_k_개까지만_근거로_삼는다(
     assert len(result.evidence) == 2
 
 
+def test_SQL_원문은_표시용_content에만_남고_allowlist_근거는_결과_행만_쓴다() -> None:
+    sql = "SELECT status FROM orders WHERE order_no = '<선검사 주문>' AND '010-9999-9999' <> ''"
+
+    content, evidence_text = _sql_evidence_texts(
+        sql=sql,
+        rows=({"status": "배송중"},),
+        pii_safe_output_columns=("status",),
+    )
+
+    assert sql in content
+    assert "010-9999-9999" in content
+    assert evidence_text == "1) status=배송중"
+
+
+def test_SQL_계산_결과의_PII는_evidence_text에서_출처로_승인하지_않는다() -> None:
+    sql = "SELECT concat('010', '-9999-', '9999') AS customer_phone FROM orders"
+
+    content, evidence_text = _sql_evidence_texts(
+        sql=sql,
+        rows=({"customer_phone": "010-9999-9999"},),
+        pii_safe_output_columns=(),
+    )
+
+    assert "customer_phone=010-9999-9999" in content
+    assert "010-9999-9999" not in evidence_text
+
+
+def test_출력_별칭_이름에_심은_PII도_allowlist_근거가_되지_않는다() -> None:
+    """출력 이름은 LLM 이 정한다 — 값만 거르면 같은 공격이 이름 자리로 내려온다.
+
+    `SELECT status AS "010-9999-9999"` 는 가드를 통과하고 별칭이 결과 dict 의 **키**가 되며,
+    직접 컬럼으로 증명된 이름 집합에도 그 별칭이 들어온다. `key=value` 로 렌더되는 순간
+    지어낸 번호가 근거 유래로 승인됐다.
+    """
+    sql = "SELECT status AS \"010-9999-9999\" FROM orders WHERE order_no = '<선검사 주문>'"
+
+    content, evidence_text = _sql_evidence_texts(
+        sql=sql,
+        rows=({"010-9999-9999": "배송중"},),
+        pii_safe_output_columns=("010-9999-9999",),
+    )
+
+    assert "010-9999-9999" in content
+    assert "010-9999-9999" not in evidence_text
+
+
+def test_SQL_계산_결과가_비PII면_L2용_evidence_text에_계속_남긴다() -> None:
+    content, evidence_text = _sql_evidence_texts(
+        sql="SELECT upper(status) AS status_label FROM orders",
+        rows=({"status_label": "배송중"},),
+        pii_safe_output_columns=(),
+    )
+
+    assert "status_label=배송중" in content
+    assert evidence_text == "1) status_label=배송중"
+
+
+@pytest.mark.parametrize(
+    ("safe_name", "row_name"),
+    [
+        pytest.param("phone", "phone", id="따옴표_없는_별칭은_소문자"),
+        pytest.param("Phone", "Phone", id="따옴표_별칭은_대소문자_보존"),
+    ],
+)
+def test_DB가_노출하는_별칭과_직접_컬럼_provenance가_일치하면_PII를_보존한다(
+    safe_name: str, row_name: str
+) -> None:
+    _, evidence_text = _sql_evidence_texts(
+        sql="SELECT customer_phone FROM orders",
+        rows=({row_name: "010-1234-5678"},),
+        pii_safe_output_columns=(safe_name,),
+    )
+
+    assert evidence_text == f"1) {row_name}=010-1234-5678"
+
+
 # ── text-to-SQL (DB 필요) ───────────────────────────────────────────────────
 
 
@@ -574,6 +652,57 @@ def test_SQL_근거의_evidence_text_에_연락처_원문이_그대로_들어간
         ]
     }
     assert evaluate_draft(raw_draft=draft, evidences=result.evidence).verdict is Verdict.PASS
+
+
+@pytest.mark.db
+def test_SQL_WHERE_리터럴은_표시용_content에만_남고_PII_allowlist에는_들어가지_않는다(
+    app_conn: psycopg.Connection[DictRow],
+    ro_conn: psycopg.Connection[DictRow],
+    sample_order: dict[str, Any],
+) -> None:
+    order_no = sample_order["order_no"]
+    sql = f"SELECT status FROM orders WHERE order_no = '{order_no}' AND '010-9999-9999' <> ''"
+    client = _client(
+        {
+            INTENT_STAGE: [_intent("order")],
+            SQL_GENERATION_STAGE: [_sql(sql)],
+        }
+    )
+
+    result = _collector(client).collect(
+        inquiry_id=INQUIRY_ID,
+        content=INQUIRY,
+        order_no=order_no,
+        app_conn=app_conn,
+        readonly_conn=ro_conn,
+    )
+
+    evidence = result.evidence[0]
+    assert sql in evidence.content
+    assert sql not in evidence.evidence_text
+    assert "010-9999-9999" not in evidence.evidence_text
+
+    fabricated = {
+        "claims": [
+            {
+                "text": "연락처는 010-9999-9999입니다.",
+                "citation_ids": [evidence.id],
+            }
+        ]
+    }
+    status_echo = {
+        "claims": [
+            {
+                "text": f"주문 상태는 {sample_order['status']}입니다.",
+                "citation_ids": [evidence.id],
+            }
+        ]
+    }
+
+    assert evaluate_draft(raw_draft=fabricated, evidences=result.evidence).reject_reasons == (
+        RejectReason.PII_DETECTED,
+    )
+    assert evaluate_draft(raw_draft=status_echo, evidences=result.evidence).verdict is Verdict.PASS
 
 
 @pytest.mark.db

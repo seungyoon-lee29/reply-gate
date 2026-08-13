@@ -104,6 +104,37 @@ def test_구조가_온전하면_schema_violation_이_붙지_않는다() -> None:
     assert RejectReason.SCHEMA_VIOLATION not in result.reject_reasons
 
 
+@pytest.mark.parametrize(
+    "raw_draft",
+    [
+        pytest.param(
+            {"claims": [{"text": "", "citation_ids": ["policy:x:1"]}]},
+            id="빈_문자열",
+        ),
+        pytest.param(
+            {"claims": [{"text": "   ", "citation_ids": ["policy:x:1"]}]},
+            id="공백뿐인_문자열",
+        ),
+    ],
+)
+def test_빈_claim_text는_schema_violation_으로_기각된다(raw_draft: object) -> None:
+    evidence = _evidence("policy:x:1", "답변 근거")
+
+    result = evaluate_draft(raw_draft=raw_draft, evidences=[evidence])
+
+    assert result.reject_reasons == (RejectReason.SCHEMA_VIOLATION,)
+
+
+def test_공백이_아닌_claim_text는_계속_통과한다() -> None:
+    """양성 대조 — 비어 있지 않은 문장까지 구조 위반으로 접으면 안 된다."""
+    evidence = _evidence("policy:x:1", "답변 근거")
+    raw_draft = {"claims": [{"text": "답변", "citation_ids": ["policy:x:1"]}]}
+
+    result = evaluate_draft(raw_draft=raw_draft, evidences=[evidence])
+
+    assert result.verdict is Verdict.PASS
+
+
 def test_형식_불일치_원문_문자열도_예외를_던지지_않는다() -> None:
     """초안 생성은 형식 불일치 시 원문 문자열을 그대로 넘긴다 — 게이트가 삼켜야 한다."""
     result = evaluate_draft(raw_draft="죄송합니다, JSON 을 못 만들었습니다", evidences=[])
@@ -225,6 +256,111 @@ def test_근거에_있는_이메일은_대문자로_에코해도_통과한다() 
         _evidence(SQL_ID, '{"email": "hong@example.com"}', source=EvidenceSource.SQL),
     ]
     raw_draft = _draft(text="확인 메일을 HONG@Example.COM 으로 보냈습니다.", citation_ids=(SQL_ID,))
+
+    result = evaluate_draft(raw_draft=raw_draft, evidences=evidences)
+
+    assert result.verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize(
+    "draft_text",
+    [
+        "연락처는 010-1234-5678입니다.",
+        "주민등록번호는 900101-1234567입니다.",
+        "문의는 help@shop.co.kr 로 보내세요.",
+    ],
+)
+def test_기존_PII_표준형도_탐지하고_근거에_있으면_통과한다(draft_text: str) -> None:
+    no_pii_evidence = _evidence(POLICY_ID, "고객센터 운영 시간 안내")
+    matching_evidence = _evidence(SQL_ID, draft_text, source=EvidenceSource.SQL)
+
+    rejected = evaluate_draft(raw_draft=_draft(text=draft_text), evidences=[no_pii_evidence])
+    echoed = evaluate_draft(
+        raw_draft=_draft(text=draft_text, citation_ids=(SQL_ID,)), evidences=[matching_evidence]
+    )
+
+    assert rejected.reject_reasons == (RejectReason.PII_DETECTED,)
+    assert echoed.verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize(
+    ("draft_text", "evidence_text"),
+    [
+        pytest.param(
+            "연락처는 +82 10-1234-5678입니다.",
+            "등록 연락처는 010-1234-5678입니다.",
+            id="국가번호_휴대전화",
+        ),
+        pytest.param(
+            "주민등록번호는 900101 1234567입니다.",
+            "본인확인 값은 900101-1234567입니다.",
+            id="공백_주민등록번호",
+        ),
+        pytest.param(
+            "문의는 support@쇼핑몰.kr 로 보내세요.",
+            "문의 이메일은 support@쇼핑몰.kr 입니다.",
+            id="국제화_도메인_이메일",
+        ),
+        # 아래 셋은 사람 눈에는 같은 값인데 ASCII 정규식만으로는 비껴간다. 눈으로 구분되지
+        # 않는 문자라 **이스케이프로 적는다** — 리터럴로 쓰면 읽는 사람이 무엇을 시험하는지
+        # 알 수 없고, 편집 중에 조용히 반각으로 바뀌어도 아무도 모른다.
+        # 근거 쪽 표기를 일부러 반각으로 둬, 접기가 **양쪽에** 걸려야만 양성 대조가 통과한다.
+        pytest.param(
+            "연락처는 \uff10\uff11\uff10-\uff11\uff12\uff13\uff14-\uff15\uff16\uff17\uff18입니다.",
+            "등록 연락처는 010-1234-5678입니다.",
+            id="전각_숫자_휴대전화",
+        ),
+        pytest.param(
+            "연락처는 010-1234\u200b-5678입니다.",
+            "등록 연락처는 010-1234-5678입니다.",
+            id="폭없는_서식문자_삽입",
+        ),
+        pytest.param(
+            "문의는 help\uff20shop.co.kr 로 보내세요.",
+            "문의 이메일은 help@shop.co.kr 입니다.",
+            id="전각_골뱅이_이메일",
+        ),
+    ],
+)
+def test_흔한_PII_표기_변형은_탐지하고_근거에_있는_값만_통과시킨다(
+    draft_text: str, evidence_text: str
+) -> None:
+    no_pii_evidence = _evidence(POLICY_ID, "고객센터 운영 시간 안내")
+    matching_evidence = _evidence(SQL_ID, evidence_text, source=EvidenceSource.SQL)
+
+    rejected = evaluate_draft(raw_draft=_draft(text=draft_text), evidences=[no_pii_evidence])
+    echoed = evaluate_draft(
+        raw_draft=_draft(text=draft_text, citation_ids=(SQL_ID,)), evidences=[matching_evidence]
+    )
+
+    assert rejected.reject_reasons == (RejectReason.PII_DETECTED,)
+    assert echoed.verdict is Verdict.PASS
+
+
+def test_국가번호와_괄호를_정규화해도_서로_다른_번호는_같은_값으로_접지_않는다() -> None:
+    evidences = [
+        _evidence(
+            SQL_ID,
+            "등록 연락처는 0082 (10) 1234 5679입니다.",
+            source=EvidenceSource.SQL,
+        )
+    ]
+    raw_draft = _draft(text="연락처는 +82 10-1234-5678입니다.", citation_ids=(SQL_ID,))
+
+    result = evaluate_draft(raw_draft=raw_draft, evidences=evidences)
+
+    assert result.reject_reasons == (RejectReason.PII_DETECTED,)
+
+
+def test_더하기와_0082_국가번호_표기는_같은_번호로_정규화해_통과한다() -> None:
+    evidences = [
+        _evidence(
+            SQL_ID,
+            "등록 연락처는 0082 (10) 1234 5678입니다.",
+            source=EvidenceSource.SQL,
+        )
+    ]
+    raw_draft = _draft(text="연락처는 +82 10-1234-5678입니다.", citation_ids=(SQL_ID,))
 
     result = evaluate_draft(raw_draft=raw_draft, evidences=evidences)
 

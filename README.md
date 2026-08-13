@@ -289,7 +289,7 @@ flowchart TD
 
 | 사유 | 무엇을 보나 |
 |---|---|
-| `schema_violation` | 답변 계약 JSON 구조 — `claims` 배열 존재·비어 있지 않음, 각 claim 의 `text`(문자열)·`citation_ids`(문자열 배열). 스키마에 없는 추가 키는 위반으로 보지 않는다. |
+| `schema_violation` | 답변 계약 JSON 구조 — `claims` 배열 존재·비어 있지 않음, 각 claim 의 비어 있지 않은 `text`(문자열)·`citation_ids`(문자열 배열). 스키마에 없는 추가 키는 위반으로 보지 않는다. |
 | `missing_citation` | `citation_ids` 가 빈 claim |
 | `invalid_citation` | 이번 문의에서 **실제로 수집된 근거 ID 목록에 없는** ID 를 인용 |
 | `pii_detected` | 초안의 패턴형 PII 중 **근거에서 유래하지 않은 값** |
@@ -301,14 +301,19 @@ flowchart TD
 
 탐지 대상은 **패턴형 PII 5종**이다: 휴대폰, 일반전화, 대표번호(15xx~18xx), 주민등록번호, 이메일.
 
-1. 초안 텍스트에서 정규식으로 값을 뽑고 **정규화**한다(숫자형은 구분자 제거, 이메일은 소문자화).
+1. 초안 텍스트에서 정규식으로 값을 뽑고 **정규화**한다(전화번호는 `+82`/`0082`·공백·괄호를 국내형으로 통일, 주민등록번호는 구분자 제거, 이메일은 국제화 도메인까지 탐지해 소문자화).
 2. **수집 근거 텍스트에도 같은 패턴·같은 정규화**를 적용해 allowlist 를 만든다.
 3. 정규화된 값끼리 **완전 일치**로 비교한다. 근거에 없으면 기각.
 
+SQL 근거에서 패턴형 PII의 allowlist 입력은 가드가 **`orders` 직접 컬럼으로 증명한 출력만**이다.
+실행 SQL 은 표시용 `content` 에만 남는다. 계산 결과 중 비PII 값은 `evidence_text` 에도 남겨 L2가
+보지만, 계산된 PII는 문의의 영향을 받는 SQL 리터럴일 수 있어 제외한다. 승인된 직접 컬럼 값은
+정상 에코를 위해 마스킹하지 않는다.
+
 부분 문자열 포함이 아니라 완전 일치인 것은 의도적이다 — 근거에 주문번호 같은 긴 숫자열이 있으면
 짧은 전화번호가 우연히 그 안에 들어가 **지어낸 번호가 통과해 버린다.**
-대신 근거가 패턴이 모르는 표기(국가번호 접두 등)를 쓰면 정상 에코도 기각될 수 있는데,
-L1 의 실패는 인계로 흘러 안전한 쪽이므로 이 방향의 보수성을 택했다.
+대신 위 정규화가 모르는 표기는 정상 에코도 기각될 수 있는데, L1 의 실패는 인계로 흘러 안전한
+쪽이므로 이 방향의 보수성을 택했다.
 
 ### 커버리지 한계 — 과장하지 않는다
 
@@ -398,13 +403,14 @@ read-only 계정은 **임시 테이블조차 만들 수 없다.**
 
 ### 3층 — 쿼리 검증
 
-거부 규칙 코드는 16종(`SqlGuardRule`)이고, 거부 사유 문자열은 그대로 SQL 재생성 프롬프트의 피드백이 된다 —
+거부 규칙 코드는 17종(`SqlGuardRule`)이고, 거부 사유 문자열은 그대로 SQL 재생성 프롬프트의 피드백이 된다 —
 그래서 사유 메시지는 "무엇을 어떻게 고쳐야 하는지"를 담는다.
 
 | 검사 | 거부하는 것 |
 |---|---|
 | 단일 읽기 전용 SELECT | DML·DDL·`Command`, 세미콜론 다중문, **주석**(파싱 전 토큰 단위로 검출), `SELECT ... INTO`, 행 잠금 절(`FOR UPDATE`·`FOR SHARE` 등) |
 | 함수 허용 목록 | 허용 목록(집계 · NULL 처리 · CASE · CAST · 문자열/날짜 포맷) **밖의 모든 함수**. 블랙리스트가 아니라 화이트리스트 — **모르는 함수는 거부**가 기본값이다. `pg_sleep` 같은 가용성 공격은 권한으로 막히지 않는다. |
+| PII allowlist 출력 provenance | 최상위 직접 상수 projection 과 중복 출력명은 거부한다. 함수·CASE·CAST·문자열 연산·CTE 계산은 실행할 수 있지만 그 출력은 PII allowlist 출처로 승인하지 않는다. 오직 `orders` 직접 컬럼 출력만 승인한다. |
 | **주문 1건 한정** | 화이트리스트 테이블을 읽는 **모든 스코프**가 선검사를 통과한 주문번호 1건으로 묶였는지 AST 로 확인한다. 조건을 빼거나 `OR` 로 묶거나 다른 주문번호를 쓰면 거부. 기저 테이블을 읽는 스코프를 하나도 못 찾으면 **통과가 아니라 거부**다 — 검사하지 못한 쿼리를 통과시키면 게이트가 조용히 열린다. |
 | **외부 조인 거부** | `LEFT`/`RIGHT`/`FULL JOIN` 의 ON 절은 보존측 테이블을 거르지 않는다 → `orders o LEFT JOIN (SELECT 1) d ON o.order_no = '...'` 는 orders **전체**를 돌려준다. 안전을 증명할 수 없는 조인 종류는 신뢰하지 않는다. |
 | 결과 행 수 상한 | 거부가 아니라 **LIMIT 을 강제**한다(없으면 붙이고, 상한을 넘으면 낮춘다). 다만 행 수가 정수 리터럴이 아니면(부질의 · `FETCH ... PERCENT` · `WITH TIES`) 실행 전에 확인할 수 없으므로 거부. |
@@ -825,7 +831,7 @@ uv run python -m scripts.evaluate --live   # 측정 1 + 2(골든셋 30건) + 3(�
 | [`src/reply_gate/gate.py`](src/reply_gate/gate.py) | **L1 게이트** — 사유 4종 + PII allowlist. LLM 을 import 하지 않는다 |
 | [`src/reply_gate/judge.py`](src/reply_gate/judge.py) | **L2 판정** — claim 단위 뒷받침 + 근거쌍 모순, 시도당 1회 배치. 판정 산출 검증은 fail-closed. `gate.py` 를 부르지 않는다 |
 | [`src/reply_gate/evidence.py`](src/reply_gate/evidence.py) | 근거 수집 — 의도 해석 · 벡터 검색 · 존재성 선검사 · text-to-SQL 조율 |
-| [`src/reply_gate/sql_guard.py`](src/reply_gate/sql_guard.py) | 안전장치 2·3 — sqlglot AST 검증, 거부 규칙 16종 |
+| [`src/reply_gate/sql_guard.py`](src/reply_gate/sql_guard.py) | 안전장치 2·3 — sqlglot AST 검증, 거부 규칙 17종 |
 | [`src/reply_gate/draft.py`](src/reply_gate/draft.py) | 초안 생성 — 근거만 컨텍스트, 기각 사유를 피드백으로 재생성 |
 | [`src/reply_gate/contracts.py`](src/reply_gate/contracts.py) | 사이클 간 계약 — 답변 계약 JSON, 근거 ID 체계, 판정·상태 enum |
 | [`src/reply_gate/api.py`](src/reply_gate/api.py) | FastAPI 엔드포인트 4개 + 응답 스키마 |

@@ -18,6 +18,7 @@ docs/business-rules.md "L1 게이트 판정 규칙" 을 그대로 옮긴 모듈�
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
@@ -30,6 +31,7 @@ __all__ = [
     "evaluate_draft",
     "normalize_digits",
     "normalize_email",
+    "normalize_phone",
     "to_draft",
 ]
 
@@ -60,6 +62,16 @@ def normalize_digits(value: str) -> str:
     return _NON_DIGIT.sub("", value)
 
 
+def normalize_phone(value: str) -> str:
+    """전화번호 정규화: 구분자를 지우고 한국 국가번호를 국내 `0` 표기로 바꾼다."""
+    digits = normalize_digits(value)
+    if digits.startswith("0082"):
+        return f"0{digits[4:]}"
+    if digits.startswith("82"):
+        return f"0{digits[2:]}"
+    return digits
+
+
 def normalize_email(value: str) -> str:
     """이메일 정규화: 앞뒤 공백 제거 후 소문자화."""
     return value.strip().lower()
@@ -81,13 +93,19 @@ class PiiPattern:
 DEFAULT_PII_PATTERNS: tuple[PiiPattern, ...] = (
     PiiPattern(
         name="mobile_phone",
-        regex=re.compile(r"(?<![0-9])01[016789][-. ]?[0-9]{3,4}[-. ]?[0-9]{4}(?![0-9])"),
-        normalize=normalize_digits,
+        regex=re.compile(
+            r"(?<![0-9])(?:(?:\+82|0082)[-. ()]*10|01[016789])"
+            r"[-. ()]*[0-9]{3,4}[-. ()]*[0-9]{4}(?![0-9])"
+        ),
+        normalize=normalize_phone,
     ),
     PiiPattern(
         name="landline_phone",
-        regex=re.compile(r"(?<![0-9])0[2-9][0-9]?[-. ]?[0-9]{3,4}[-. ]?[0-9]{4}(?![0-9])"),
-        normalize=normalize_digits,
+        regex=re.compile(
+            r"(?<![0-9])(?:(?:\+82|0082)[-. ()]*(?:2|[3-9][0-9]?)|0[2-9][0-9]?)"
+            r"[-. ()]*[0-9]{3,4}[-. ()]*[0-9]{4}(?![0-9])"
+        ),
+        normalize=normalize_phone,
     ),
     # 15xx/16xx/17xx/18xx 대표번호. 개인 연락처는 아니지만 정책 문서의 미끼 조항이
     # 겨냥하는 값이 바로 이것이다(docs/engineering-notes.md "대표번호(15xx~18xx)를
@@ -100,12 +118,12 @@ DEFAULT_PII_PATTERNS: tuple[PiiPattern, ...] = (
     ),
     PiiPattern(
         name="resident_registration_number",
-        regex=re.compile(r"(?<![0-9])[0-9]{6}-?[1-4][0-9]{6}(?![0-9])"),
+        regex=re.compile(r"(?<![0-9])[0-9]{6}[-. ]?[1-4][0-9]{6}(?![0-9])"),
         normalize=normalize_digits,
     ),
     PiiPattern(
         name="email",
-        regex=re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
+        regex=re.compile(r"[A-Za-z0-9._%+-]+@(?:[^\W_]|-)+(?:\.(?:[^\W_]|-)+)+"),
         normalize=normalize_email,
     ),
 )
@@ -209,7 +227,7 @@ def _inspect_schema(raw_draft: object) -> _SchemaInspection:
             continue
 
         text = claim.get(_TEXT_KEY)
-        if not isinstance(text, str):
+        if not isinstance(text, str) or not text.strip():
             ok = False
 
         citation_ids = claim.get(_CITATION_IDS_KEY)
@@ -266,8 +284,27 @@ def _collect_texts(value: object, *, depth: int = 0) -> list[str]:
     return []
 
 
+def fold_for_detection(text: str) -> str:
+    """탐지 전 유니코드 접기 — 사람 눈에 같은 값이 패턴을 비껴가지 못하게 한다.
+
+    전각 숫자(U+FF10~U+FF19)로 쓴 전화번호는 사람이 읽으면 전화번호지만 ASCII 숫자
+    정규식에 걸리지 않는다. NFKC 로 호환 문자를 반각으로 접고, 폭 없는 서식 문자
+    (`Cf` 범주 — U+200B 등)를 지운다. 숫자 사이에 끼워 넣는 우회도 같은 계열이다.
+    실제 우회 문자열은 `tests/test_gate.py` 의 표기 변형 케이스에 그대로 들어 있다.
+
+    **초안과 근거 양쪽에 같은 접기를 적용한다.** 한쪽에만 걸면 근거의 같은 값이 다른 문자열이
+    되어 정상 에코가 오기각된다.
+    """
+    folded = unicodedata.normalize("NFKC", text)
+    return "".join(ch for ch in folded if unicodedata.category(ch) != "Cf")
+
+
 def _normalized_matches(*, texts: Sequence[str], pattern: PiiPattern) -> set[str]:
-    return {pattern.normalize(match) for text in texts for match in pattern.regex.findall(text)}
+    return {
+        pattern.normalize(match)
+        for text in texts
+        for match in pattern.regex.findall(fold_for_detection(text))
+    }
 
 
 def _has_unsourced_pii(
@@ -285,8 +322,9 @@ def _has_unsourced_pii(
     정규화한 숫자열을 근거 텍스트에 '부분 문자열 포함' 으로 대조하지 않는 이유:
     근거에 주문번호 같은 긴 숫자열이 있으면 짧은 전화번호가 우연히 그 안에 들어가
     지어낸 번호가 통과해 버린다(= PII 유출). 완전 일치는 이 오탐 경로를 통째로 없앤다.
-    대신 근거가 패턴이 모르는 표기(예: 국가번호 접두)를 쓰면 정상 에코도 기각될 수 있는데,
-    L1 의 실패는 인계(escalation)로 흘러 안전한 쪽이므로 이 방향의 보수성을 택한다.
+    국내형과 한국 국가번호(+82/0082), 공백·괄호 구분자는 같은 값으로 접는다. 그래도 패턴이
+    모르는 표기는 정상 에코라도 기각될 수 있는데, L1 실패는 인계(escalation)로 흘러 안전한
+    쪽이므로 이 방향의 보수성을 택한다.
 
     비패턴형 개인정보(이름·주소)는 정규식으로 잡을 수 없어 **L1 의 검사 대상이 아니다** —
     L2 사이클의 claim 단위 근거 대조로 이월한다. 커버리지를 과장하지 않는다.

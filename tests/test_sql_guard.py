@@ -90,6 +90,233 @@ def test_선검사를_통과하지_않은_주문번호로_호출하는_것은_�
         validate_sql(OK_SQL, order_no="주문번호아님", max_rows=MAX_ROWS)
 
 
+# ── 결과 projection 은 DB 컬럼에서 유래해야 한다 ───────────────────────────
+
+
+def test_PII_리터럴을_직접_결과_컬럼으로_위장한_projection은_거부한다() -> None:
+    reproduced_sql = (
+        "SELECT '010-9999-9999' AS customer_phone FROM orders WHERE order_no = '<선검사 주문>'"
+    )
+    sql = reproduced_sql.replace("<선검사 주문>", ORDER_NO)
+
+    rejection = _reject(sql)
+
+    assert rejection.rule == "unsupported_projection"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        (
+            "WITH t AS (SELECT '010-9999-9999' AS customer_phone, order_no FROM orders "
+            f"WHERE order_no = '{ORDER_NO}') SELECT customer_phone FROM t"
+        ),
+        (
+            "SELECT coalesce('010-9999-9999', customer_phone) AS customer_phone FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT CASE WHEN status IS NOT NULL THEN '010-9999-9999' "
+            "ELSE customer_phone END AS customer_phone FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT concat('010', '-9999-', '9999') AS customer_phone FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT cast('010-9999-9999' AS text) AS customer_phone FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT '010' || '-9999-' || '9999' AS customer_phone FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT replace('010x9999x9999', 'x', '-') AS customer_phone FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT 'support' || '@' || 'example.com' AS customer_email FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT substring('0010-9999-99990', 2, 13) AS customer_phone FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT concat(status, '010', '-9999-', '9999') AS customer_phone FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT (CASE WHEN status IS NOT NULL THEN '010' ELSE '011' END) "
+            "|| '-9999-' || '9999' AS customer_phone FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT (CASE WHEN status IS NOT NULL THEN 'support' ELSE 'help' END) "
+            "|| '@' || 'example.com' AS customer_email FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT coalesce(NULL, '010') || '-9999-' || '9999' AS customer_phone "
+            f"FROM orders WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT nullif('010', '') || '-9999-' || '9999' AS customer_phone "
+            f"FROM orders WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT '0' || cast(1099999999 AS text) AS customer_phone FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT concat('0', cast(1099999999 AS text)) AS customer_phone FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT cast(1588 AS text) || '-' || cast(1234 AS text) AS service_phone "
+            f"FROM orders WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT cast(900101 AS text) || '-' || cast(1234567 AS text) AS rrn "
+            f"FROM orders WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            r"SELECT E'010\0559999\0559999' AS customer_phone FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            r"SELECT E'support\100example.com' AS customer_email FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            r"SELECT U&'010\002D9999\002D9999' AS customer_phone FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (f"SELECT $$010-9999-9999$$ AS customer_phone FROM orders WHERE order_no = '{ORDER_NO}'"),
+        (
+            "SELECT '0' || cast(1099999998 + 1 AS text) AS customer_phone FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT to_char(1099999999, 'FM0000000000') AS customer_phone FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (f"SELECT N'010-9999-9999' AS customer_phone FROM orders WHERE order_no = '{ORDER_NO}'"),
+        (
+            "SELECT N'support@example.com' AS customer_email FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+        (
+            "SELECT N'010' || N'-9999-' || N'9999' AS customer_phone FROM orders "
+            f"WHERE order_no = '{ORDER_NO}'"
+        ),
+    ],
+    ids=[
+        "CTE",
+        "coalesce",
+        "case",
+        "concat",
+        "cast",
+        "문자열연산자",
+        "replace",
+        "이메일결합",
+        "substring",
+        "컬럼과_상수조각_concat",
+        "case_전화",
+        "case_이메일",
+        "coalesce_전화",
+        "nullif_전화",
+        "숫자cast_휴대전화_DPipe",
+        "숫자cast_휴대전화_concat",
+        "숫자cast_대표번호",
+        "숫자cast_주민번호",
+        "escape_문자열_전화",
+        "escape_문자열_이메일",
+        "unicode_문자열",
+        "dollar_quoted_문자열",
+        "숫자산술_cast",
+        "상수_to_char",
+        "national_전화",
+        "national_이메일",
+        "national_결합",
+    ],
+)
+def test_계산_projection은_PII_allowlist_출력으로_승인하지_않는다(sql: str) -> None:
+    validated = validate_sql(sql, order_no=ORDER_NO, max_rows=MAX_ROWS)
+
+    assert validated.pii_safe_output_columns == ()
+
+
+def test_DB_연락처_컬럼을_직접_projection하면_계속_통과한다() -> None:
+    """양성 대조 — 실제 컬럼과 PII 아닌 허용 함수 표현식은 계속 쓸 수 있어야 한다."""
+    validated = validate_sql(
+        f"SELECT customer_phone AS phone FROM orders WHERE order_no = '{ORDER_NO}'",
+        order_no=ORDER_NO,
+        max_rows=MAX_ROWS,
+    )
+
+    assert validated.pii_safe_output_columns == ("phone",)
+
+    _ok(f"SELECT coalesce(customer_phone, '미등록') FROM orders WHERE order_no = '{ORDER_NO}'")
+    _ok(f"SELECT concat(courier, ' ', tracking_no) FROM orders WHERE order_no = '{ORDER_NO}'")
+    _ok(f"SELECT customer_name || ' ' || product_name FROM orders WHERE order_no = '{ORDER_NO}'")
+    _ok(f"SELECT replace(product_name, '구형', '신형') FROM orders WHERE order_no = '{ORDER_NO}'")
+    _ok(f"SELECT to_char(ordered_at, 'YYYY-MM-DD') FROM orders WHERE order_no = '{ORDER_NO}'")
+
+
+def test_직접_컬럼의_출력명은_Postgres_별칭_대소문자_규칙을_따른다() -> None:
+    unquoted = validate_sql(
+        f"SELECT customer_phone AS Phone FROM orders WHERE order_no = '{ORDER_NO}'",
+        order_no=ORDER_NO,
+        max_rows=MAX_ROWS,
+    )
+    quoted = validate_sql(
+        f"SELECT customer_phone AS \"Phone\" FROM orders WHERE order_no = '{ORDER_NO}'",
+        order_no=ORDER_NO,
+        max_rows=MAX_ROWS,
+    )
+    case_distinct = validate_sql(
+        'SELECT customer_phone AS "phone", customer_email AS "Phone" '
+        f"FROM orders WHERE order_no = '{ORDER_NO}'",
+        order_no=ORDER_NO,
+        max_rows=MAX_ROWS,
+    )
+
+    assert unquoted.pii_safe_output_columns == ("phone",)
+    assert quoted.pii_safe_output_columns == ("Phone",)
+    assert case_distinct.pii_safe_output_columns == ("phone", "Phone")
+
+
+def test_직접_컬럼과_계산식의_같은_별칭은_provenance_덮어쓰기를_막기_위해_거부한다() -> None:
+    rejection = _reject(
+        "SELECT customer_phone AS x, "
+        "concat('010','-9999-','9999') AS x "
+        f"FROM orders WHERE order_no = '{ORDER_NO}'"
+    )
+
+    assert rejection.rule == "unsupported_projection"
+    _ok(
+        "SELECT customer_phone AS stored_phone, "
+        "concat('010','-9999-','9999') AS calculated_phone "
+        f"FROM orders WHERE order_no = '{ORDER_NO}'"
+    )
+
+
+def test_별표와_계산식의_직접_컬럼명_충돌도_거부한다() -> None:
+    rejection = _reject(
+        "SELECT *, concat('010','-9999-','9999') AS customer_phone "
+        f"FROM orders WHERE order_no = '{ORDER_NO}'"
+    )
+
+    assert rejection.rule == "unsupported_projection"
+    _ok(
+        "SELECT *, concat('010','-9999-','9999') AS calculated_phone "
+        f"FROM orders WHERE order_no = '{ORDER_NO}'"
+    )
+
+
 # ── 비SELECT 거부 ───────────────────────────────────────────────────────────
 
 
