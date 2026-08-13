@@ -27,9 +27,8 @@ DB 가 필요한 테스트는 `db` 마커가 붙고, 쓰기는 전부 `app_conn`
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, cast
 
 import psycopg
@@ -40,6 +39,7 @@ from psycopg.rows import DictRow
 from reply_gate.api import (
     InquiryResponse,
     InquiryService,
+    ServiceOpener,
     app,
     build_embedding_client,
     build_generation_client,
@@ -146,8 +146,8 @@ class RecordingService:
 def recorder() -> Iterator[RecordingService]:
     service = RecordingService()
 
-    def _override() -> RecordingService:
-        return service
+    def _override() -> ServiceOpener:
+        return lambda: nullcontext(cast(InquiryService, service))
 
     app.dependency_overrides[get_service] = _override
     try:
@@ -186,10 +186,16 @@ def service_client(
     app_conn: psycopg.Connection[DictRow],
     ro_conn: psycopg.Connection[DictRow],
 ) -> Iterator[TestClient]:
-    """주어진 파이프라인 + 테스트 커넥션으로 앱을 돌린다 (의존성 주입 지점)."""
+    """주어진 파이프라인 + 테스트 커넥션으로 앱을 돌린다 (의존성 주입 지점).
 
-    def _override() -> InquiryService:
-        return InquiryService(pipeline=pipeline, app_conn=app_conn, readonly_conn=ro_conn)
+    주입한 커넥션은 **이미 열려 있으므로** 여는 계층은 `nullcontext` 로 비운다 — 테스트
+    커넥션의 수명은 픽스처가 소유하고, 요청이 끝날 때 닫히면 안 된다.
+    """
+
+    def _override() -> ServiceOpener:
+        return lambda: nullcontext(
+            InquiryService(pipeline=pipeline, app_conn=app_conn, readonly_conn=ro_conn)
+        )
 
     app.dependency_overrides[get_service] = _override
     try:
@@ -954,6 +960,77 @@ def test_스위치가_꺼져_있으면_판정_키_없이도_POST_가_처리된�
     assert response.json()["status"] == InquiryStatus.ANSWERED.value
 
 
+# ── DB 가 없을 때의 순서 (요청 오류·설정 오류가 500 에 가리지 않는다) ───────
+#
+# 이 절의 테스트는 **DB 가 없어야 의미가 있다** — `db` 마커를 붙이지 않고, 살아 있는
+# 컨테이너를 건드리는 대신 설정을 죽은 포트로 돌려 "DB 없음"을 만든다. 의존성 override 도
+# 하지 않는다: 실제 `get_service` 가 언제 연결하는지가 검사 대상이기 때문이다.
+
+
+def _dbless(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> Settings:
+    """DB 가 없는 환경. 포트 1 은 어떤 Postgres 도 듣지 않는다."""
+    return api_settings(monkeypatch, postgres_port=1, **overrides)
+
+
+def test_의존성_해석만으로는_커넥션을_열지_않는다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`get_service()` 자체가 연결하면 라우트의 선검사가 무엇을 하든 늦는다.
+
+    프레임워크의 의존성 해석 순서에 기대지 않는 지점이 여기다 — 해석이 공짜면 순서가
+    무엇이든 선검사가 먼저 끝난다.
+    """
+    _dbless(monkeypatch)
+
+    open_service = get_service()  # DB 가 없는데도 여기서 터지면 안 된다
+
+    with pytest.raises(psycopg.OperationalError), open_service():  # 열 때에야 터진다
+        pass
+
+
+def test_DB_가_없어도_접수_거부는_422다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """형식이 틀린 주문번호는 요청 오류다 — DB 가 떠 있느냐와 무관하다."""
+    _dbless(monkeypatch, l2_enabled=False)
+
+    with TestClient(app) as test_client:
+        response = test_client.post("/inquiries", json={"content": INQUIRY, "order_no": "12345"})
+
+    assert response.status_code == 422
+
+
+def test_DB_가_없어도_빈_내용은_422다(monkeypatch: pytest.MonkeyPatch) -> None:
+    _dbless(monkeypatch, l2_enabled=False)
+
+    with TestClient(app) as test_client:
+        response = test_client.post("/inquiries", json={"content": "   "})
+
+    assert response.status_code == 422
+
+
+def test_DB_가_없어도_판정키_부재는_503이다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """설정 오류는 DB 상태와 무관하게 설정 오류다."""
+    _dbless(monkeypatch, l2_enabled=True, anthropic_api_key="")
+
+    with TestClient(app) as test_client:
+        response = test_client.post("/inquiries", json={"content": INQUIRY})
+
+    assert response.status_code == 503
+    assert "ANTHROPIC_API_KEY" in response.text
+
+
+def test_DB_가_진짜_필요한_경로는_그대로_500이다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DB 장애를 업무 판정으로 바꾸지 않는다(docs/standards.md).
+
+    위 세 건을 "DB 오류를 삼켜서" 통과시키면 이 테스트가 깨진다.
+    """
+    _dbless(monkeypatch, l2_enabled=False)
+
+    with TestClient(app, raise_server_exceptions=False) as test_client:
+        lookup = test_client.get("/inquiries/3b0a5a1e-0000-4000-8000-000000000000")
+        process = test_client.post("/inquiries", json={"content": INQUIRY})
+
+    assert lookup.status_code == 500
+    assert process.status_code == 500
+
+
 # ── 커넥션 배선 자체 (목으로 덮이는 구간) ────────────────────────────────────
 
 
@@ -965,9 +1042,8 @@ def test_get_service_가_계정_두_개로_커넥션을_열고_닫는다() -> No
     실제로 열리는 커넥션이 각각 어느 계정인지 한 번은 DB 에 물어 확인한다.
     """
     settings = get_settings()
-    generator = get_service()
-    service = next(generator)
-    try:
+    open_service = get_service()
+    with open_service() as service:
         with service._app_conn.cursor() as cur:
             cur.execute("SELECT current_user AS who")
             row = cur.fetchone()
@@ -979,10 +1055,7 @@ def test_get_service_가_계정_두_개로_커넥션을_열고_닫는다() -> No
             row = cur.fetchone()
             assert row is not None
             assert row["who"] == settings.postgres_ro_user
-    finally:
-        with contextlib.suppress(StopIteration):
-            next(generator)
 
-    # 제너레이터가 끝나면 두 커넥션 모두 닫혀 있어야 한다 — 요청마다 새는 것을 막는다.
+    # 블록이 끝나면 두 커넥션 모두 닫혀 있어야 한다 — 요청마다 새는 것을 막는다.
     assert service._app_conn.closed
     assert service._readonly_conn.closed
