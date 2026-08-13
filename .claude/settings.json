@@ -1,4 +1,7 @@
 {
+  "env": {
+    "HANDOFF_FILE": ".dryforge/handoff.md"
+  },
   "hooks": {
     "PreToolUse": [
       {

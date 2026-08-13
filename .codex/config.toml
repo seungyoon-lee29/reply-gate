@@ -32,3 +32,79 @@ type = "command"
 command = '"$(git rev-parse --show-toplevel)/.claude/hooks/protect-live-reports.sh" codex'
 timeout = 10
 statusMessage = "라이브 리포트 불변식 확인"
+
+# ── 인계 게이트 ─────────────────────────────────────────────────────────────
+#
+# compact 로 맥락이 깎이기 전에 `.dryforge/handoff.md` 갱신을 강제한다. 구현은
+# `~/.claude/hooks/handoff/` 한 벌뿐이고 Claude Code 의 Stop/PreCompact/PostCompact
+# 훅도 **같은 스크립트**를 부른다 — 위 protect-live-reports 와 같은 이유다. 규칙이
+# 두 벌로 갈라지면 한쪽만 고쳐지고 다른 쪽이 조용히 뚫린다.
+#
+# 갱신 여부는 말이 아니라 파일 해시로 확인한다. 해시가 안 바뀌면 compact 가 막힌다.
+# 검증: `python3 ~/.claude/hooks/handoff/gate.py --help` 가 아니라
+#       `cd ~/.claude/hooks/handoff && python3 gate.test.py` (22개 테스트).
+
+[[hooks.SessionStart]]
+matcher = "^(startup|resume|compact)$"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = 'HANDOFF_FILE=.dryforge/handoff.md python3 "$HOME/.claude/hooks/handoff/continuity.py" load'
+timeout = 10
+statusMessage = "인계 문서 주입"
+additionalContextLimit = 16000
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = 'HANDOFF_FILE=.dryforge/handoff.md python3 "$HOME/.claude/hooks/handoff/gate.py" start'
+timeout = 10
+statusMessage = "인계 게이트 초기화"
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = 'HANDOFF_FILE=.dryforge/handoff.md python3 "$HOME/.claude/hooks/handoff/gate.py" prompt'
+timeout = 10
+statusMessage = "컨텍스트 잔여량 확인"
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = 'HANDOFF_FILE=.dryforge/handoff.md python3 "$HOME/.claude/hooks/handoff/gate.py" stop'
+timeout = 10
+statusMessage = "인계 선행 여부 확인"
+
+[[hooks.PreCompact]]
+matcher = "^(manual|auto)$"
+
+[[hooks.PreCompact.hooks]]
+type = "command"
+command = 'HANDOFF_FILE=.dryforge/handoff.md python3 "$HOME/.claude/hooks/handoff/gate.py" precompact'
+timeout = 10
+statusMessage = "인계 갱신 확인 후 compact"
+
+[[hooks.PostCompact]]
+matcher = "^(manual|auto)$"
+
+[[hooks.PostCompact.hooks]]
+type = "command"
+command = 'HANDOFF_FILE=.dryforge/handoff.md python3 "$HOME/.claude/hooks/handoff/gate.py" reset'
+timeout = 10
+statusMessage = "다음 인계 주기 준비"
+
+[[hooks.SessionEnd]]
+matcher = "^other$"
+
+[[hooks.SessionEnd.hooks]]
+type = "command"
+command = 'HANDOFF_FILE=.dryforge/handoff.md python3 "$HOME/.claude/hooks/handoff/continuity.py" cleanup'
+timeout = 3
+statusMessage = "임시 인계 스냅샷 정리"
+
+[[hooks.SessionEnd.hooks]]
+type = "command"
+command = 'HANDOFF_FILE=.dryforge/handoff.md python3 "$HOME/.claude/hooks/handoff/gate.py" cleanup'
+timeout = 3
+statusMessage = "인계 게이트 상태 정리"
