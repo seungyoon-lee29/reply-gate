@@ -48,6 +48,32 @@ __all__ = [
 MAX_ATTEMPTS = 2
 
 
+def _pin_transport_policy[C](client: C, *, timeout: float) -> C:
+    """SDK 자동 재시도를 끄고 타임아웃을 래퍼 값으로 고정한다 — **주입 여부와 무관하게.**
+
+    구 코드는 `client or <SDK>(..., max_retries=0, timeout=timeout)` 이었다. 주입하면
+    `or` **우변 전체가 평가되지 않아** 두 값이 적용되지 않는다. 두 SDK 기본값이 모두
+    `max_retries=2` 라, 래퍼의 "1회 재시도"가 SDK 재시도와 **곱해져 최대 6회 전송**이
+    되면서 `LLMCallError.attempts` 는 래퍼 루프만 세어 2 로 신고했다(실측: 전송 6 / 기록 2).
+    타임아웃도 같은 표현식의 같은 구멍이라 120초 의도가 SDK 기본 600초가 됐다.
+
+    그래서 값을 `or` 우변이 아니라 **관문**에 둔다. 기본 생성 경로도 이 관문을 지나므로,
+    생성자에서 `max_retries=0` 리터럴이 사라져도 정책은 코드가 되돌린다.
+
+    `with_options`·`max_retries` 가 없는 테스트 대역은 그대로 통과한다 — 대역 주입은 정상
+    용법이다. 끌 수단이 없는데 재시도가 켜진 객체만 거부한다(fail-closed).
+    """
+    candidate: Any = client
+    with_options = getattr(candidate, "with_options", None)
+    if callable(with_options):  # 진짜 SDK — 공식 API 로 사본에 정책을 박는다
+        candidate = with_options(max_retries=0, timeout=timeout)
+    if getattr(candidate, "max_retries", 0) != 0:
+        raise ValueError(
+            "주입된 클라이언트의 SDK 자동 재시도를 끌 수 없다 — 재시도는 래퍼가 단독 통제한다"
+        )
+    return cast(C, candidate)
+
+
 class LLMCallError(RuntimeError):
     """전송 오류가 재시도 후에도 지속됨 → 인계 사유 `llm_call_failed`.
 
@@ -244,8 +270,12 @@ class OpenAIGenerationClient:
         timeout: float = 120.0,
         client: openai.OpenAI | None = None,
     ) -> None:
-        # max_retries=0: 재시도는 이 래퍼가 단독 통제한다 (모듈 docstring 참조).
-        self._client = client or openai.OpenAI(api_key=api_key, max_retries=0, timeout=timeout)
+        # 재시도·타임아웃은 이 래퍼가 단독 통제한다 (모듈 docstring 참조). 값을 `or`
+        # 우변에만 두면 주입 시 우회되므로 **관문을 지나게** 한다.
+        self._client = _pin_transport_policy(
+            client or openai.OpenAI(api_key=api_key, max_retries=0, timeout=timeout),
+            timeout=timeout,
+        )
         self._model = model
 
     @property
@@ -343,9 +373,11 @@ class AnthropicGenerationClient:
         timeout: float = 120.0,
         client: anthropic.Anthropic | None = None,
     ) -> None:
-        # max_retries=0: 재시도는 이 래퍼가 단독 통제한다 (모듈 docstring 참조).
-        self._client = client or anthropic.Anthropic(
-            api_key=api_key, max_retries=0, timeout=timeout
+        # 재시도·타임아웃은 이 래퍼가 단독 통제한다 (모듈 docstring 참조). 값을 `or`
+        # 우변에만 두면 주입 시 우회되므로 **관문을 지나게** 한다.
+        self._client = _pin_transport_policy(
+            client or anthropic.Anthropic(api_key=api_key, max_retries=0, timeout=timeout),
+            timeout=timeout,
         )
         self._model = model
 
@@ -441,7 +473,10 @@ class OpenAIEmbeddingClient:
         timeout: float = 60.0,
         client: openai.OpenAI | None = None,
     ) -> None:
-        self._client = client or openai.OpenAI(api_key=api_key, max_retries=0, timeout=timeout)
+        self._client = _pin_transport_policy(
+            client or openai.OpenAI(api_key=api_key, max_retries=0, timeout=timeout),
+            timeout=timeout,
+        )
         self._model = model
         self._dimensions = dimensions
 

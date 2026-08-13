@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import json
+import pathlib
 from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any, cast
@@ -82,6 +84,87 @@ def test_sdk_자동재시도를_끈다() -> None:
         api_key="test", model="text-embedding-3-small", dimensions=1536
     )
     assert embedder._client.max_retries == 0
+
+
+# ── 주입 경로도 같은 정책을 받는다 (`or` 우변은 주입 시 평가되지 않는다) ──────
+
+
+def test_주입한_SDK_클라이언트도_자동재시도가_꺼지고_타임아웃이_고정된다() -> None:
+    """구 코드는 `client or SDK(..., max_retries=0, timeout=...)` 라 주입 시 우변을 평가조차
+    하지 않았다. SDK 기본 `max_retries=2` 와 래퍼 재시도가 곱해져 **최대 6회 전송**인데
+    `LLMCallError.attempts` 는 2 로 신고됐고, 타임아웃도 120초 의도가 SDK 기본 600초였다.
+    """
+    injected_openai = openai.OpenAI(api_key="test")
+    injected_anthropic = anthropic.Anthropic(api_key="test")
+    assert injected_openai.max_retries == 2  # 주입 전에는 SDK 기본값이다
+    assert injected_anthropic.max_retries == 2
+
+    generation = OpenAIGenerationClient(
+        api_key="test", model="gpt-5.6-terra", client=injected_openai
+    )
+    judging = AnthropicGenerationClient(
+        api_key="test", model="claude-sonnet-5", client=injected_anthropic
+    )
+    embedding = OpenAIEmbeddingClient(
+        api_key="test",
+        model="text-embedding-3-small",
+        dimensions=1536,
+        client=openai.OpenAI(api_key="test"),
+    )
+
+    for wrapper in (generation, judging, embedding):
+        assert wrapper._client.max_retries == 0
+
+    # 타임아웃도 같은 표현식의 같은 구멍이었다 — 래퍼 값으로 고정한다.
+    assert generation._client.timeout == 120.0
+    assert judging._client.timeout == 120.0
+    assert embedding._client.timeout == 60.0
+
+
+def test_테스트_대역_주입은_그대로_통과한다() -> None:
+    """대역 주입은 정상 용법이다 — `max_retries`·`with_options` 가 없어도 막지 않는다."""
+    double = SimpleNamespace(responses=SimpleNamespace(create=lambda **_: None))
+
+    client = OpenAIGenerationClient(
+        api_key="test", model="gpt-5.6-terra", client=cast(openai.OpenAI, double)
+    )
+
+    assert cast(object, client._client) is double  # 사본을 만들지도 않는다
+
+
+def test_재시도를_끌_수_없는_클라이언트는_조립에서_거부된다() -> None:
+    """fail-closed — 재시도가 켜져 있는데 끌 수단이 없으면 조용히 받아들이지 않는다."""
+    unfixable = SimpleNamespace(max_retries=2)
+
+    with pytest.raises(ValueError, match="자동 재시도를 끌 수 없다"):
+        OpenAIGenerationClient(
+            api_key="test", model="gpt-5.6-terra", client=cast(openai.OpenAI, unfixable)
+        )
+
+
+def test_llm_모듈의_모든_클라이언트_대입은_관문을_지난다() -> None:
+    """구조 테스트 — 네 번째 래퍼가 생기거나 누가 `client or SDK(...)` 로 되돌리면 잡는다.
+
+    인스턴스 속성 assert 만으로는 **새로 추가된 래퍼**를 잡지 못한다. 대입 지점 자체를
+    검사해야 관문이 우회 불가능한 통로가 된다(`tests/test_gate.py` 의 격리 구조 테스트와
+    같은 방식).
+    """
+    source = pathlib.Path("src/reply_gate/llm.py").read_text(encoding="utf-8")
+    assignments = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Attribute) and target.attr == "_client"
+    ]
+
+    assert len(assignments) >= 3, "클라이언트 대입 지점을 찾지 못했다 — 검사가 헛돌고 있다"
+    for node in assignments:
+        call = node.value
+        assert isinstance(call, ast.Call), f"line {node.lineno}: 관문 호출이 아니다"
+        assert isinstance(call.func, ast.Name) and call.func.id == "_pin_transport_policy", (
+            f"line {node.lineno}: `self._client` 는 `_pin_transport_policy(...)` 결과여야 한다"
+        )
 
 
 def test_정상_응답은_데이터와_토큰을_돌려준다() -> None:

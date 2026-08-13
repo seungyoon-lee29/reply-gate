@@ -274,8 +274,9 @@ flowchart TD
 | **L2 판정 호출 실패**(전송 오류·형식 불일치 소진) | 최초 + 재시도 1회 | `llm_call_failed`(실패 단계 `l2_judge`) — **재생성으로 가지 않는다.** 검증하지 못한 답변은 내보내지 않는다 |
 | 초안 재생성 | 최초 + 재생성 1회 | `rejected_twice` (L1 기각이든 L2 기각이든 동일) |
 
-> OpenAI SDK 의 기본 자동 재시도(2회)는 `max_retries=0` 으로 껐다.
+> OpenAI·Anthropic **두 SDK 모두** 기본 자동 재시도(2회)를 `max_retries=0` 으로 껐다.
 > 켜 두면 "1회 재시도"가 실제로는 최대 6회 전송이 되어 지연·토큰 기록이 어긋난다.
+> 클라이언트를 주입해도 래퍼 생성자가 같은 정책을 다시 건다.
 
 인계 사유 6종 중 앞의 5종(`no_evidence` · `missing_order_ref` · `order_not_found` · `sql_failed` · `llm_call_failed`)은
 **초안 생성에 진입하기 전**에 결정된다. 초안 전 인계라도 그때까지 모은 근거는 감사 목적으로 응답 `citations` 에 남는다.
