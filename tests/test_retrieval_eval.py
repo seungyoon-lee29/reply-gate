@@ -794,8 +794,13 @@ def test_리랭크는_후보_풀에서_골라_하이브리드와_다른_집합�
 
 
 class _CandidateEmbedder:
-    def __init__(self, dimensions: int) -> None:
+    def __init__(self, dimensions: int, model: str = "stub:candidate") -> None:
         self._dimensions = dimensions
+        self._model = model
+
+    @property
+    def model(self) -> str:
+        return self._model
 
     @property
     def dimensions(self) -> int:

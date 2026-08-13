@@ -682,6 +682,8 @@ class EvidenceCollector:
             query_vector=embedding.vectors[0],
             top_k=self._settings.vector_top_k,
             similarity_threshold=self._settings.vector_similarity_threshold,
+            embedding_model=self._embedder.model,
+            embedding_dimensions=self._embedder.dimensions,
         )
         ledger.evidence.extend(_policy_evidence(hit) for hit in hits)
 

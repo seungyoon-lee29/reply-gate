@@ -839,6 +839,36 @@ def test_API_키가_없으면_POST_는_503_이고_인계로_기록하지_않는�
     assert after["n"] == before["n"]
 
 
+@pytest.mark.db
+@pytest.mark.usefixtures("indexed_policies")
+def test_인덱스와_다른_모델로_질의하면_503_이고_인계로_기록하지_않는다(
+    app_conn: psycopg.Connection[DictRow], ro_conn: psycopg.Connection[DictRow]
+) -> None:
+    """낡은 정책 인덱스는 설정 오류다 — `no_evidence` 로 집계되면 재색인 누락이 검색 품질로 위장한다.
+
+    `indexed_policies` 는 기본 모델 이름으로 적재하고, 여기서는 다른 이름의 임베더로 질의한다.
+    차원은 같으므로 pgvector 는 아무 불평 없이 코사인을 계산해 줄 것이다 — 그래서 코드가 막는다.
+    """
+    before = app_conn.execute("SELECT count(*) AS n FROM inquiries").fetchone()
+    assert before is not None
+    pipeline = build_pipeline(
+        generation_client=cast(
+            GenerationClient, scripted_client({INTENT_STAGE: [intent_completion("policy")]})
+        ),
+        embedding_client=LexicalEmbeddingClient(dimensions=1536, model="다른-모델"),
+        settings=Settings(vector_top_k=5, vector_similarity_threshold=0.0, l2_enabled=False),
+    )
+
+    with service_client(pipeline=pipeline, app_conn=app_conn, ro_conn=ro_conn) as test_client:
+        response = test_client.post("/inquiries", json={"content": INQUIRY})
+
+    assert response.status_code == 503
+    assert "index_policies" in response.text
+    after = app_conn.execute("SELECT count(*) AS n FROM inquiries").fetchone()
+    assert after is not None
+    assert after["n"] == before["n"]
+
+
 # ── 판정 키가 없는 환경 (L2 켜짐 = POST 진입 선검사) ─────────────────────────
 #
 # lazy(L2 에 도달해서야 실패)로 하면 생성 토큰을 태운 뒤 503 이 나고, L1 이 2회 기각하면

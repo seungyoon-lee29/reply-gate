@@ -186,6 +186,36 @@ def test_policy_chunk_vector_dimension_matches_settings(
     assert column_type == f"vector({db_settings.embedding_dimensions})"
 
 
+def test_policy_chunk_embedding_provenance_is_not_optional(
+    app_conn: psycopg.Connection[DictRow],
+) -> None:
+    """출처 없는 벡터는 DB 가 받지 않는다 — 같은 차원의 다른 모델을 가릴 유일한 근거다."""
+    with pytest.raises(psycopg.errors.NotNullViolation):
+        app_conn.execute(
+            """INSERT INTO policy_chunks
+                   (evidence_id, document_slug, document_title, article, content)
+               VALUES ('policy:delivery:9.9', 'delivery', '배송 정책', '9.9', '조항 본문')"""
+        )
+    app_conn.rollback()
+    with pytest.raises(psycopg.errors.CheckViolation):
+        app_conn.execute(
+            """INSERT INTO policy_chunks
+                   (evidence_id, document_slug, document_title, article, content,
+                    embedding_model, embedding_dimensions)
+               VALUES ('policy:delivery:9.9', 'delivery', '배송 정책', '9.9', '조항 본문',
+                       '', 1536)"""
+        )
+    app_conn.rollback()
+    with pytest.raises(psycopg.errors.CheckViolation):
+        app_conn.execute(
+            """INSERT INTO policy_chunks
+                   (evidence_id, document_slug, document_title, article, content,
+                    embedding_model, embedding_dimensions)
+               VALUES ('policy:delivery:9.9', 'delivery', '배송 정책', '9.9', '조항 본문',
+                       'stub', 0)"""
+        )
+
+
 def test_policy_chunks_have_a_vector_index(app_conn: psycopg.Connection[DictRow]) -> None:
     assert (
         _scalar(
@@ -202,15 +232,17 @@ def test_policy_chunk_evidence_id_follows_the_contract(
     """`contracts.policy_evidence_id()` 형식을 DB 가 강제한다."""
     good = policy_evidence_id(document_slug="delivery", article="3.1")
     app_conn.execute(
-        """INSERT INTO policy_chunks (evidence_id, document_slug, document_title, article, content)
-           VALUES (%s, 'delivery', '배송 정책', '3.1', '조항 본문')""",
+        """INSERT INTO policy_chunks (evidence_id, document_slug, document_title, article, content,
+                                      embedding_model, embedding_dimensions)
+           VALUES (%s, 'delivery', '배송 정책', '3.1', '조항 본문', 'stub', 1536)""",
         (good,),
     )
     with pytest.raises(psycopg.errors.CheckViolation):
         app_conn.execute(
             """INSERT INTO policy_chunks
-                   (evidence_id, document_slug, document_title, article, content)
-               VALUES ('policy:wrong:9', 'refund', '환불 정책', '1.1', '조항 본문')"""
+                   (evidence_id, document_slug, document_title, article, content,
+                    embedding_model, embedding_dimensions)
+               VALUES ('policy:wrong:9', 'refund', '환불 정책', '1.1', '조항 본문', 'stub', 1536)"""
         )
 
 

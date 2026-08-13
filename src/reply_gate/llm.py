@@ -177,7 +177,16 @@ class GenerationClient(Protocol):
 
 
 class EmbeddingClient(Protocol):
-    """임베딩 클라이언트 계약 — 실제 구현과 테스트 대역이 공유한다."""
+    """임베딩 클라이언트 계약 — 실제 구현과 테스트 대역이 공유한다.
+
+    `model` 은 편의 정보가 아니라 **벡터의 출처**다. 저장된 벡터와 질의 벡터가 같은 공간에서
+    나왔는지는 차원만으로 알 수 없고(같은 차원의 다른 모델이 흔하다), 그 판정을 코드가
+    하려면 클라이언트가 자기 출처를 말할 수 있어야 한다
+    (`policy_index.search_policy_chunks`).
+    """
+
+    @property
+    def model(self) -> str: ...
 
     @property
     def dimensions(self) -> int: ...
@@ -517,6 +526,10 @@ class OpenAIEmbeddingClient:
         self._dimensions = dimensions
 
     @property
+    def model(self) -> str:
+        return self._model
+
+    @property
     def dimensions(self) -> int:
         return self._dimensions
 
@@ -577,6 +590,10 @@ class BgeM3EmbeddingClient:
                 )
             model = cast(_SentenceTransformerModel, model_type(self.MODEL, revision=self.REVISION))
         self._model = model
+
+    @property
+    def model(self) -> str:
+        return self.MODEL
 
     @property
     def dimensions(self) -> int:

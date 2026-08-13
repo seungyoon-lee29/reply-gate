@@ -234,6 +234,32 @@ L2 호출 실패(판정 안 됨)   bait 0/1 = recall 0.0   attempt_verdicts=['pa
 `UndefinedFunction: No operator matches the given name and argument types` 가 난다.
 `pgvector.Vector(list)` 로 감싸서 넘긴다.
 
+## 같은 차원의 다른 모델은 아무도 막지 않는다
+
+pgvector 는 **차원**이 다르면 거부한다 — 1536 컬럼에 3072 질의를 넣으면
+`DataException: different vector dimensions 1536 and 3072` 다. 그래서 차원 오류는 시끄럽다.
+
+**모델은 아니다.** `text-embedding-3-small` 과 `3-large` 는 둘 다 1536 을 낼 수 있고
+(이 저장소의 비교 축 `DEFAULT_EMBEDDING_CANDIDATES` 에 그 두 행이 나란히 있다),
+`EMBEDDING_MODEL` 만 바꾸고 `scripts.index_policies` 를 다시 돌리지 않으면 **다른 공간의
+벡터를 코사인으로 비교한다.** DB 도 pgvector 도 오류를 내지 않는다.
+
+실측한 결과는 "이상한 수치"가 아니라 **결과 0건**이었다. 다른 공간의 질의는 전 조항이
+임계값 아래로 떨어지고, 파이프라인은 그것을 정상 업무 판정인 `no_evidence` 로 기록한다 —
+운영 실수(재색인 누락)가 **검색 품질 지표로 위장**된다. 지표가 유일한 주장인 제품에서
+가장 나쁜 실패 모양이다.
+
+고친 방식: `policy_chunks` 가 `embedding_model`·`embedding_dimensions` 를 **NOT NULL 로**
+들고, `search_policy_chunks` 가 질의 출처를 인자로 받아 유사도 계산 **전에** 대조한다.
+불일치는 fail-closed 로 `PolicyIndexProvenanceError`(→ 503 설정 오류)다.
+
+세 가지가 이 설계의 이유다:
+- **확인을 호출자에게 맡기지 않는다.** 검색 함수 밖에 두면 새 호출자마다 다시 빠뜨릴 수 있고,
+  빠뜨린 결과가 오류처럼 보이지 않는다.
+- **전 행을 본다.** `ORDER BY … LIMIT k` 결과만 검사하면 상위 k 밖의 낡은 행을 놓친다.
+  적재가 도중에 끊겨 두 출처가 섞인 상태도 같은 검사에 걸린다.
+- **행 0개는 불일치가 아니다.** 적재 전과 다른 공간은 다른 상태다.
+
 ## DB 통합 테스트의 skip 은 정직해야 한다
 
 `db` 마커 테스트가 DB 없을 때 조용히 skip 되면, 전체 녹색이 아무것도 증명하지 않는다.

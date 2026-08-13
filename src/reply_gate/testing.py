@@ -32,10 +32,19 @@ class LexicalEmbeddingClient:
     한국어는 띄어쓰기가 의미 단위와 어긋나는 경우가 많아 공백 토큰 대신 문자 2-gram 을 쓴다.
     """
 
-    def __init__(self, *, dimensions: int = 1536) -> None:
+    #: 벡터 출처 이름. 대역도 출처를 밝혀야 실제 모델의 인덱스와 섞이지 않는다 —
+    #: 대역으로 적재한 DB 를 실제 모델로 검색하면 그 자체가 불일치로 걸린다.
+    MODEL = "stub:lexical-2gram"
+
+    def __init__(self, *, dimensions: int = 1536, model: str = MODEL) -> None:
         if dimensions <= 0:
             raise ValueError("dimensions 는 1 이상이어야 한다")
         self._dimensions = dimensions
+        self._model = model
+
+    @property
+    def model(self) -> str:
+        return self._model
 
     @property
     def dimensions(self) -> int:

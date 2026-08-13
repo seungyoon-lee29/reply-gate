@@ -54,20 +54,31 @@ CREATE INDEX IF NOT EXISTS orders_customer_phone_idx ON orders (customer_phone);
 -- 청킹 단위는 **조항**이다 (docs/architecture.md "구성요소 지도" 의 policy_index 행).
 -- 임베딩은 scripts.index_policies 가 채운다 — 여기서는
 -- 컬럼과 인덱스만 만든다. 차원 1536 은 `Settings.embedding_dimensions` 와 같아야 한다.
+--
+-- **벡터는 자기 출처를 함께 들고 있어야 한다.** 차원이 다르면 pgvector 가 거부하지만
+-- (`different vector dimensions`), **같은 차원의 다른 모델**은 아무도 막지 않는다 —
+-- `text-embedding-3-small`·`3-large` 는 둘 다 1536 을 낼 수 있다. 모델만 바꾸고 재색인하지
+-- 않으면 서로 다른 공간의 벡터를 코사인으로 비교하고, 그 결과는 오류가 아니라 **근거 없음**
+-- 으로 위장된다. `embedding_model`·`embedding_dimensions` 가 그 판정의 근거다
+-- (`policy_index.search_policy_chunks`).
 CREATE TABLE IF NOT EXISTS policy_chunks (
-    id              bigint GENERATED ALWAYS AS IDENTITY,
-    evidence_id     text   NOT NULL,
-    document_slug   text   NOT NULL,
-    document_title  text   NOT NULL,
-    article         text   NOT NULL,
-    article_title   text,
-    content         text   NOT NULL,
-    embedding       vector(1536),
-    created_at      timestamptz NOT NULL DEFAULT now(),
+    id                   bigint GENERATED ALWAYS AS IDENTITY,
+    evidence_id          text   NOT NULL,
+    document_slug        text   NOT NULL,
+    document_title       text   NOT NULL,
+    article              text   NOT NULL,
+    article_title        text,
+    content              text   NOT NULL,
+    embedding            vector(1536),
+    embedding_model      text   NOT NULL,
+    embedding_dimensions integer NOT NULL,
+    created_at           timestamptz NOT NULL DEFAULT now(),
 
     CONSTRAINT policy_chunks_pkey PRIMARY KEY (id),
     CONSTRAINT policy_chunks_evidence_id_key UNIQUE (evidence_id),
     CONSTRAINT policy_chunks_document_article_key UNIQUE (document_slug, article),
+    CONSTRAINT policy_chunks_embedding_model_nonempty CHECK (embedding_model <> ''),
+    CONSTRAINT policy_chunks_embedding_dimensions_positive CHECK (embedding_dimensions > 0),
     -- `reply_gate.contracts.policy_evidence_id()` 의 정의를 DB 가 강제한다.
     CONSTRAINT policy_chunks_evidence_id_shape CHECK (
         evidence_id = 'policy:' || document_slug || ':' || article

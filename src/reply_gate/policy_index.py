@@ -36,6 +36,7 @@ __all__ = [
     "PlantedKind",
     "PolicyChunk",
     "PolicyDocument",
+    "PolicyIndexProvenanceError",
     "PolicySearchHit",
     "index_policy_documents",
     "load_policy_documents",
@@ -52,6 +53,15 @@ POLICY_INDEX_STAGE = "policy_index"
 _FRONT_MATTER = re.compile(r"\A---\n(?P<body>.*?)\n---\n", re.DOTALL)
 _PLANTED = re.compile(r"<!--\s*planted:\s*(?P<kind>[a-z_]+)\s*(?:;\s*note:\s*(?P<note>.*?))?-->")
 _HEADING = re.compile(r"^##\s+(?P<article>\S+)\s+(?P<title>.+?)\s*$")
+
+
+class PolicyIndexProvenanceError(RuntimeError):
+    """저장된 벡터가 질의 임베딩과 다른 공간에서 나왔다 — 재색인 없이는 비교가 성립하지 않는다.
+
+    **인계 사유가 아니라 설정 오류다.** `no_evidence` 로 바꾸면 "검색이 못 찾았다"로 집계되어
+    낡은 인덱스가 검색 품질 지표로 위장한다(docs/standards.md "오류를 업무 판정으로
+    바꾸지 않는다").
+    """
 
 
 class PlantedKind(StrEnum):
@@ -227,10 +237,18 @@ def index_policy_documents(
     documents: Sequence[PolicyDocument],
     embedder: EmbeddingClient,
 ) -> IndexResult:
-    """조항을 임베딩해 `policy_chunks` 에 적재한다. 재실행하면 중복 없이 갱신된다."""
+    """조항을 임베딩해 `policy_chunks` 에 적재한다. 재실행하면 중복 없이 갱신된다.
+
+    벡터와 **함께 그 벡터를 만든 모델·차원을 적는다** — 나중에 질의 임베딩이 같은 공간에서
+    나왔는지 판정할 근거가 이것뿐이다.
+    """
     chunks = _all_chunks(documents)
     if embedder.dimensions <= 0:
         raise ValueError("임베딩 차원은 1 이상이어야 한다")
+    if not embedder.model.strip():
+        raise ValueError(
+            "임베딩 모델 이름이 비어 있다 — 출처를 적을 수 없는 벡터는 적재하지 않는다"
+        )
 
     embedding = embedder.embed(
         stage=POLICY_INDEX_STAGE, texts=[chunk.embedding_text for chunk in chunks]
@@ -247,15 +265,17 @@ def index_policy_documents(
                 """
                 INSERT INTO policy_chunks
                     (evidence_id, document_slug, document_title, article, article_title,
-                     content, embedding)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                     content, embedding, embedding_model, embedding_dimensions)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (evidence_id) DO UPDATE SET
-                    document_slug  = EXCLUDED.document_slug,
-                    document_title = EXCLUDED.document_title,
-                    article        = EXCLUDED.article,
-                    article_title  = EXCLUDED.article_title,
-                    content        = EXCLUDED.content,
-                    embedding      = EXCLUDED.embedding
+                    document_slug        = EXCLUDED.document_slug,
+                    document_title       = EXCLUDED.document_title,
+                    article              = EXCLUDED.article,
+                    article_title        = EXCLUDED.article_title,
+                    content              = EXCLUDED.content,
+                    embedding            = EXCLUDED.embedding,
+                    embedding_model      = EXCLUDED.embedding_model,
+                    embedding_dimensions = EXCLUDED.embedding_dimensions
                 """,
                 (
                     chunk.evidence_id,
@@ -265,6 +285,8 @@ def index_policy_documents(
                     chunk.article_title,
                     chunk.content,
                     vector,
+                    embedder.model,
+                    embedder.dimensions,
                 ),
             )
         # 문서에서 사라진 조항은 남겨두면 존재하지 않는 근거를 검색이 돌려주게 된다.
@@ -281,23 +303,70 @@ def index_policy_documents(
     )
 
 
+def _assert_index_provenance(
+    cur: psycopg.Cursor[DictRow], *, embedding_model: str, embedding_dimensions: int
+) -> None:
+    """저장된 벡터가 전부 질의와 같은 공간에서 나왔는지 확인한다 — 아니면 거부한다.
+
+    검색 자체는 거부하지 않는다: 차원이 같으면 pgvector 가 코사인을 계산해 주고, 그 값은
+    **오류처럼 보이지 않는다.** 실측에서 다른 모델의 질의는 전 조항이 임계값 아래로 떨어져
+    `no_evidence` 로 끝났다 — 낡은 인덱스가 "검색이 못 찾았다"로 위장한 것이다.
+
+    적재 전(행 0개)은 불일치가 아니다. 검색할 것이 없으면 빈 결과와 같다.
+    """
+    cur.execute(
+        """
+        SELECT embedding_model, embedding_dimensions, count(*) AS n
+        FROM policy_chunks
+        GROUP BY embedding_model, embedding_dimensions
+        ORDER BY embedding_model, embedding_dimensions
+        """
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return
+    if len(rows) == 1 and (
+        rows[0]["embedding_model"] == embedding_model
+        and int(rows[0]["embedding_dimensions"]) == embedding_dimensions
+    ):
+        return
+    stored = ", ".join(
+        f"{row['embedding_model']}/{int(row['embedding_dimensions'])}차원 {int(row['n'])}건"
+        for row in rows
+    )
+    raise PolicyIndexProvenanceError(
+        f"정책 인덱스의 임베딩 출처가 질의와 다르다 — 저장: {stored}, "
+        f"질의: {embedding_model}/{embedding_dimensions}차원. "
+        "`uv run python -m scripts.index_policies` 로 재색인해야 한다."
+    )
+
+
 def search_policy_chunks(
     *,
     conn: psycopg.Connection[DictRow],
     query_vector: Sequence[float],
     top_k: int,
     similarity_threshold: float,
+    embedding_model: str,
+    embedding_dimensions: int,
 ) -> list[PolicySearchHit]:
     """문의 임베딩과 코사인 유사도가 높은 조항 상위 k 개.
 
     **임계값 미만 결과는 버린다** (docs/architecture.md "대표 흐름" 3단계) — 관련 없는 조항을 근거로
     올리면 초안이 그 위에 문장을 세우고 게이트가 잡아야 할 일이 늘어난다.
+
+    **질의 임베딩의 출처를 함께 받는다.** 저장된 벡터와 다른 공간이면 유사도를 계산하지
+    않고 거부한다(fail-closed) — 이 확인을 호출자에게 맡기면 새 호출자가 생길 때마다 다시
+    빠뜨릴 수 있고, 빠뜨린 결과는 오류가 아니라 정상 판정처럼 보인다.
     """
     if top_k <= 0:
         return []
     register_vector(conn)
     vector = Vector(list(query_vector))
     with conn.cursor() as cur:
+        _assert_index_provenance(
+            cur, embedding_model=embedding_model, embedding_dimensions=embedding_dimensions
+        )
         cur.execute(
             """
             SELECT evidence_id, document_slug, document_title, article, article_title,

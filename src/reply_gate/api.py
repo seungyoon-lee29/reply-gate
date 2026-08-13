@@ -72,6 +72,7 @@ from reply_gate.pipeline import (
     build_pipeline,
     new_inquiry_id,
 )
+from reply_gate.policy_index import PolicyIndexProvenanceError
 from reply_gate.records import load_inquiry, save_inquiry
 
 __all__ = [
@@ -386,11 +387,15 @@ class _LazyGenerationClient:
 
 
 class _LazyEmbeddingClient:
-    """`EmbeddingClient` 의 지연 생성판. `dimensions` 는 설정만으로 답한다."""
+    """`EmbeddingClient` 의 지연 생성판. `model`·`dimensions` 는 설정만으로 답한다."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._client: EmbeddingClient | None = None
+
+    @property
+    def model(self) -> str:
+        return self._settings.embedding_model
 
     @property
     def dimensions(self) -> int:
@@ -439,6 +444,17 @@ ServiceDep = Annotated[InquiryService, Depends(get_service)]
 @app.exception_handler(MissingCredentialsError)
 def missing_credentials_handler(request: Request, exc: Exception) -> JSONResponse:
     """설정 오류는 503 — 처리 기록을 남기지 않는다 (인계로 집계되면 지표가 오염된다)."""
+    del request
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+
+@app.exception_handler(PolicyIndexProvenanceError)
+def stale_policy_index_handler(request: Request, exc: Exception) -> JSONResponse:
+    """낡은 정책 인덱스도 **설정 오류(503)** 다 — 자격 증명 부재와 같은 계열이다.
+
+    `no_evidence` 인계로 바꾸면 "검색이 못 찾았다"로 집계되어, 재색인을 빠뜨린 운영 실수가
+    검색 품질 지표로 위장한다. 처리 기록은 커넥션 롤백으로 남지 않는다.
+    """
     del request
     return JSONResponse(status_code=503, content={"detail": str(exc)})
 

@@ -77,6 +77,10 @@ uv run python -m scripts.seed_orders
 > (`judge_input_tokens`·`judge_output_tokens`)이 추가됐다. **이전 사이클의 볼륨을 그대로 쓰면
 > 이 컬럼들이 없어 저장이 실패한다.** 위 볼륨 재생성을 반드시 한 번 실행한 뒤 5단계(정책
 > 인덱싱)를 다시 돌린다 — 볼륨을 지우면 정책 청크도 함께 사라진다.
+>
+> **이번 사이클에도 스키마가 바뀌었다** — `policy_chunks` 에 임베딩 출처 컬럼
+> (`embedding_model`·`embedding_dimensions`, 둘 다 NOT NULL)이 추가됐다. 이전 볼륨을 그대로
+> 쓰면 정책 적재가 NOT NULL 위반으로 실패한다. 같은 볼륨 재생성 절차를 한 번 더 돌린다.
 
 ## 5. 정책 인덱싱 — **API 키 필요**
 
@@ -87,6 +91,12 @@ uv run python -m scripts.index_policies
 `data/policies/` 의 문서 4개를 조항 단위로 쪼개 임베딩하고 `policy_chunks` 에 적재한다(26건).
 재실행하면 중복 없이 갱신되고, 문서에서 사라진 조항은 삭제된다.
 **이 단계를 건너뛰면 정책 근거 검색이 항상 0건이라 모든 문의가 `no_evidence` 로 인계된다.**
+
+**`EMBEDDING_MODEL`·`EMBEDDING_DIMENSIONS` 를 바꿨으면 이 단계를 반드시 다시 돌린다.**
+적재된 벡터는 자기 출처를 함께 들고 있고, 질의 임베딩의 출처와 다르면 검색이 유사도를 내지
+않고 **503** 으로 거부한다. 재색인 없이 모델만 바꾸면 서로 다른 공간을 비교하게 되는데,
+그 결과는 오류가 아니라 "근거 없음"처럼 보인다
+(docs/engineering-notes.md "같은 차원의 다른 모델은 아무도 막지 않는다").
 
 ## 6. 서버 기동
 
