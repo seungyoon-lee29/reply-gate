@@ -112,6 +112,10 @@ class LLMFormatError(ValueError):
     원문(`raw_text`)과 토큰 사용량을 함께 실어 보낸다 — 초안 생성은 재시도하지 않고
     이 산출을 그대로 L1 에 넘겨 `schema_violation` 으로 판정시키기 때문이다
     (docs/standards.md "재시도 상한").
+
+    `transport_attempts` 는 이 형식 오류가 나오기까지 **실제로 나간 전송 수**다. 형식 루프를
+    도는 호출자(판정·의도 해석)가 토큰과 **같은 이유로** 누적해야 하는 값이다 — 앞선 시도의
+    비용을 세면서 그 시도가 있었다는 사실을 세지 않으면 기록과 실제가 갈린다.
     """
 
     def __init__(
@@ -122,6 +126,7 @@ class LLMFormatError(ValueError):
         raw_text: str = "",
         input_tokens: int = 0,
         output_tokens: int = 0,
+        transport_attempts: int = 1,
     ) -> None:
         super().__init__(f"구조화 출력 형식 불일치 (stage={stage}): {detail}")
         self.stage = stage
@@ -129,15 +134,22 @@ class LLMFormatError(ValueError):
         self.raw_text = raw_text
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
+        self.transport_attempts = transport_attempts
 
 
 @dataclass(frozen=True)
 class JsonCompletion:
-    """구조화 출력 1건 + 토큰 사용량."""
+    """구조화 출력 1건 + 토큰 사용량.
+
+    `transport_attempts` 는 이 산출을 얻기까지 실제로 나간 전송 수다(전송 오류 재시도 포함).
+    성공한 호출에도 싣는 이유는 형식 루프가 **성공한 시도의 전송까지** 세어야 하기 때문이다 —
+    1차가 200/비 JSON 이고 2차가 전송 실패면 실제 전송은 3회다.
+    """
 
     data: Any
     input_tokens: int
     output_tokens: int
+    transport_attempts: int = 1
 
 
 @dataclass(frozen=True)
@@ -187,16 +199,19 @@ def _call_with_one_retry[T](
     call: Callable[[], T],
     is_transport_error: Callable[[Exception], bool],
     is_api_error: Callable[[Exception], bool],
-) -> T:
-    """전송 오류면 1회 재시도, 재실패하면 `LLMCallError`.
+) -> tuple[T, int]:
+    """전송 오류면 1회 재시도, 재실패하면 `LLMCallError`. 결과와 **실제 전송 수**를 돌려준다.
 
     전송 오류가 아닌 API 오류(4xx 등)는 재시도해도 결과가 같으므로 즉시 실패시킨다.
     두 경우 모두 호출자에게는 `LLMCallError` 로 보여 인계 사유가 `llm_call_failed` 로 통일된다.
+
+    전송 수를 **세어서** 돌려주는 이유: 이 값을 상수(`MAX_ATTEMPTS`)로 되읽으면 "몇 번 돌았나"가
+    아니라 "몇 번까지 돌 수 있나"를 신고하게 된다. 호출자가 형식 루프를 돌면 그 차이가 누적된다.
     """
     last: Exception | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            return call()
+            return call(), attempt
         except Exception as exc:
             if is_transport_error(exc):
                 last = exc
@@ -212,9 +227,13 @@ def _call_with_one_retry[T](
 
 
 def _parse_json_completion(
-    *, stage: str, text: str, input_tokens: int, output_tokens: int
+    *, stage: str, text: str, input_tokens: int, output_tokens: int, transport_attempts: int = 1
 ) -> JsonCompletion:
-    """구조화 출력 원문을 파싱한다 — 빈 응답·비 JSON 은 `LLMFormatError` (양 래퍼 공통)."""
+    """구조화 출력 원문을 파싱한다 — 빈 응답·비 JSON 은 `LLMFormatError` (양 래퍼 공통).
+
+    성공하든 형식 오류든 **실제 전송 수를 그대로 실어 보낸다** — 형식 루프를 도는 호출자가
+    토큰과 같은 자격으로 누적한다.
+    """
     if not text.strip():
         raise LLMFormatError(
             stage=stage,
@@ -222,6 +241,7 @@ def _parse_json_completion(
             raw_text=text,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            transport_attempts=transport_attempts,
         )
     try:
         data = json.loads(text)
@@ -232,8 +252,14 @@ def _parse_json_completion(
             raw_text=text,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            transport_attempts=transport_attempts,
         ) from exc
-    return JsonCompletion(data=data, input_tokens=input_tokens, output_tokens=output_tokens)
+    return JsonCompletion(
+        data=data,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        transport_attempts=transport_attempts,
+    )
 
 
 def _is_openai_transport_error(exc: Exception) -> bool:
@@ -320,7 +346,7 @@ class OpenAIGenerationClient:
             # `**request` 로 넘기면 오버로드 추론이 풀려 Any 가 되므로 반환 타입을 고정한다.
             return cast(Response, self._client.responses.create(**request))
 
-        response = _call_with_one_retry(
+        response, sent = _call_with_one_retry(
             stage=stage,
             call=_call,
             is_transport_error=_is_openai_transport_error,
@@ -338,14 +364,19 @@ class OpenAIGenerationClient:
             raise LLMCallError(
                 stage=stage,
                 reason="refusal",
-                attempts=1,
+                # 실측이다. 1차가 전송 오류로 실패하고 2차가 200+거절이면 전송은 2회다.
+                attempts=sent,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
             )
 
         text = response.output_text or ""
         return _parse_json_completion(
-            stage=stage, text=text, input_tokens=input_tokens, output_tokens=output_tokens
+            stage=stage,
+            text=text,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            transport_attempts=sent,
         )
 
 
@@ -423,7 +454,7 @@ class AnthropicGenerationClient:
             # `**request` 로 넘기면 오버로드 추론이 풀려 Any 가 되므로 반환 타입을 고정한다.
             return cast(Message, self._client.messages.create(**request))
 
-        response = _call_with_one_retry(
+        response, sent = _call_with_one_retry(
             stage=stage,
             call=_call,
             is_transport_error=_is_anthropic_transport_error,
@@ -441,7 +472,8 @@ class AnthropicGenerationClient:
             raise LLMCallError(
                 stage=stage,
                 reason="refusal",
-                attempts=1,
+                # 실측이다. 1차가 전송 오류로 실패하고 2차가 200+거절이면 전송은 2회다.
+                attempts=sent,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
             )
@@ -457,7 +489,11 @@ class AnthropicGenerationClient:
             "",
         )
         return _parse_json_completion(
-            stage=stage, text=text, input_tokens=input_tokens, output_tokens=output_tokens
+            stage=stage,
+            text=text,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            transport_attempts=sent,
         )
 
 
@@ -497,7 +533,7 @@ class OpenAIEmbeddingClient:
                 dimensions=self._dimensions,
             )
 
-        response = _call_with_one_retry(
+        response, _ = _call_with_one_retry(
             stage=stage,
             call=_call,
             is_transport_error=_is_openai_transport_error,

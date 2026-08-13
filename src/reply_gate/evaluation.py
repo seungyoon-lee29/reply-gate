@@ -2489,8 +2489,13 @@ class StubGenerationClient:
 
 @dataclass(frozen=True)
 class _StubCompletion:
-    """`llm.JsonCompletion` 과 같은 모양의 대역 산출 (llm 모듈을 import 하지 않기 위해)."""
+    """`llm.JsonCompletion` 과 같은 모양의 대역 산출 (llm 모듈을 import 하지 않기 위해).
+
+    `transport_attempts` 는 대역이라 항상 1 이다 — 전송이 없으니 전송 수도 1회분으로 센다.
+    모양을 맞추지 않으면 형식 루프가 이 값을 읽는 자리에서 대역만 터진다(실제로 그랬다).
+    """
 
     data: Any
     input_tokens: int
     output_tokens: int
+    transport_attempts: int = 1

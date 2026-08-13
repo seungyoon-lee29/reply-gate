@@ -250,6 +250,46 @@ def test_거절_응답은_사용가능한_산출이_없으므로_실패다() -> 
     assert (excinfo.value.input_tokens, excinfo.value.output_tokens) == (11, 7)
 
 
+# ── attempts 는 상수가 아니라 실측이다 ─────────────────────────────────────
+
+
+def test_전송_수는_상수가_아니라_실제로_나간_횟수다() -> None:
+    """성공한 산출에도 실린다 — 형식 루프를 도는 호출자가 이 값을 누적하기 때문이다."""
+    once, _ = _generation_client([_response(json.dumps({"intent": "policy"}))])
+    twice, calls = _generation_client(
+        [_connection_error(), _response(json.dumps({"intent": "policy"}))]
+    )
+
+    assert once.complete_json(stage="intent", system="s", user="u", schema=SCHEMA)
+    assert (
+        once.complete_json(stage="intent", system="s", user="u", schema=SCHEMA).transport_attempts
+        == 1
+    )
+    result = twice.complete_json(stage="intent", system="s", user="u", schema=SCHEMA)
+    assert result.transport_attempts == len(calls.calls) == 2
+
+
+def test_형식오류에도_그때까지_나간_전송_수가_실린다() -> None:
+    """1차 전송 실패 뒤 2차가 비 JSON 이면 전송은 2회다 — 호출자가 이어 세야 한다."""
+    client, calls = _generation_client([_connection_error(), _response("이건 JSON 이 아니다")])
+
+    with pytest.raises(LLMFormatError) as excinfo:
+        client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
+
+    assert excinfo.value.transport_attempts == len(calls.calls) == 2
+
+
+def test_거절_경로의_attempts_도_실측이다() -> None:
+    """구 코드는 `attempts=1` 하드코딩이라, 재시도 뒤에 온 거절이 1회로 신고됐다."""
+    client, calls = _generation_client([_connection_error(), _response("", refusal="정책상 불가")])
+
+    with pytest.raises(LLMCallError) as excinfo:
+        client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
+
+    assert excinfo.value.reason == "refusal"
+    assert excinfo.value.attempts == len(calls.calls) == 2
+
+
 def test_형식오류는_재시도하지_않고_호출자에게_위임한다() -> None:
     client, responses = _generation_client([_response("이건 JSON 이 아니다")])
 

@@ -204,6 +204,31 @@ def test_전송_오류는_재시도하지_않고_그대로_올린다() -> None:
     assert len(client.calls_for(INTENT_STAGE)) == 1
 
 
+def test_형식_실패_뒤_전송_오류면_앞선_전송까지_세어_올린다() -> None:
+    """토큰은 누적하면서 횟수만 버리면 '1회 재시도'라고 적힌 기록이 실제와 갈린다.
+
+    1차 시도가 형식 오류(전송 1회) + 2차 시도가 전송 오류(래퍼가 2회 전송) = 실제 3회.
+    """
+    broken = LLMFormatError(
+        stage=INTENT_STAGE,
+        detail="형식 불일치",
+        input_tokens=7,
+        output_tokens=1,
+        transport_attempts=1,
+    )
+    died = LLMCallError(
+        stage=INTENT_STAGE, reason="transport_error", attempts=2, input_tokens=3, output_tokens=0
+    )
+    client = _client({INTENT_STAGE: [broken, died]})
+
+    with pytest.raises(LLMCallError) as excinfo:
+        classify_intent(client=cast(GenerationClient, client), inquiry=INQUIRY)
+
+    assert excinfo.value.attempts == 3
+    # 토큰 누적은 원래도 맞았다 — 같은 자리에서 횟수만 빠져 있었다.
+    assert (excinfo.value.input_tokens, excinfo.value.output_tokens) == (10, 1)
+
+
 # ── SQL 생성 (DB 불필요) ────────────────────────────────────────────────────
 
 

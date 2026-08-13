@@ -452,6 +452,9 @@ class Judge:
         """
         input_tokens = 0
         output_tokens = 0
+        # 실제로 나간 전송 수. **토큰과 같은 이유로 버리지 않는다** — 앞선 형식 실패의
+        # 비용을 세면서 그 시도가 있었다는 사실을 세지 않으면 기록과 실제가 갈린다.
+        sent = 0
         error: str | None = None
         previous_output: str | None = None
 
@@ -467,6 +470,7 @@ class Judge:
             except LLMFormatError as exc:
                 input_tokens += exc.input_tokens
                 output_tokens += exc.output_tokens
+                sent += exc.transport_attempts
                 error = exc.detail
                 previous_output = exc.raw_text or None
                 continue
@@ -477,7 +481,7 @@ class Judge:
                 raise LLMCallError(
                     stage=exc.stage,
                     reason=exc.reason,
-                    attempts=exc.attempts,
+                    attempts=sent + exc.attempts,
                     cause=exc.cause,
                     input_tokens=input_tokens + exc.input_tokens,
                     output_tokens=output_tokens + exc.output_tokens,
@@ -485,6 +489,8 @@ class Judge:
 
             input_tokens += completion.input_tokens
             output_tokens += completion.output_tokens
+            # `_ParseError` 로 continue 하는 경로에서도 이 전송은 이미 나갔다.
+            sent += completion.transport_attempts
             try:
                 result = _parse_judge_result(completion.data, draft=draft, evidence=evidence)
             except _ParseError as exc:
@@ -504,4 +510,5 @@ class Judge:
             raw_text=previous_output or "",
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            transport_attempts=sent,
         )

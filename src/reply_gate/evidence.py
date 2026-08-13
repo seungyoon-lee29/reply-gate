@@ -253,6 +253,8 @@ def classify_intent(
     """필요한 근거 소스를 분류한다. 형식 불일치는 **코드가 1회만** 재시도한다."""
     input_tokens = 0
     output_tokens = 0
+    # 실제로 나간 전송 수 — 토큰과 같은 이유로 버리지 않는다(`judge.Judge.judge` 와 같은 형태).
+    sent = 0
     error: str | None = None
     previous_output: str | None = None
 
@@ -275,6 +277,7 @@ def classify_intent(
         except LLMFormatError as exc:
             input_tokens += exc.input_tokens
             output_tokens += exc.output_tokens
+            sent += exc.transport_attempts
             error = exc.detail
             previous_output = exc.raw_text or None
             continue
@@ -285,7 +288,7 @@ def classify_intent(
             raise LLMCallError(
                 stage=exc.stage,
                 reason=exc.reason,
-                attempts=exc.attempts,
+                attempts=sent + exc.attempts,
                 cause=exc.cause,
                 input_tokens=input_tokens + exc.input_tokens,
                 output_tokens=output_tokens + exc.output_tokens,
@@ -293,6 +296,7 @@ def classify_intent(
 
         input_tokens += completion.input_tokens
         output_tokens += completion.output_tokens
+        sent += completion.transport_attempts
         source = _parse_intent(completion.data)
         if source is not None:
             return IntentResult(
@@ -330,6 +334,9 @@ class SqlGenerationResult:
     input_tokens: int
     output_tokens: int
     error: str | None
+    #: 이 1회 호출에서 실제로 나간 전송 수. 형식 오류로 SQL 을 못 얻어도 전송은 나갔다 —
+    #: 재시도 루프가 토큰과 같은 자격으로 누적한다.
+    transport_attempts: int = 1
 
 
 def _extract_sql(data: object) -> str | None:
@@ -376,6 +383,7 @@ def generate_sql(
             input_tokens=exc.input_tokens,
             output_tokens=exc.output_tokens,
             error=f"구조화 출력 형식 불일치: {exc.detail}",
+            transport_attempts=exc.transport_attempts,
         )
 
     sql = _extract_sql(completion.data)
@@ -384,6 +392,7 @@ def generate_sql(
         input_tokens=completion.input_tokens,
         output_tokens=completion.output_tokens,
         error=None if sql is not None else "유효한 SQL 문자열을 얻지 못했다",
+        transport_attempts=completion.transport_attempts,
     )
 
 
@@ -565,6 +574,9 @@ class _Ledger:
     input_tokens: int = 0
     output_tokens: int = 0
     embedding_tokens: int = 0
+    #: SQL 생성 루프에서 실제로 나간 전송 수. 전송 오류가 루프 중간에 터지면
+    #: `LLMCallError.attempts` 가 이 값을 이어받아야 기록과 실제가 같아진다.
+    sql_transport_attempts: int = 0
 
 
 # ── 수집기 ──────────────────────────────────────────────────────────────────
@@ -721,17 +733,31 @@ class EvidenceCollector:
         previous_error: str | None = None
 
         for attempt in range(1, SQL_MAX_ATTEMPTS + 1):
-            generation = generate_sql(
-                client=self._client,
-                inquiry=content,
-                order_no=order_no,
-                max_rows=max_rows,
-                previous_sql=previous_sql,
-                previous_error=previous_error,
-                effort=self._settings.generation_effort,
-            )
+            try:
+                generation = generate_sql(
+                    client=self._client,
+                    inquiry=content,
+                    order_no=order_no,
+                    max_rows=max_rows,
+                    previous_sql=previous_sql,
+                    previous_error=previous_error,
+                    effort=self._settings.generation_effort,
+                )
+            except LLMCallError as exc:
+                # 앞선 시도에서 이미 나간 전송을 이어 센다 — 토큰을 원장에 누적하면서
+                # 횟수만 버리면 "1회 재시도"라고 적힌 기록이 실제와 갈린다
+                # (`classify_intent`·`judge.Judge.judge` 와 같은 형태).
+                raise LLMCallError(
+                    stage=exc.stage,
+                    reason=exc.reason,
+                    attempts=ledger.sql_transport_attempts + exc.attempts,
+                    cause=exc.cause,
+                    input_tokens=exc.input_tokens,
+                    output_tokens=exc.output_tokens,
+                ) from exc
             ledger.input_tokens += generation.input_tokens
             ledger.output_tokens += generation.output_tokens
+            ledger.sql_transport_attempts += generation.transport_attempts
 
             if generation.sql is None:
                 previous_sql = None

@@ -385,6 +385,9 @@ def test_형식_실패_뒤_전송_오류는_누적_토큰을_실어_전파한다
     assert excinfo.value.stage == JUDGE_STAGE
     assert excinfo.value.reason == "transport_error"
     assert (excinfo.value.input_tokens, excinfo.value.output_tokens) == (30, 5)
+    # **횟수도 같은 자격으로 누적한다.** 앞선 형식 실패의 전송 1회 + 래퍼가 센 2회 = 3회.
+    # 구 코드는 `attempts=exc.attempts` 라, 비용은 세면서 그 시도가 있었다는 사실은 버렸다.
+    assert excinfo.value.attempts == 3
     # 원본 예외는 원인으로 남는다 — 새로 던지는 것은 토큰을 싣기 위해서다.
     assert excinfo.value.__cause__ is transport_error
 
