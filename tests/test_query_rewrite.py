@@ -197,12 +197,16 @@ def test_명시적으로_끄면_클라이언트_없이도_조립된다() -> None
     assert collector is not None
 
 
-def test_제품_기본값은_재작성_켜짐과_컷_0_50_이다() -> None:
-    """둘은 한 짝이다 — 재작성 없이 컷만 0.50 이면 recall 이 0.880 → 0.640 으로 무너진다."""
+def test_제품_기본값은_재작성_켜짐과_컷_0_30_이다() -> None:
+    """T10 이 두 축을 갈랐다 — 재작성은 실측이 정당화하고 컷 0.50 은 반증됐다.
+
+    컷 0.50 은 무근거 4건을 기권시키는 대신 G04 의 정답 조항(0.3571)과 G18 의 상충 조항
+    (0.4676)을 함께 잘라 정상 문의를 인계시키고 L2 모순 기각을 없앴다. 둘 다 0.30 위다.
+    """
     settings = Settings()
 
     assert settings.query_rewrite_enabled is True
-    assert settings.vector_similarity_threshold == 0.5
+    assert settings.vector_similarity_threshold == 0.3
 
 
 # ── 합집합 합침 규칙 (순수 함수) ────────────────────────────────────────────
