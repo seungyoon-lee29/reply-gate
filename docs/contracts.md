@@ -109,9 +109,14 @@ pass 이고 **L2 가 실행됐다면** L2 도 pass. 층별 내역은 두 키로 
   대응한다**. 각 항목은 `{claim_text, verdict, explanation}` 이고, `claim_text` 는 답변
   계약의 claim 에 별도 ID 가 없어 text 로 가리키는 참조다.
   **짝짓기는 `claim_text` 로 한다 — 배열 위치는 계약이 아니다.** fail-closed 검증기가
-  강제하는 것은 초안 claim 집합과의 완전 대응과 중복 없음까지이고(`judge._parse_claim_judgments`),
+  강제하는 것은 초안 claim 과의 **개수까지 포함한** 완전 대응이고(`judge._parse_claim_judgments`),
   배열 순서는 프롬프트가 요청할 뿐 거부 사유가 아니다. 위치로 짝지으면 "어느 문장이 왜
   기각됐는지"가 다른 claim 에 붙을 수 있다.
+  **개수까지 보는 이유**: 초안은 LLM 산출이라 claim 의 text 가 유일하다는 보장이 없고, 같은
+  문장이 두 번 들어오면 두 claim 의 `citation_ids` 는 다를 수 있다. 집합으로만 대조하면
+  판정 1건이 claim 2건을 덮어도 통과하고(판정받지 못한 문장이 답변에 실린다), 반대로 판정을
+  정직하게 2건 낸 옳은 산출이 "중복"으로 거부된다. 그래서 **같은 문장이 N번이면 판정도 N번**
+  이고, 프롬프트가 이 규칙을 명시한다.
 - 인계된 문의는 최상위 `claims` 가 `[]` 여도 이 배열은 **기각된 초안의** claim 을 담는다 —
   두 배열을 서로 짝지으면 안 된다.
 - `l2.contradictions` 는 **근거쌍 단위** 기록 `{evidence_id_a, evidence_id_b, explanation}` 이다.

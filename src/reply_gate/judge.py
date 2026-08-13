@@ -37,6 +37,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final
@@ -158,6 +159,8 @@ JUDGE_SYSTEM_PROMPT: Final = """\
 - verdict 는 reject_reasons 가 비어 있으면 "pass", 하나라도 있으면 "reject" 다.
 - claim_judgments 에는 초안의 claim **전부**를(통과한 claim 포함) 순서대로 넣고, claim_text 는
   초안의 문장을 글자 그대로 쓴다. explanation 은 한국어로 짧게 쓴다.
+  **개수가 claim 목록과 정확히 같아야 한다** — 같은 문장이 claim 목록에 두 번 나오면 판정도
+  두 번 낸다. 인용 근거가 claim 마다 다를 수 있어 판정도 달라질 수 있다.
 - contradictions 의 evidence_id 는 수집 근거 목록의 ID 를 글자 그대로 쓴다.
 
 산출은 다음 형태의 JSON 이다:
@@ -251,7 +254,19 @@ def _require_items(value: object, *, field: str) -> Sequence[object]:
 
 
 def _parse_claim_judgments(value: object, *, draft: Draft) -> tuple[ClaimJudgment, ...]:
-    """claim 판정 배열 — 초안의 claim 전부와 1:1 로 대응해야 한다(통과한 claim 포함)."""
+    """claim 판정 배열 — 초안의 claim 전부와 1:1 로 대응해야 한다(통과한 claim 포함).
+
+    **대조는 집합이 아니라 다중집합(개수 포함)으로 한다.** 초안 claim 의 text 가 유일하다는
+    보장이 없기 때문이다 — 초안은 LLM 산출이고 같은 문장이 두 번 들어올 수 있으며, 그때
+    두 claim 의 `citation_ids` 는 다를 수 있다(한쪽은 뒷받침되고 한쪽은 아닌 경우가 실제
+    시나리오다). 집합으로 대조하면 두 방향으로 다 틀렸다:
+
+    * 판정 1건이 claim 2건을 덮어도 **통과** — 판정받지 못한 claim 이 답변에 실린다.
+    * 판정 2건을 정직하게 낸 **옳은 산출이 "중복"으로 거부** — 모델이 맞게 답할 길이 없었다.
+
+    개수까지 맞추면 둘 다 닫힌다. 짝짓기는 여전히 `claim_text` 로 한다 — 배열 위치를 계약으로
+    올리지 않는다(docs/contracts.md "층별 판정 키").
+    """
     judgments: list[ClaimJudgment] = []
     for position, item in enumerate(_require_items(value, field="claim_judgments"), start=1):
         if not isinstance(item, Mapping):
@@ -270,16 +285,16 @@ def _parse_claim_judgments(value: object, *, draft: Draft) -> tuple[ClaimJudgmen
             )
         )
 
-    judged_texts = [judgment.claim_text for judgment in judgments]
-    if len(judged_texts) != len(set(judged_texts)):
-        raise _ParseError("claim_judgments 에 같은 claim 에 대한 판정이 중복으로 있다")
-    draft_texts = {claim.text for claim in draft.claims}
-    missing = sorted(draft_texts - set(judged_texts))
-    unknown = sorted(set(judged_texts) - draft_texts)
-    if missing or unknown:
+    judged = Counter(judgment.claim_text for judgment in judgments)
+    expected = Counter(claim.text for claim in draft.claims)
+    if judged != expected:
+        # `Counter` 뺄셈은 개수 차이만 남긴다 — 같은 문장이 초안에 2건인데 판정이 1건이면
+        # 그 문장이 `missing` 에 1개 남는다(집합 대조에서는 아무것도 남지 않던 자리다).
+        missing = sorted((expected - judged).elements())
+        unknown = sorted((judged - expected).elements())
         raise _ParseError(
-            "claim_judgments 가 초안의 claim 전부와 대응하지 않는다 "
-            f"(판정 누락: {missing!r}, 초안에 없는 claim: {unknown!r})"
+            "claim_judgments 가 초안의 claim 전부와 1:1 로 대응하지 않는다 "
+            f"(판정 누락: {missing!r}, 초안에 없거나 개수를 넘긴 판정: {unknown!r})"
         )
     return tuple(judgments)
 
