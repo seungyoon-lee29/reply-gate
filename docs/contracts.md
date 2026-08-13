@@ -101,6 +101,10 @@ pass 이고 **L2 가 실행됐다면** L2 도 pass. 층별 내역은 두 키로 
 - **`l2: null` 은 "통과"가 아니라 "판정이 없었다"** 이다. 특히 ③ 판정 호출 실패 시도는
   층 결합 정의상 **종합 `verdict` 가 `pass` 인데 문의는 인계된다** — 그 시도의 진실은
   `escalation_reason: "llm_call_failed"` 가 들고 있다. 종합 verdict 만 보고 통과로 읽으면 안 된다.
+  **이 규칙은 소비자에게 맡기지 않고 코드가 지킨다** — 평가 하네스는 `escalation_reason` +
+  `failed_stage` 로 이 상태를 판별해(`GoldenOutcome.gate_never_ran`) 게이트 품질 지표의
+  분모에서 빼고 `bait_unmeasured` 로 따로 센다. 문서로만 두면 "verdict 가 pass 니까 통과"로
+  집계하는 소비자가 언제든 다시 생긴다.
 - `l2.claim_judgments` 는 **그 시도 초안의** claim **전부**(통과한 claim 포함)와 **1:1 로
   대응한다**. 각 항목은 `{claim_text, verdict, explanation}` 이고, `claim_text` 는 답변
   계약의 claim 에 별도 ID 가 없어 text 로 가리키는 참조다.

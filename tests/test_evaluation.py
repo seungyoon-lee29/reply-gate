@@ -77,7 +77,7 @@ from reply_gate.gate import evaluate_draft
 from reply_gate.judge import JUDGE_STAGE, JudgeOutcome
 from reply_gate.llm import GenerationClient, LLMFormatError
 from reply_gate.order_ref import is_valid_order_no
-from reply_gate.pipeline import AttemptRecord, ProcessedInquiry
+from reply_gate.pipeline import L2_JUDGE_STAGE, AttemptRecord, ProcessedInquiry
 from reply_gate.policy_index import index_policy_documents, load_policy_documents
 from reply_gate.testing import LexicalEmbeddingClient, StubJudge, build_stub_pipeline
 
@@ -551,10 +551,106 @@ def test_기각_재현율은_시도_판정에서_나온다() -> None:
     assert agreement.bait_total == 2
     assert agreement.bait_reject_reproduced == 1
     assert agreement.bait_reject_recall == 0.5
+    assert agreement.bait_unmeasured == 0
     assert agreement.outcomes[0].matched is True
     assert agreement.outcomes[1].matched is False
     # 비미끼 케이스도 expect_reject 요구는 그대로 받는다 — 불일치로는 찍히되 분모 밖이다.
     assert agreement.outcomes[2].matched is False
+
+
+def _bait_case(*, expect_reject: bool = False) -> GoldenCase:
+    return _case(
+        "B",
+        statuses=(InquiryStatus.ANSWERED, InquiryStatus.ESCALATED),
+        reasons=(EscalationReason.REJECTED_TWICE,),
+        expect_reject=expect_reject,
+        category="reject_bait",
+    )
+
+
+def _judge_call_died() -> ProcessedInquiry:
+    """L2 호출이 무너진 시도 — L1 통과, L2 판정 없음, 종합 verdict 는 `pass` 다."""
+    return _processed(
+        status=InquiryStatus.ESCALATED,
+        escalation=EscalationReason.LLM_CALL_FAILED,
+        failed_stage=L2_JUDGE_STAGE,
+        attempts=(AttemptRecord(attempt_no=1, verdict=Verdict.PASS, reject_reasons=(), draft={}),),
+    )
+
+
+def _gate_ran_and_missed() -> ProcessedInquiry:
+    return _processed(
+        attempts=(AttemptRecord(attempt_no=1, verdict=Verdict.PASS, reject_reasons=(), draft={}),)
+    )
+
+
+def test_판정이_돌지_못한_미끼는_게이트가_놓친_것과_구분된다() -> None:
+    """두 상태의 `attempt_verdicts` 는 똑같이 `['pass']` 다.
+
+    구분하지 않으면 인프라 실패가 "게이트가 미끼를 놓쳤다"로 접혀 분모에 0 으로 채워진다
+    (`scripts/AGENTS.md` 불변식 5 — 미실행을 0 으로 채우지 않는다).
+    """
+    died, missed = _judge_call_died(), _gate_ran_and_missed()
+    assert [a.verdict for a in died.attempts] == [a.verdict for a in missed.attempts]
+
+    unmeasured = measure_pipeline_agreement(
+        cases=[_bait_case()],
+        pipeline=ScriptedPipeline([died]),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+    measured = measure_pipeline_agreement(
+        cases=[_bait_case()],
+        pipeline=ScriptedPipeline([missed]),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    # 판정이 없었던 건은 분모 밖 — 재현율은 0.0 이 아니라 "미실행"이다.
+    assert unmeasured.bait_total == 0
+    assert unmeasured.bait_unmeasured == 1
+    assert unmeasured.bait_reject_recall is None
+    assert unmeasured.outcomes[0].gate_never_ran is True
+
+    # 게이트가 실제로 돌았고 놓친 건은 그대로 0.0 이다.
+    assert measured.bait_total == 1
+    assert measured.bait_unmeasured == 0
+    assert measured.bait_reject_recall == 0.0
+    assert measured.outcomes[0].gate_never_ran is False
+
+
+def test_판정이_없었던_케이스의_불일치_사유는_기각_실패가_아니다() -> None:
+    """`어떤 시도도 기각되지 않았다` 는 거짓이다 — 게이트에 닿지 못했다."""
+    agreement = measure_pipeline_agreement(
+        cases=[_bait_case(expect_reject=True)],
+        pipeline=ScriptedPipeline([_judge_call_died()]),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    mismatches = agreement.outcomes[0].mismatches
+    assert any("판정이 없었다(미측정)" in item for item in mismatches)
+    assert not any("어떤 시도도 기각되지 않았다" in item for item in mismatches)
+
+
+def test_분모에서_뺀_미측정은_리포트와_JSON_에_남는다(tmp_path: Path) -> None:
+    """분모에서 빼기만 하고 말하지 않으면 그냥 사라진 것이다."""
+    agreement = measure_pipeline_agreement(
+        cases=[_bait_case()],
+        pipeline=ScriptedPipeline([_judge_call_died()]),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    markdown_path, json_path = write_report(
+        _report(pipeline=agreement), out_dir=tmp_path, stem="unmeasured"
+    )
+    markdown = markdown_path.read_text(encoding="utf-8")
+    payload = json.loads(json_path.read_text(encoding="utf-8"))["measurement_2_pipeline_agreement"]
+
+    assert "미측정 1건은 분모 밖이다" in markdown
+    assert payload["bait_unmeasured"] == 1
+    assert payload["outcomes"][0]["gate_never_ran"] is True
 
 
 def test_금지_기각_사유가_발화하면_오탐으로_집계된다() -> None:

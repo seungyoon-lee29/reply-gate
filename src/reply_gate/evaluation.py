@@ -54,6 +54,7 @@ from reply_gate.gate import DEFAULT_PII_PATTERNS, REASON_ORDER, evaluate_draft
 from reply_gate.judge import L2_REJECT_REASONS
 from reply_gate.llm import LLMCallError, LLMFormatError
 from reply_gate.pipeline import (
+    L2_JUDGE_STAGE,
     Judging,
     ProcessedInquiry,
     ReceiptError,
@@ -509,8 +510,29 @@ class GoldenOutcome:
 
         종합 verdict 를 보므로 L1 기각도 L2 기각도 같은 자격으로 들어온다. 기각 재현율의
         정의가 층에 묶이면 L2 도입이 지표 정의를 바꾸게 되고, 도입 전후 비교가 깨진다.
+
+        **이 값만으로 "게이트가 놓쳤다"고 읽으면 안 된다** — 게이트가 아예 돌지 않은
+        경우에도 False 다. 두 상태의 구분은 `gate_never_ran` 이 들고 있다.
         """
         return any(verdict is Verdict.REJECT for verdict in self.attempt_verdicts)
+
+    @property
+    def gate_never_ran(self) -> bool:
+        """L2 판정 호출이 무너져 **판정 자체가 없었던** 케이스인가.
+
+        판정 호출이 실패한 시도의 종합 verdict 는 `pass` 다(docs/contracts.md "층별 판정 키"
+        ③ — 그 시도의 진실은 `escalation_reason` 이 들고 있다). 그래서 `attempt_verdicts`
+        만 보면 **"게이트가 돌았고 놓쳤다"와 "게이트가 안 돌았다"가 같은 값**이 되고,
+        미실행이 관측 실패로 접혀 지표에 0 으로 채워진다
+        (`scripts/AGENTS.md` 불변식 5 — 미실행을 0 으로 채우지 않는다).
+
+        contracts.md 가 지정한 신호를 그대로 쓴다: 인계 사유 `llm_call_failed` +
+        실패 단계 `l2_judge`.
+        """
+        return (
+            self.escalation_reason is EscalationReason.LLM_CALL_FAILED
+            and self.failed_stage == L2_JUDGE_STAGE
+        )
 
 
 @dataclass(frozen=True)
@@ -523,8 +545,12 @@ class PipelineAgreement:
 
     total: int
     matched: int
+    #: 미끼 범주 중 **판정이 실제로 돈** 건수 = 재현율의 분모.
     bait_total: int
     bait_reject_reproduced: int
+    #: 미끼 범주인데 L2 판정 호출이 무너져 **측정되지 않은** 건수. 분모 밖이고, 0 으로
+    #: 채우지 않는다(`scripts/AGENTS.md` 불변식 5). 리포트에 사유와 함께 실린다.
+    bait_unmeasured: int
     forbidden_watch_total: int
     forbidden_violations: int
     latency_p50_ms: int | None
@@ -551,6 +577,10 @@ class PipelineAgreement:
         분자의 정의는 **시도 중 최소 1건 기각, 층 무관**이다(L2 도입으로 바뀌지 않는다).
         분모는 라벨(`expect_reject`)이 아니라 범주다 — 라벨을 판정 규칙에 정렬하면서
         (결정 0008) 기각 요구는 해제했지만 관측은 유지하기 때문이다.
+
+        **판정이 돌지 못한 건(`bait_unmeasured`)은 분모에서 뺀다.** 남겨 두면 인프라
+        실패가 "게이트가 미끼를 놓쳤다"와 같은 값이 되어, 미실행이 관측 실패로 둔갑한다.
+        전부 미측정이면 재현율은 0.0 이 아니라 **None**(미실행)이다.
         """
         return None if self.bait_total == 0 else self.bait_reject_reproduced / self.bait_total
 
@@ -668,7 +698,16 @@ def _compare(case: GoldenCase, processed: ProcessedInquiry) -> tuple[bool, tuple
 
     rejected = any(attempt.verdict is Verdict.REJECT for attempt in processed.attempts)
     if expected.expect_reject and not rejected:
-        mismatches.append("기각을 기대했으나 어떤 시도도 기각되지 않았다")
+        # 판정이 아예 돌지 못한 경우까지 "기각되지 않았다"로 적으면 거짓이다 — 게이트가
+        # 통과시킨 것이 아니라 게이트에 닿지 못했다. 불일치인 것은 같지만 사유가 다르고,
+        # 사람이 이 문자열을 읽고 게이트 품질을 판단한다.
+        if (
+            processed.escalation_reason is EscalationReason.LLM_CALL_FAILED
+            and processed.failed_stage == L2_JUDGE_STAGE
+        ):
+            mismatches.append("기각을 기대했으나 L2 판정 호출이 실패해 판정이 없었다(미측정)")
+        else:
+            mismatches.append("기각을 기대했으나 어떤 시도도 기각되지 않았다")
 
     seen_reasons = {reason for attempt in processed.attempts for reason in attempt.reject_reasons}
     forbidden = sorted(reason.value for reason in seen_reasons & expected.forbidden_reject_reasons)
@@ -776,11 +815,15 @@ def measure_pipeline_agreement(
             name = outcome.escalation_reason.value
             escalation_counts[name] = escalation_counts.get(name, 0) + 1
 
-    bait = [
+    # 미끼 범주를 "판정이 돈 것"과 "돌지 못한 것"으로 가른다 — 뒤엣것을 분모에 남기면
+    # 인프라 실패가 게이트 실패로 둔갑한다(`GoldenOutcome.gate_never_ran`).
+    bait_all = [
         (case, outcome)
         for case, outcome in zip(cases, outcomes, strict=True)
         if case.category == BAIT_CATEGORY
     ]
+    bait = [(case, outcome) for case, outcome in bait_all if not outcome.gate_never_ran]
+    bait_unmeasured = len(bait_all) - len(bait)
     watch = [
         (case, outcome)
         for case, outcome in zip(cases, outcomes, strict=True)
@@ -793,6 +836,7 @@ def measure_pipeline_agreement(
         matched=sum(1 for outcome in outcomes if outcome.matched),
         bait_total=len(bait),
         bait_reject_reproduced=sum(1 for _, outcome in bait if outcome.rejected_at_least_once),
+        bait_unmeasured=bait_unmeasured,
         forbidden_watch_total=len(watch),
         forbidden_violations=sum(
             1
@@ -1724,7 +1768,13 @@ def _render_measurement_two(
             "— **초안 전 인계 경로 포함이며 L1 판정만의 지표가 아니다.**",
             f"- **미끼 문의(reject_bait)의 기각 재현율: {_pct(pipeline.bait_reject_recall)}** "
             f"({pipeline.bait_reject_reproduced}/{pipeline.bait_total}) "
-            "— 목표 없는 관측값이다(결정 0006·0008).",
+            "— 목표 없는 관측값이다(결정 0006·0008)."
+            + (
+                f" **미측정 {pipeline.bait_unmeasured}건은 분모 밖이다**"
+                " — L2 판정 호출이 실패해 게이트가 돌지 못했다."
+                if pipeline.bait_unmeasured
+                else ""
+            ),
             f"- 정상 PII 에코 감시 케이스: {pipeline.forbidden_watch_total}건 중 "
             f"금지 사유 발화 {pipeline.forbidden_violations}건",
             f"- 지연 p50: {_int(pipeline.latency_p50_ms)} ms / "
@@ -2134,6 +2184,8 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
         "bait_total": pipeline.bait_total,
         "bait_reject_reproduced": pipeline.bait_reject_reproduced,
         "bait_reject_recall": pipeline.bait_reject_recall,
+        #: 판정이 돌지 못해 분모 밖으로 뺀 미끼 건수. 0 으로 채우지 않는다.
+        "bait_unmeasured": pipeline.bait_unmeasured,
         "forbidden_watch_total": pipeline.forbidden_watch_total,
         "forbidden_violations": pipeline.forbidden_violations,
         "latency_p50_ms": pipeline.latency_p50_ms,
@@ -2161,6 +2213,9 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
                 ),
                 "failed_stage": outcome.failed_stage,
                 "attempt_verdicts": [verdict.value for verdict in outcome.attempt_verdicts],
+                #: 판정 호출이 무너져 게이트가 돌지 못했는가. `attempt_verdicts` 만으로는
+                #: "돌았고 통과"와 구분되지 않는다(docs/contracts.md "층별 판정 키" ③).
+                "gate_never_ran": outcome.gate_never_ran,
                 "reject_reasons": [reason.value for reason in outcome.reject_reasons],
                 "adopted_evidence_ids": list(outcome.adopted_evidence_ids),
                 "latency_ms": outcome.latency_ms,
