@@ -136,7 +136,9 @@
 최적 컷(macro F1 최대)에서 읽는다 — 전략마다 컷의 실효 강도가 달라 고정 컷 한 점 비교는
 불공정하다. 산출물 `reports/retrieval-strategies-live-*`.
 
-| 전략 | best cut | precision | recall | macro F1 | r@1 (컷 0.30) |
+`r@1` 은 **컷과 무관하다** — 채택이 아니라 전체 순위로 계산한다(결정 0009 가 분리한 지점).
+
+| 전략 | best cut | precision | recall | macro F1 | r@1 |
 |---|---:|---:|---:|---:|---:|
 | vector | 0.50 | 0.628 | 0.640 | 0.634 | 0.5600 |
 | + rewrite | 0.55 | 0.652 | 0.840 | **0.734** | 0.7600 |
