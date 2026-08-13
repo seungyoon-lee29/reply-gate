@@ -15,10 +15,14 @@
 않는다 — `null` 은 "통과"가 아니라 "판정이 없었다"는 뜻이며, 그 시도의 진실은 인계 사유가
 들고 있다.
 
-`metrics.tokens` 의 `input`/`output` 은 **생성 LLM 합산**이고 임베딩·판정 토큰을 여기
-섞지 않는다. 판정 토큰은 `judge_input`/`judge_output` 으로 **분리 신설**한다(L2 미실행이면
-0) — provider 와 단가가 달라 생성 합산에 섞으면 건당 비용 지표가 무너진다. 임베딩 토큰은
-지금도 응답에 싣지 않고 처리 기록에만 남는다.
+`metrics.tokens` 의 `input`/`output` 은 **생성 LLM 합산**이고 임베딩·판정·검색 토큰을 여기
+섞지 않는다. 판정 토큰은 `judge_input`/`judge_output` 으로(L2 미실행이면 0), 검색 단계
+재작성 토큰은 `retrieval_input`/`retrieval_output` 으로 **분리 신설**한다 — provider·단가가
+다르고, 검색 계열은 특히 "초안 없이 끝난 문의"의 비용을 초안 생성 칸에 찍지 않기 위한
+분리다. 임베딩 토큰은 지금도 응답에 싣지 않고 처리 기록에만 남는다.
+
+`metrics.retrieval_fallback_reason` 은 검색 단계가 폴백한 사유다. `null` 이 기본이고
+**인계 사유가 아니다** — 폴백한 문의도 그대로 답변될 수 있다.
 
 접수 검증(내용 필수·주문번호 형식)은 **파이프라인에 들어가기 전에** 422 로 끝난다.
 형식이 틀린 주문번호는 인계가 아니라 요청 오류다.
@@ -211,20 +215,30 @@ class TokensOut(BaseModel):
     키이며 **L2 미실행이면 0** 이다. 판정 토큰을 생성 합산에 섞으면 건당 비용 지표가
     무너진다 — 임베딩 토큰을 섞지 않는 것과 같은 이유다(임베딩은 지금도 응답에 싣지 않고
     처리 기록에만 남는다).
+
+    `retrieval_input`/`retrieval_output` 은 **검색 단계 생성 호출**(질의 재작성)의 토큰이다.
+    같은 규칙의 세 번째 계열이고 분리하는 이유가 특히 뾰족하다: 무근거 문의가 검색에서
+    걸러져 **초안 없이** 끝나는 것이 이 사이클의 성공 판정인데, 재작성 토큰이 생성 칸에
+    들어가면 초안을 만들지도 않은 문의가 초안 생성 토큰을 쓴 것으로 찍힌다.
     """
 
     input: int
     output: int
     judge_input: int
     judge_output: int
+    retrieval_input: int
+    retrieval_output: int
 
 
 class MetricsOut(BaseModel):
-    """`latency_ms` 는 파이프라인 벽시계 시간이다 — **L2 호출을 포함**하고 처리 기록
-    저장은 포함하지 않는다."""
+    """`latency_ms` 는 파이프라인 벽시계 시간이다 — **L2 호출과 검색 단계 재작성 호출을
+    포함**하고 처리 기록 저장은 포함하지 않는다."""
 
     latency_ms: int
     tokens: TokensOut
+    #: 검색 단계가 폴백한 사유. `null` 은 "폴백하지 않았다"이고 **인계 사유가 아니다** —
+    #: 폴백한 문의도 그대로 답변될 수 있다.
+    retrieval_fallback_reason: str | None
 
 
 def _gate_out(result: GateResult | None) -> GateOut | None:
@@ -318,7 +332,10 @@ class InquiryResponse(BaseModel):
                     output=processed.output_tokens,
                     judge_input=processed.judge_input_tokens,
                     judge_output=processed.judge_output_tokens,
+                    retrieval_input=processed.retrieval_input_tokens,
+                    retrieval_output=processed.retrieval_output_tokens,
                 ),
+                retrieval_fallback_reason=processed.retrieval_fallback_reason,
             ),
         )
 

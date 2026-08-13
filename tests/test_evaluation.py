@@ -169,12 +169,15 @@ def _conditions(
     judge_is_real: bool = False,
     l2_enabled: bool = True,
     judge: str = "결정론 대역",
+    retrieval_strategy: str = "vector+rewrite",
 ) -> RunConditions:
     return RunConditions(
         started_at=utc_now_iso(),
         generation="대역",
         embedding="대역",
+        embedding_dimensions=1536,
         judge=judge,
+        retrieval_strategy=retrieval_strategy,
         similarity_threshold=0.05,
         top_k=5,
         l1_fixture_count=len(FIXTURES),

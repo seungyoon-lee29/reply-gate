@@ -61,6 +61,7 @@ from reply_gate.pipeline import (
     accept_inquiry,
     new_inquiry_id,
 )
+from reply_gate.query_rewrite import QUERY_REWRITE_STAGE
 
 __all__ = [
     "DEFAULT_GOLDEN_SET_PATH",
@@ -503,6 +504,12 @@ class GoldenOutcome:
     mismatches: tuple[str, ...]
     #: 접수 거부처럼 파이프라인에 진입조차 못한 경우의 사유.
     error: str | None
+    #: 검색 단계(질의 재작성) 토큰 — 같은 규칙의 세 번째 계열이다. 재작성을 쓰지 않은
+    #: 문의는 0 이고, 실패한 호출의 토큰도 실비용이므로 그대로 들어온다.
+    retrieval_input_tokens: int = 0
+    retrieval_output_tokens: int = 0
+    #: 검색 단계가 폴백한 사유. 인계 사유가 아니다 — 폴백한 문의도 답변으로 끝날 수 있다.
+    retrieval_fallback_reason: str | None = None
 
     @property
     def rejected_at_least_once(self) -> bool:
@@ -565,6 +572,12 @@ class PipelineAgreement:
     status_counts: Mapping[str, int]
     escalation_counts: Mapping[str, int]
     outcomes: tuple[GoldenOutcome, ...]
+    #: 검색 계열도 같은 자격으로 분리해서 센다.
+    retrieval_input_tokens_total: int = 0
+    retrieval_output_tokens_total: int = 0
+    #: 검색 단계가 폴백한 문의 수. **조용한 폴백을 금지하는 집계**다(`.dryforge/spec.md` §8-1)
+    #: — 0 이 정상이고, 커지면 재작성 층이 사실상 꺼진 실행을 정상 실측으로 읽게 된다.
+    retrieval_fallback_total: int = 0
 
     @property
     def match_rate(self) -> float | None:
@@ -601,8 +614,14 @@ class PipelineAgreement:
         return (self.judge_input_tokens_total + self.judge_output_tokens_total) / self.total
 
     @property
+    def retrieval_tokens_per_inquiry(self) -> float | None:
+        if self.total == 0:
+            return None
+        return (self.retrieval_input_tokens_total + self.retrieval_output_tokens_total) / self.total
+
+    @property
     def total_tokens_per_inquiry(self) -> float | None:
-        """세 계열 합산 — 판정 계열을 빠뜨리면 L2 켜짐 실측의 건당 비용이 거짓이 된다."""
+        """네 계열 합산 — 한 계열이라도 빠지면 건당 비용이 거짓이 된다."""
         if self.total == 0:
             return None
         return _grand_total(self) / self.total
@@ -780,6 +799,9 @@ def evaluate_case(
         matched=matched,
         mismatches=mismatches,
         error=None,
+        retrieval_input_tokens=processed.retrieval_input_tokens,
+        retrieval_output_tokens=processed.retrieval_output_tokens,
+        retrieval_fallback_reason=processed.retrieval_fallback_reason,
     )
 
 
@@ -853,6 +875,11 @@ def measure_pipeline_agreement(
         status_counts=status_counts,
         escalation_counts=escalation_counts,
         outcomes=tuple(outcomes),
+        retrieval_input_tokens_total=sum(outcome.retrieval_input_tokens for outcome in outcomes),
+        retrieval_output_tokens_total=sum(outcome.retrieval_output_tokens for outcome in outcomes),
+        retrieval_fallback_total=sum(
+            1 for outcome in outcomes if outcome.retrieval_fallback_reason is not None
+        ),
     )
 
 
@@ -1243,6 +1270,13 @@ class RunConditions:
     judge: str
     similarity_threshold: float
     top_k: int
+    #: 검색 구성 요약 (`.dryforge/spec.md` §8-3). **필수 필드**다 — 같은 지표를 다른 검색
+    #: 설정으로 잰 산출물이 이름 계열은 하나이므로(리포트 이름을 늘리지 않기로 한 판단),
+    #: 어떤 구성으로 잰 값인지는 실행 조건이 들고 있어야 한다. `embedding` 문자열이 모델을
+    #: 담지만 차원·전략 조합은 거기 없다.
+    embedding_dimensions: int
+    #: 실행 경로에 켜진 검색 전략 조합. 예: `vector` · `vector+rewrite`.
+    retrieval_strategy: str
     l1_fixture_count: int
     golden_case_count: int
     #: 판정 픽스처 수. **로드하지 못했으면 `None`** — 미실행을 0 으로 채우지 않는다.
@@ -1645,6 +1679,8 @@ def render_markdown(report: EvaluationReport) -> str:
         f"- 생성 LLM: {conditions.generation}",
         f"- 임베딩: {conditions.embedding}",
         f"- L2 판정: {'켜짐' if conditions.l2_enabled else '꺼짐'} / 판정 모델: {conditions.judge}",
+        f"- 검색 전략: {conditions.retrieval_strategy}"
+        f" · 임베딩 {conditions.embedding_dimensions}차원",
         f"- 유사도 임계값: {conditions.similarity_threshold} / top k: {conditions.top_k}",
         f"- L1 픽스처: {conditions.l1_fixture_count}건 (`{conditions.l1_fixtures_path}`)",
         f"- 골든셋: {conditions.golden_case_count}건 (`{conditions.golden_set_path}`)",
@@ -1780,11 +1816,19 @@ def _render_measurement_two(
             f"- 지연 p50: {_int(pipeline.latency_p50_ms)} ms / "
             f"p95: {_int(pipeline.latency_p95_ms)} ms "
             "(파이프라인 `run` 의 벽시계 시간 — 처리 기록 저장은 포함하지 않는다)",
+            f"- 검색 단계 폴백: {pipeline.retrieval_fallback_total}건"
+            + (
+                " — 재작성을 얻지 못해 원문 질의로 검색한 문의다. **인계가 아니다.** "
+                "이 수가 크면 재작성 층이 사실상 꺼진 실행이므로 검색 지표를 그렇게 읽어야 한다."
+                if pipeline.retrieval_fallback_total
+                else " (전건 재작성 성공 — 검색 구성이 실행 조건 그대로 돌았다)"
+            ),
             "",
-            "### 문의 1건당 토큰 (생성·임베딩·판정 구분)",
+            "### 문의 1건당 토큰 (생성·임베딩·판정·검색 구분)",
             "",
-            "provider 와 단가가 다른 계열을 합산하면 건당 비용 지표가 무너진다 — 세 계열은",
-            "끝까지 분리해서 센다. L2 미실행이면 판정 계열은 0 이다.",
+            "provider 와 단가가 다른 계열을 합산하면 건당 비용 지표가 무너진다 — 네 계열은",
+            "끝까지 분리해서 센다. L2 미실행이면 판정 계열은, 재작성을 쓰지 않았으면 검색",
+            "계열은 0 이다.",
             "",
             "| 계열 | 합계 | 건당 |",
             "| --- | ---: | ---: |",
@@ -1820,10 +1864,14 @@ def _render_measurement_two(
 
 
 def _token_rows(pipeline: PipelineAgreement, conditions: RunConditions) -> list[str]:
-    """토큰 표의 본문 — 계열 셋(생성·임베딩·판정)을 끝까지 분리해서 적는다.
+    """토큰 표의 본문 — 계열 넷(생성·임베딩·판정·검색)을 끝까지 분리해서 적는다.
 
-    대역 실행에서는 **판정 행에 `(대역)` 을 붙인다**: `--stub-llm` 은 판정자까지 대역으로
-    갈아 끼우므로 이 행의 값은 대역의 휴리스틱 산출이고 합산에도 그대로 들어간다.
+    대역 실행에서는 **판정·검색 행에 `(대역)` 을 붙인다**: `--stub-llm` 은 판정자와 생성
+    클라이언트를 모두 대역으로 갈아 끼우므로 이 행들의 값은 대역의 휴리스틱 산출이고
+    합산에도 그대로 들어간다.
+
+    **검색 계열을 생성 소계에 넣지 않는다.** 초안을 만들지도 않은 문의가 초안 생성 토큰을
+    쓴 것으로 찍히면 성공 판정 ②("시도 0건 + 판정 토큰 0")를 표에서 읽을 수 없다.
     """
     # 대역 실행이면 판정 계열도 대역이다 — 표만 보고 실제 판정 비용으로 읽으면 안 된다.
     judge_mark = "" if conditions.measurement2_is_real else " (대역)"
@@ -1833,6 +1881,7 @@ def _token_rows(pipeline: PipelineAgreement, conditions: RunConditions) -> list[
 
     generation_total = pipeline.input_tokens_total + pipeline.output_tokens_total
     judge_total = pipeline.judge_input_tokens_total + pipeline.judge_output_tokens_total
+    retrieval_total = pipeline.retrieval_input_tokens_total + pipeline.retrieval_output_tokens_total
     rows: list[tuple[str, int, float | None]] = [
         ("생성 입력", pipeline.input_tokens_total, per_inquiry(pipeline.input_tokens_total)),
         ("생성 출력", pipeline.output_tokens_total, per_inquiry(pipeline.output_tokens_total)),
@@ -1849,6 +1898,17 @@ def _token_rows(pipeline: PipelineAgreement, conditions: RunConditions) -> list[
             per_inquiry(pipeline.judge_output_tokens_total),
         ),
         (f"판정 소계{judge_mark}", judge_total, pipeline.judge_tokens_per_inquiry),
+        (
+            f"검색 입력{judge_mark}",
+            pipeline.retrieval_input_tokens_total,
+            per_inquiry(pipeline.retrieval_input_tokens_total),
+        ),
+        (
+            f"검색 출력{judge_mark}",
+            pipeline.retrieval_output_tokens_total,
+            per_inquiry(pipeline.retrieval_output_tokens_total),
+        ),
+        (f"검색 소계{judge_mark}", retrieval_total, pipeline.retrieval_tokens_per_inquiry),
     ]
     lines = [f"| {label} | {total} | {_num(value)} |" for label, total, value in rows]
     lines.append(
@@ -1922,13 +1982,15 @@ def _render_failure_attribution(
 
 
 def _grand_total(pipeline: PipelineAgreement) -> int:
-    """세 계열 합산 — 판정 계열이 빠지면 L2 켜짐 실측의 건당 비용이 실제보다 작아진다."""
+    """네 계열 합산 — 한 계열이 빠지면 건당 비용이 실제보다 작아진다."""
     return (
         pipeline.input_tokens_total
         + pipeline.output_tokens_total
         + pipeline.embedding_tokens_total
         + pipeline.judge_input_tokens_total
         + pipeline.judge_output_tokens_total
+        + pipeline.retrieval_input_tokens_total
+        + pipeline.retrieval_output_tokens_total
     )
 
 
@@ -2064,8 +2126,10 @@ def report_to_json(report: EvaluationReport) -> dict[str, Any]:
             "started_at": conditions.started_at,
             "generation": conditions.generation,
             "embedding": conditions.embedding,
+            "embedding_dimensions": conditions.embedding_dimensions,
             "judge": conditions.judge,
             "l2_enabled": conditions.l2_enabled,
+            "retrieval_strategy": conditions.retrieval_strategy,
             "similarity_threshold": conditions.similarity_threshold,
             "top_k": conditions.top_k,
             "l1_fixture_count": conditions.l1_fixture_count,
@@ -2190,15 +2254,20 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
         "forbidden_violations": pipeline.forbidden_violations,
         "latency_p50_ms": pipeline.latency_p50_ms,
         "latency_p95_ms": pipeline.latency_p95_ms,
+        #: 검색 단계가 폴백한 문의 수. 인계가 아니라 "재작성 없이 원문으로 돌았다"이다.
+        "retrieval_fallback_total": pipeline.retrieval_fallback_total,
         "tokens": {
             "generation_input_total": pipeline.input_tokens_total,
             "generation_output_total": pipeline.output_tokens_total,
             "embedding_total": pipeline.embedding_tokens_total,
             "judge_input_total": pipeline.judge_input_tokens_total,
             "judge_output_total": pipeline.judge_output_tokens_total,
+            "retrieval_input_total": pipeline.retrieval_input_tokens_total,
+            "retrieval_output_total": pipeline.retrieval_output_tokens_total,
             "generation_per_inquiry": pipeline.generation_tokens_per_inquiry,
             "embedding_per_inquiry": pipeline.embedding_tokens_per_inquiry,
             "judge_per_inquiry": pipeline.judge_tokens_per_inquiry,
+            "retrieval_per_inquiry": pipeline.retrieval_tokens_per_inquiry,
             "total_per_inquiry": pipeline.total_tokens_per_inquiry,
         },
         "status_counts": dict(pipeline.status_counts),
@@ -2224,6 +2293,9 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
                 "embedding_tokens": outcome.embedding_tokens,
                 "judge_input_tokens": outcome.judge_input_tokens,
                 "judge_output_tokens": outcome.judge_output_tokens,
+                "retrieval_input_tokens": outcome.retrieval_input_tokens,
+                "retrieval_output_tokens": outcome.retrieval_output_tokens,
+                "retrieval_fallback_reason": outcome.retrieval_fallback_reason,
                 "matched": outcome.matched,
                 "mismatches": list(outcome.mismatches),
                 "error": outcome.error,
@@ -2417,7 +2489,24 @@ class StubGenerationClient:
             return {"sql": self._build_sql(user)}
         if stage == "draft":
             return self._build_draft(user)
+        if stage == QUERY_REWRITE_STAGE:
+            return {"rewritten": self._rewrite(user)}
         raise AssertionError(f"대역이 모르는 단계다: {stage!r}")
+
+    @staticmethod
+    def _rewrite(user: str) -> str:
+        """**재작성하지 않는다** — 문의 원문을 그대로 돌려준다.
+
+        이 대역이 하는 유일한 정직한 산출이다. 재작성의 값어치는 구어체를 문서체 어휘로
+        옮기는 의미 변환인데, 대역은 어휘 규칙밖에 없어 그것을 흉내내면 실제 모델이 내지
+        않는 질의로 검색 배관을 재게 된다 — `StubJudge` 가 모순 감지를 흉내내지 않는 것과
+        같은 이유다. 원문과 같은 문자열은 픽스처 계약이 명시적으로 허용하는 산출이고,
+        그때 수집기는 검색을 한 번만 돈다(합집합 경로는 단위 테스트가 덮는다).
+
+        **호출 자체는 실제로 나간다** — 토큰이 검색 계열에 집계되고 단계가 기록에 남으므로,
+        대역 완주가 "재작성 배선이 실제로 걸려 있는가"까지 확인한다.
+        """
+        return user.removeprefix("[문의]\n")
 
     @staticmethod
     def _section(pattern: re.Pattern[str], user: str, group: str) -> str:

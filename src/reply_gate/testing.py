@@ -180,6 +180,10 @@ def build_stub_pipeline(
             generation_client=generation_client,
             embedding_client=embedding_client,
             settings=settings,
+            # 실제 조립과 같은 값(생성 클라이언트)을 넘긴다 — 여기서 `None` 을 넘기면
+            # 대역 실행이 재작성 없는 파이프라인을 재게 되어 T2·T3 의 "대역 완주"가
+            # 실제 실행과 다른 것을 잰다.
+            rewrite_client=generation_client,
         ),
         drafter=DraftGenerator(client=generation_client, effort=settings.generation_effort),
         judge=judge,

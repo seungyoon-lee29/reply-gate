@@ -98,8 +98,17 @@ RESPONSE_KEYS = {
 ATTEMPT_KEYS = {"verdict", "reject_reasons", "l1", "l2"}
 L1_KEYS = {"verdict", "reject_reasons"}
 L2_KEYS = {"verdict", "reject_reasons", "claim_judgments", "contradictions"}
-#: 생성 합산(기존 키·기존 의미) + 판정 계열 분리 키.
-TOKEN_KEYS = {"input", "output", "judge_input", "judge_output"}
+#: 생성 합산(기존 키·기존 의미) + 판정·검색 계열 분리 키.
+TOKEN_KEYS = {
+    "input",
+    "output",
+    "judge_input",
+    "judge_output",
+    "retrieval_input",
+    "retrieval_output",
+}
+#: `metrics` 의 키 — 폴백 사유는 인계 사유가 아니라 검색 층의 관측이므로 여기 산다.
+METRICS_KEYS = {"latency_ms", "tokens", "retrieval_fallback_reason"}
 
 
 def layer(verdict: Verdict, reasons: Sequence[RejectReason] = ()) -> dict[str, Any]:
@@ -244,6 +253,7 @@ def l2_live_pipeline(
             generation_client=client,
             embedding_client=LexicalEmbeddingClient(dimensions=1536),
             settings=settings,
+            rewrite_client=client,
         ),
         drafter=DraftGenerator(client=client, effort=settings.generation_effort),
         judge=cast(Judging, judge),
@@ -445,7 +455,7 @@ def _assert_skeleton(payload: dict[str, Any]) -> None:
         assert set(item) == ATTEMPT_KEYS
         assert item["l1"] is None or set(item["l1"]) == L1_KEYS
         assert item["l2"] is None or set(item["l2"]) == L2_KEYS
-    assert set(payload["metrics"]) == {"latency_ms", "tokens"}
+    assert set(payload["metrics"]) == METRICS_KEYS
     assert set(payload["metrics"]["tokens"]) == TOKEN_KEYS
     assert isinstance(payload["metrics"]["latency_ms"], int)
 
@@ -555,10 +565,18 @@ def test_GET_은_메모리가_아니라_저장된_기록에서_재구성한다(
     _assert_skeleton(payload)
     assert payload["inquiry_id"] == stored.inquiry_id
     assert payload["answer"] == stored.answer
-    # 판정 토큰은 생성 합산(910/210)에 섞이지 않고 **분리된 키**로 복원된다.
+    # 판정·검색 토큰은 생성 합산(910/210)에 섞이지 않고 **분리된 키**로 복원된다.
     assert payload["metrics"] == {
         "latency_ms": 1234,
-        "tokens": {"input": 910, "output": 210, "judge_input": 433, "judge_output": 91},
+        "tokens": {
+            "input": 910,
+            "output": 210,
+            "judge_input": 433,
+            "judge_output": 91,
+            "retrieval_input": 17,
+            "retrieval_output": 5,
+        },
+        "retrieval_fallback_reason": None,
     }
     l1_reasons = (RejectReason.MISSING_CITATION, RejectReason.PII_DETECTED)
     stored_l2 = stored.attempts[1].l2_result
@@ -755,11 +773,14 @@ def test_판정_토큰은_생성_합산에_섞이지_않는다() -> None:
     tokens = InquiryResponse.of(processed).model_dump()["metrics"]["tokens"]
 
     assert processed.judge_input_tokens and processed.judge_output_tokens  # 양성 대조
+    assert processed.retrieval_input_tokens and processed.retrieval_output_tokens  # 양성 대조
     assert tokens == {
         "input": processed.input_tokens,
         "output": processed.output_tokens,
         "judge_input": processed.judge_input_tokens,
         "judge_output": processed.judge_output_tokens,
+        "retrieval_input": processed.retrieval_input_tokens,
+        "retrieval_output": processed.retrieval_output_tokens,
     }
 
 

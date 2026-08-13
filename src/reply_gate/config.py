@@ -58,9 +58,21 @@ class Settings(BaseSettings):
     #: (thinking 설정 미전송 = adaptive thinking 켜짐이 모델 기본).
     judge_max_output_tokens: int = 16000
 
+    # ── 검색 전략 ───────────────────────────────────────────────────────────
+    #: 검색용 질의 재작성 스위치 — 기본 켜짐. **켜짐 + 재작성 클라이언트 미배선은 조립 시점
+    #: 오류**다(`evidence.RetrievalWiringError`). 끄려면 `false` 로 명시한다.
+    #: 하이브리드(BM25+RRF)·LLM 리랭크는 채택하지 않아 실행 경로에 스위치가 없다 —
+    #: 조항 26개 코퍼스에서 벡터 단독이 이미 r@5 = 1.000 이라 재정렬은 풀린 문제를 공격한다
+    #: (`docs/tracking/status.md` "검색 전략 비교").
+    query_rewrite_enabled: bool = True
+
     # ── 조정 가능 기본값 (docs/operations.md "환경 변수" 절) ────────────────────────
     vector_top_k: int = 5
-    vector_similarity_threshold: float = 0.3
+    #: 정책 근거 채택 컷. **재작성 배선과 짝이다** — 재작성이 유사도를 밀어 올린 뒤의 값이라
+    #: 재작성을 끄고 이 값만 유지하면 recall 이 0.880 → 0.640 으로 무너진다
+    #: (`docs/tracking/status.md`). 0.50 은 무근거 4건(G21-G24)이 전부 기권하는 가장 낮은
+    #: 컷이다 — F1 최적점 0.55 는 recall 을 0.920 → 0.840 으로 깎고 G17 마진을 0.03 으로 줄인다.
+    vector_similarity_threshold: float = 0.5
     sql_max_rows: int = 50
     #: text-to-SQL 실행 커넥션의 `statement_timeout`(ms). 0 이면 무제한이므로 0 을 두지 않는다 —
     #: 생성된 쿼리 하나가 워커를 몇 분씩 묶는 것을 코드가 막는 층이다.

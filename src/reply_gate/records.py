@@ -14,8 +14,13 @@ L2 호출 실패)은 컬럼이 전부 NULL 이고 복원값도 `None` 이다 —
 실행 경로의 초안은 `json.loads` 산출이라 이 예외에 걸리지 않는다.
 
 토큰은 생성 계열(`input_tokens`/`output_tokens`)·임베딩(`embedding_tokens`)·판정
-(`judge_input_tokens`/`judge_output_tokens`)을 **분리해서** 쓴다 — 건당 비용을 계열별로
-산출해야 하기 때문이다.
+(`judge_input_tokens`/`judge_output_tokens`)·검색
+(`retrieval_input_tokens`/`retrieval_output_tokens`)을 **분리해서** 쓴다 — 건당 비용을
+계열별로 산출해야 하기 때문이다.
+
+검색 단계 폴백(`retrieval_fallback_reason`)도 여기 남는다. 인계 사유가 아니라 **폴백이
+있었다는 사실**의 기록이고, 남기지 않으면 재작성이 매번 실패하는 실행과 정상 실행이
+산출물에서 구분되지 않는다(`.dryforge/spec.md` §8-1 "조용한 폴백 금지").
 
 커밋은 하지 않는다. 트랜잭션 경계는 호출자(요청 핸들러·테스트 픽스처)가 정한다.
 """
@@ -66,8 +71,9 @@ def save_inquiry(*, conn: psycopg.Connection[DictRow], processed: ProcessedInqui
                 (id, order_no, content, intent_source, status, answer, claims,
                  escalation_reason, failed_stage, latency_ms,
                  input_tokens, output_tokens, embedding_tokens,
-                 judge_input_tokens, judge_output_tokens)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 judge_input_tokens, judge_output_tokens,
+                 retrieval_input_tokens, retrieval_output_tokens, retrieval_fallback_reason)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 processed.inquiry_id,
@@ -85,6 +91,9 @@ def save_inquiry(*, conn: psycopg.Connection[DictRow], processed: ProcessedInqui
                 processed.embedding_tokens,
                 processed.judge_input_tokens,
                 processed.judge_output_tokens,
+                processed.retrieval_input_tokens,
+                processed.retrieval_output_tokens,
+                processed.retrieval_fallback_reason,
             ),
         )
 
@@ -188,6 +197,9 @@ def load_inquiry(*, conn: psycopg.Connection[DictRow], inquiry_id: str) -> Proce
         embedding_tokens=row["embedding_tokens"],
         judge_input_tokens=row["judge_input_tokens"],
         judge_output_tokens=row["judge_output_tokens"],
+        retrieval_input_tokens=row["retrieval_input_tokens"],
+        retrieval_output_tokens=row["retrieval_output_tokens"],
+        retrieval_fallback_reason=row["retrieval_fallback_reason"],
     )
 
 

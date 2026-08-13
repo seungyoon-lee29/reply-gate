@@ -37,6 +37,7 @@ from reply_gate.evidence import (
 from reply_gate.gate import evaluate_draft
 from reply_gate.llm import GenerationClient, JsonCompletion, LLMCallError, LLMFormatError
 from reply_gate.policy_index import index_policy_documents, load_policy_documents
+from reply_gate.query_rewrite import QUERY_REWRITE_STAGE
 from reply_gate.testing import LexicalEmbeddingClient
 
 INQUIRY_ID = "11111111-2222-3333-4444-555555555555"
@@ -47,8 +48,20 @@ MISSING_ORDER_NO = "ORD-20991231-9999"
 # ── 목 / 픽스처 ─────────────────────────────────────────────────────────────
 
 
+#: 대본에 재작성이 없을 때 기본으로 돌려주는 토큰 — 0 이 아니어야 "검색 계열이 생성
+#: 합산에 섞이지 않는다"를 대조할 수 있다.
+_DEFAULT_REWRITE_TOKENS = (7, 3)
+
+
 class _ScriptedClient:
-    """`GenerationClient` 대역 — 단계별로 미리 정한 결과를 순서대로 돌려준다."""
+    """`GenerationClient` 대역 — 단계별로 미리 정한 결과를 순서대로 돌려준다.
+
+    **재작성 단계만 예외**다: 대본에 아예 없으면 "원문 그대로"를 돌려준다. 재작성은 정책
+    경로의 기본 호출이라 대본에 넣기를 강제하면 관계없는 테스트 수십 개가 재작성 대본을
+    이고 다니게 되고, 원문 그대로는 픽스처 계약이 명시적으로 허용하는 산출이라
+    (`rewritten` == `original`) 수집기가 검색을 한 번만 돌아 기존 기대가 그대로 선다.
+    **대본이 재작성을 지정했으면 그것이 이기고, 큐가 마르면 그때는 오류다.**
+    """
 
     def __init__(self, script: Mapping[str, Sequence[Any]]) -> None:
         self._script = {stage: list(outcomes) for stage, outcomes in script.items()}
@@ -57,6 +70,8 @@ class _ScriptedClient:
     def complete_json(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
         stage = kwargs["stage"]
+        if stage == QUERY_REWRITE_STAGE and stage not in self._script:
+            return _echo_rewrite(kwargs["user"])
         queue = self._script.get(stage)
         if not queue:
             raise AssertionError(f"대본에 없는 호출이다: stage={stage!r}")
@@ -67,6 +82,22 @@ class _ScriptedClient:
 
     def calls_for(self, stage: str) -> list[dict[str, Any]]:
         return [call for call in self.calls if call["stage"] == stage]
+
+
+def _echo_rewrite(user_prompt: str) -> JsonCompletion:
+    """재작성 대역의 기본 산출 — 프롬프트에 실린 문의 원문을 그대로 되돌려준다."""
+    inquiry = user_prompt.removeprefix("[문의]\n")
+    return JsonCompletion(
+        data={"rewritten": inquiry},
+        input_tokens=_DEFAULT_REWRITE_TOKENS[0],
+        output_tokens=_DEFAULT_REWRITE_TOKENS[1],
+    )
+
+
+def _rewrite(text: str, *, input_tokens: int = 7, output_tokens: int = 3) -> JsonCompletion:
+    return JsonCompletion(
+        data={"rewritten": text}, input_tokens=input_tokens, output_tokens=output_tokens
+    )
 
 
 def _client(script: Mapping[str, Sequence[Any]]) -> _ScriptedClient:
@@ -91,7 +122,10 @@ def _collector(
     threshold: float = 0.0,
     top_k: int = 5,
     max_rows: int = 50,
+    query_rewrite_enabled: bool = True,
 ) -> EvidenceCollector:
+    """기본은 **제품 기본값(재작성 켜짐)** 이다 — 테스트가 제품이 쓰지 않는 구성을 재면
+    배관 검증이 실제 실행과 다른 것을 검증한다."""
     return EvidenceCollector(
         generation_client=cast(GenerationClient, client),
         embedding_client=LexicalEmbeddingClient(dimensions=1536),
@@ -99,7 +133,9 @@ def _collector(
             vector_top_k=top_k,
             vector_similarity_threshold=threshold,
             sql_max_rows=max_rows,
+            query_rewrite_enabled=query_rewrite_enabled,
         ),
+        rewrite_client=cast(GenerationClient, client) if query_rewrite_enabled else None,
     )
 
 
@@ -1272,3 +1308,151 @@ def test_임베딩은_정책_검색이_필요할_때만_호출된다(
     assert result.embedding_tokens == 0
     assert result.escalation_reason is None
     assert INQUIRY_EMBEDDING_STAGE == "inquiry_embedding"
+    # 재작성도 정책 검색의 일부다 — 검색하지 않는 의도에서는 부르지 않는다(과금 0).
+    assert client.calls_for(QUERY_REWRITE_STAGE) == []
+    assert (result.retrieval_input_tokens, result.retrieval_output_tokens) == (0, 0)
+
+
+@pytest.mark.db
+@pytest.mark.usefixtures("indexed_policies")
+def test_검색_토큰은_생성_임베딩_어디에도_합산되지_않는다(
+    app_conn: psycopg.Connection[DictRow], ro_conn: psycopg.Connection[DictRow]
+) -> None:
+    """계열이 섞이면 초안을 만들지도 않은 문의가 초안 생성 토큰을 쓴 것으로 찍힌다."""
+    content = "환불 언제까지 되나요"
+    client = _client(
+        {
+            INTENT_STAGE: [_intent("policy", input_tokens=100, output_tokens=5)],
+            QUERY_REWRITE_STAGE: [_rewrite("환불 신청 기간", input_tokens=40, output_tokens=8)],
+        }
+    )
+
+    result = _collector(client, threshold=0.0).collect(
+        inquiry_id=INQUIRY_ID,
+        content=content,
+        order_no=None,
+        app_conn=app_conn,
+        readonly_conn=ro_conn,
+    )
+
+    # 생성 합산은 의도 해석 몫 그대로다 — 재작성 40/8 이 여기 들어오지 않는다.
+    assert (result.input_tokens, result.output_tokens) == (100, 5)
+    assert (result.retrieval_input_tokens, result.retrieval_output_tokens) == (40, 8)
+    # 임베딩 계열도 따로다 — 두 질의를 실었으므로 두 문자열의 길이 합이다.
+    assert result.embedding_tokens == len(content) + len("환불 신청 기간")
+    assert result.retrieval_fallback_reason is None
+
+
+# ── 질의 재작성 (DB 필요) ───────────────────────────────────────────────────
+
+
+@pytest.mark.db
+@pytest.mark.usefixtures("indexed_policies")
+def test_원문과_재작성문을_둘_다_검색해_합집합으로_모은다(
+    app_conn: psycopg.Connection[DictRow], ro_conn: psycopg.Connection[DictRow]
+) -> None:
+    """재작성이 주제를 옮겨도 원문이 안전망이다 (spec §5-2).
+
+    두 질의를 따로 돌린 결과의 합집합이 실제 채택 근거와 같은지 본다 — 어느 한쪽만 쓰면
+    이 등식이 깨진다.
+    """
+    original = "환불 신청 기간이 어떻게 되나요"
+    rewritten = "교환 신청 조건"
+
+    def adopted(content: str) -> set[str]:
+        """재작성을 끄고 그 질의 하나만으로 검색한 결과."""
+        result = _collector(
+            _client({INTENT_STAGE: [_intent("policy")]}),
+            threshold=0.0,
+            top_k=3,
+            query_rewrite_enabled=False,
+        ).collect(
+            inquiry_id=INQUIRY_ID,
+            content=content,
+            order_no=None,
+            app_conn=app_conn,
+            readonly_conn=ro_conn,
+        )
+        return {item.id for item in result.evidence}
+
+    only_original = adopted(original)
+    only_rewritten = adopted(rewritten)
+
+    union = _collector(
+        _client({INTENT_STAGE: [_intent("policy")], QUERY_REWRITE_STAGE: [_rewrite(rewritten)]}),
+        threshold=0.0,
+        top_k=3,
+    ).collect(
+        inquiry_id=INQUIRY_ID,
+        content=original,
+        order_no=None,
+        app_conn=app_conn,
+        readonly_conn=ro_conn,
+    )
+    merged = {item.id for item in union.evidence}
+
+    # 두 질의가 실제로 다른 조항을 물어야 합집합이 관측된다(양성 대조).
+    assert only_rewritten - only_original
+    assert merged <= only_original | only_rewritten
+    assert merged & only_rewritten and merged & only_original
+    # 합집합이어도 채택 상한은 그대로다 — 재작성이 후보를 2배로 늘리지 않는다.
+    assert len(union.evidence) == 3
+
+
+@pytest.mark.db
+@pytest.mark.usefixtures("indexed_policies")
+def test_재작성이_원문과_같으면_임베딩을_한_번만_태운다(
+    app_conn: psycopg.Connection[DictRow], ro_conn: psycopg.Connection[DictRow]
+) -> None:
+    """픽스처 계약이 허용하는 산출이다(`rewritten` == `original`) — 같은 벡터를 두 번 사지 않는다."""
+    content = "환불 신청 기간이 어떻게 되나요"
+    client = _client({INTENT_STAGE: [_intent("policy")], QUERY_REWRITE_STAGE: [_rewrite(content)]})
+
+    result = _collector(client, threshold=0.0).collect(
+        inquiry_id=INQUIRY_ID,
+        content=content,
+        order_no=None,
+        app_conn=app_conn,
+        readonly_conn=ro_conn,
+    )
+
+    # `LexicalEmbeddingClient` 는 문자 수를 토큰으로 센다 — 두 번 실렸으면 2배가 된다.
+    assert result.embedding_tokens == len(content)
+
+
+@pytest.mark.db
+@pytest.mark.usefixtures("indexed_policies")
+def test_재작성_실패는_인계가_아니라_폴백이고_기록에_남는다(
+    app_conn: psycopg.Connection[DictRow], ro_conn: psycopg.Connection[DictRow]
+) -> None:
+    """검색은 검증이 아니라 재료 수집이다 — 재료가 덜 좋아진 것은 검증 없이 내보내는 것과 다르다.
+
+    같은 문의를 재작성 성공 조건에서도 돌려 **폴백이 결과를 망치지 않았다**를 함께 본다.
+    """
+    content = "환불 신청 기간이 어떻게 되나요"
+    client = _client(
+        {
+            INTENT_STAGE: [_intent("policy")],
+            QUERY_REWRITE_STAGE: [
+                LLMCallError(stage=QUERY_REWRITE_STAGE, reason="연결 실패", attempts=2)
+            ],
+        }
+    )
+
+    result = _collector(client, threshold=0.0).collect(
+        inquiry_id=INQUIRY_ID,
+        content=content,
+        order_no=None,
+        app_conn=app_conn,
+        readonly_conn=ro_conn,
+    )
+
+    # 인계가 아니다 — 원문 질의로 그대로 진행해 근거를 모았다.
+    assert result.escalation_reason is None
+    assert result.failed_stage is None
+    assert result.evidence
+    # 조용하지도 않다 — 사유가 수집 결과에 실려 처리 기록·리포트로 흘러간다.
+    assert result.retrieval_fallback_reason is not None
+    assert "전송 오류" in result.retrieval_fallback_reason
+    # 폴백은 사이클 2 동작과 같다 — 원문만 검색한 것과 임베딩 비용이 같다.
+    assert result.embedding_tokens == len(content)

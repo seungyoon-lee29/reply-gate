@@ -7,9 +7,12 @@
 `tests/test_rewritten_queries.py` 의 구조 테스트가 이 파일을 검사한다
 (`docs/standards.md` 의 "평가 입력 격리").
 
-모델·프롬프트는 런타임 의도 해석과 같은 계열을 쓴다. 이 픽스처가 재는 것은
-"정답을 모르는 재작성기가 실제로 낼 수 있는 질의"이므로, 상위 모델이나 사람이 다듬은
-문장을 쓰면 배포 가능한 이득이 아니라 상한을 재게 된다(`docs/tracking/decisions/0010`).
+**프롬프트·스키마·모델·effort 를 런타임과 공유한다** — 문장은
+`reply_gate.query_rewrite` 가 단독 소유하고 이 스크립트가 가져다 쓴다. 두 벌로 복사하면
+픽스처의 생성 조건과 런타임의 호출 조건이 조용히 갈리고, 그 순간 오프라인 비교표가
+런타임을 더 이상 예측하지 못한다. 이 픽스처가 재는 것은 "정답을 모르는 재작성기가 실제로
+낼 수 있는 질의"이므로, 상위 모델이나 사람이 다듬은 문장을 쓰면 배포 가능한 이득이 아니라
+상한을 재게 된다(`docs/tracking/decisions/0010`).
 
 산출은 기존 픽스처를 덮어쓰지 않는다 — `--out` 을 반드시 받아 그 경로에만 쓴다.
 검토한 뒤 사람이 `data/rewritten_queries.jsonl` 로 옮긴다.
@@ -21,57 +24,40 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Final
+from typing import Final
 
 from reply_gate.config import get_settings
 from reply_gate.evaluation import DEFAULT_GOLDEN_SET_PATH, load_golden_set
 from reply_gate.llm import GenerationClient, LLMCallError, LLMFormatError, OpenAIGenerationClient
+from reply_gate.query_rewrite import (
+    REWRITE_JSON_SCHEMA,
+    REWRITE_SYSTEM_PROMPT,
+    build_rewrite_user_prompt,
+)
 
-#: 처리 기록·비용 산출의 단계 이름과 섞이지 않는 픽스처 제작 전용 이름이다.
-REWRITE_STAGE: Final = "fixture_query_rewrite"
-
-REWRITE_SYSTEM_PROMPT: Final = """\
-너는 한국어 이커머스 고객센터 문의를 정책 문서 검색용 질의로 다시 쓴다.
-답변을 쓰지 말고 검색 질의만 만든다.
-
-- 문의가 실제로 묻는 대상을 정책 문서에 쓰일 법한 표현으로 옮긴다.
-- 원문에 없는 사실·수치·고유값을 지어내지 않는다.
-- 너는 이 회사의 정책 문서를 본 적이 없다. 조항 번호나 문서 제목을 쓰지 않는다.
-- 한 문장 또는 명사구 하나로 짧게 쓴다.
-
-산출은 다음 형태의 JSON 이다:
-{"rewritten": "..."}
-"""
-
-REWRITE_JSON_SCHEMA: Final[dict[str, Any]] = {
-    "type": "object",
-    "properties": {"rewritten": {"type": "string"}},
-    "required": ["rewritten"],
-    "additionalProperties": False,
-}
+#: 처리 기록·비용 산출의 단계 이름과 섞이지 않는 픽스처 제작 전용 이름이다
+#: (런타임은 `query_rewrite.QUERY_REWRITE_STAGE`). **단계 이름만 다르고 프롬프트·스키마·
+#: 모델·effort 는 런타임과 같은 한 벌이다.**
+FIXTURE_REWRITE_STAGE: Final = "fixture_query_rewrite"
 
 
-def build_rewrite_user_prompt(*, inquiry: str) -> str:
-    """재작성 프롬프트. 문의 원문 외에는 아무것도 싣지 않는다."""
-    return f"[문의]\n{inquiry}"
-
-
-def rewrite_one(*, client: GenerationClient, inquiry: str) -> str:
+def rewrite_one(*, client: GenerationClient, inquiry: str, effort: str | None = None) -> str:
     """문의 1건의 재작성 질의를 받는다. 형식 위반은 호출자에게 그대로 올린다."""
     completion = client.complete_json(
-        stage=REWRITE_STAGE,
+        stage=FIXTURE_REWRITE_STAGE,
         system=REWRITE_SYSTEM_PROMPT,
         user=build_rewrite_user_prompt(inquiry=inquiry),
         schema=REWRITE_JSON_SCHEMA,
         schema_name="rewrite",
+        effort=effort,
     )
     data = completion.data
     if not isinstance(data, dict):
-        raise LLMFormatError(stage=REWRITE_STAGE, detail="산출이 JSON 객체가 아니다")
+        raise LLMFormatError(stage=FIXTURE_REWRITE_STAGE, detail="산출이 JSON 객체가 아니다")
     rewritten = data.get("rewritten")
     if not isinstance(rewritten, str) or not rewritten.strip():
         raise LLMFormatError(
-            stage=REWRITE_STAGE, detail="rewritten 이 비어 있지 않은 문자열이 아니다"
+            stage=FIXTURE_REWRITE_STAGE, detail="rewritten 이 비어 있지 않은 문자열이 아니다"
         )
     return rewritten.strip()
 
@@ -120,7 +106,9 @@ def main(argv: list[str] | None = None) -> int:
     lines: list[str] = []
     for case in cases:
         try:
-            rewritten = rewrite_one(client=client, inquiry=case.content)
+            rewritten = rewrite_one(
+                client=client, inquiry=case.content, effort=settings.generation_effort
+            )
         except (LLMCallError, LLMFormatError) as exc:
             print(f"{case.id} 재작성 실패: {exc}", file=sys.stderr)
             return 1

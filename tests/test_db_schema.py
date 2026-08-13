@@ -28,6 +28,12 @@ from reply_gate.contracts import (
 )
 from reply_gate.db import connect
 from reply_gate.order_ref import ORDER_NO_REGEX, is_valid_order_no
+from reply_gate.policy_index import (
+    index_policy_documents,
+    load_policy_documents,
+    search_policy_chunks,
+)
+from reply_gate.testing import LexicalEmbeddingClient
 
 pytestmark = pytest.mark.db
 
@@ -216,14 +222,56 @@ def test_policy_chunk_embedding_provenance_is_not_optional(
         )
 
 
-def test_policy_chunks_have_a_vector_index(app_conn: psycopg.Connection[DictRow]) -> None:
+def test_policy_chunks_have_no_approximate_vector_index(
+    app_conn: psycopg.Connection[DictRow],
+) -> None:
+    """근사(HNSW) 인덱스는 **없어야 한다** — 있으면 검색이 조용히 짧아진다.
+
+    실측: `top_k=5` 를 요청했는데 26행 테이블에서 1~2행만, 그것도 1위 조항이 빠진 채
+    돌아왔다. 조항 26개에서 정확 스캔은 0.1 ms 미만이라 근사가 사는 이유가 없다
+    (docs/engineering-notes.md "근사 인덱스가 검색을 조용히 잘라먹었다").
+
+    **이 테스트가 지키는 것은 인덱스의 부재가 아니라 검색의 정확성이다.** 규모가 커져
+    인덱스가 필요해지면 이 테스트를 지우는 것이 아니라, 정확성을 보장하는 방식
+    (예: `hnsw.iterative_scan`)과 함께 다시 세우고 그 보장을 검사로 바꾼다.
+    """
     assert (
         _scalar(
             app_conn,
             "SELECT count(*) FROM pg_indexes WHERE indexname = 'policy_chunks_embedding_idx'",
         )
-        == 1
+        == 0
     )
+
+
+@pytest.mark.parametrize("top_k", [2, 5])
+def test_policy_search_returns_exactly_top_k_rows(
+    app_conn: psycopg.Connection[DictRow], top_k: int
+) -> None:
+    """26행 코퍼스에서 `LIMIT k` 는 항상 k 행을 돌려줘야 한다.
+
+    근사 인덱스가 다시 생기면 여기서 걸린다 — 인덱스 이름을 보는 검사는 다른 이름으로
+    만들면 빠져나가지만, 이 검사는 **증상**을 본다.
+    """
+    index_policy_documents(
+        conn=app_conn,
+        documents=load_policy_documents(),
+        embedder=LexicalEmbeddingClient(dimensions=1536),
+    )
+    embedder = LexicalEmbeddingClient(dimensions=1536)
+    vector = embedder.embed(stage="t", texts=["환불 신청 기간이 어떻게 되나요"]).vectors[0]
+
+    hits = search_policy_chunks(
+        conn=app_conn,
+        query_vector=vector,
+        top_k=top_k,
+        # 임계값을 -1 로 두어 컷이 아니라 **검색 자체**가 몇 행을 주는지만 본다.
+        similarity_threshold=-1.0,
+        embedding_model=embedder.model,
+        embedding_dimensions=embedder.dimensions,
+    )
+
+    assert len(hits) == top_k
 
 
 def test_policy_chunk_evidence_id_follows_the_contract(
@@ -316,6 +364,42 @@ def _insert_attempt(
             evidence_contradictions,
         ),
     )
+
+
+def test_retrieval_columns_default_to_no_fallback_and_zero_cost(
+    app_conn: psycopg.Connection[DictRow],
+) -> None:
+    """검색 계열 컬럼은 **살아 있는 볼륨에 붙는다** — 기존 행이 기본값을 받아야 한다.
+
+    `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 로 붙이기로 한 판단(볼륨을 지우면 보존
+    대상 처리 기록과 이미 과금한 정책 인덱스가 사라진다)이 실제로 성립하는지를 여기서
+    본다: 컬럼을 적지 않고 넣은 행이 `0 / NULL` 로 선다.
+    """
+    inquiry_id = _insert_inquiry(app_conn)
+
+    row = app_conn.execute(
+        """SELECT retrieval_input_tokens, retrieval_output_tokens, retrieval_fallback_reason
+           FROM inquiries WHERE id = %s""",
+        (inquiry_id,),
+    ).fetchone()
+
+    assert row is not None
+    assert row["retrieval_input_tokens"] == 0
+    assert row["retrieval_output_tokens"] == 0
+    # NULL 은 "폴백하지 않았다"이고 인계 사유가 아니다.
+    assert row["retrieval_fallback_reason"] is None
+
+
+def test_retrieval_token_columns_reject_negative_values(
+    app_conn: psycopg.Connection[DictRow],
+) -> None:
+    """판정·생성 계열과 같은 자격의 CHECK 다 — 조건부로 붙여도 실제로 걸려 있어야 한다."""
+    inquiry_id = _insert_inquiry(app_conn)
+
+    with pytest.raises(psycopg.errors.CheckViolation):
+        app_conn.execute(
+            "UPDATE inquiries SET retrieval_input_tokens = -1 WHERE id = %s", (inquiry_id,)
+        )
 
 
 def test_processing_record_round_trip(app_conn: psycopg.Connection[DictRow]) -> None:

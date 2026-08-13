@@ -3,10 +3,17 @@
 --
 -- 적용 주체는 **애플리케이션 계정**이다 (`reply_gate.db.apply_schema`). 그래야 테이블 소유자가
 -- 앱 계정이 되고, 앱 계정이 read-only 그룹에 SELECT 를 줄 수 있다.
--- 재실행 안전: 모든 문장이 IF NOT EXISTS / 멱등 GRANT 다.
+-- 재실행 안전: 모든 문장이 IF NOT EXISTS / 멱등 GRANT / 조건부 ALTER 다.
 --
--- 주의: 이미 존재하는 테이블의 컬럼을 바꾸지는 못한다(IF NOT EXISTS 는 조용히 넘어간다).
--- 스키마를 바꿨으면 `docker compose down -v && docker compose up -d` 로 볼륨째 재생성한다.
+-- 주의: `CREATE TABLE IF NOT EXISTS` 는 **이미 있는 테이블의 컬럼을 바꾸지 않는다**
+-- (조용히 넘어간다). 컬럼을 바꾸는 변경은 `docker compose down -v && docker compose up -d`
+-- 로 볼륨째 재생성하는 것이 기본이다.
+--
+-- **예외는 컬럼 추가뿐이다.** 추가는 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 로 살아 있는
+-- 볼륨에 그대로 붙일 수 있고(PG11+ 에서 테이블 재작성 없는 메타데이터 연산), 그래야
+-- 보존하기로 한 처리 기록과 이미 과금한 정책 인덱스를 날리지 않는다. 새 볼륨에서는 위쪽
+-- CREATE TABLE 이 이미 만든 뒤라 아무 일도 하지 않는다 — **두 자리에 같은 정의를 적는
+-- 것까지가 이 방식의 값이다.** 컬럼 변경·삭제는 여전히 볼륨 재생성이다.
 
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -85,8 +92,15 @@ CREATE TABLE IF NOT EXISTS policy_chunks (
     )
 );
 
-CREATE INDEX IF NOT EXISTS policy_chunks_embedding_idx
-    ON policy_chunks USING hnsw (embedding vector_cosine_ops);
+-- 벡터 인덱스를 **두지 않는다.** HNSW 는 근사 인덱스라 `LIMIT k` 를 요청해도 k 보다 적게,
+-- 그리고 최상위가 빠진 채로 돌려줄 수 있다. 조항이 26개인 코퍼스에서 그것은 순수한 손해다:
+-- 정확 스캔이 0.1 ms 도 안 걸리는데 검색 품질을 확률적으로 깎는다. 실측으로 확인한 모양은
+-- `top_k=5` · 26행 · 임계값 0.0 인데 **1~2행만, 그것도 1위가 빠진 채** 돌아오는 것이었다
+-- (docs/engineering-notes.md "근사 인덱스가 검색을 조용히 잘라먹었다").
+--
+-- 이 프로젝트의 유일한 주장이 신뢰성 지표라서 더 그렇다 — 검색이 조용히 짧아지면
+-- `no_evidence` 인계가 늘고, 그 수치가 "검색 품질"로 리포트에 실린다.
+DROP INDEX IF EXISTS policy_chunks_embedding_idx;
 
 -- ── 처리 기록 1 — 문의 ───────────────────────────────────────────────────────
 -- 평가 지표(p50/p95 지연, 건당 토큰 비용)의 원천이다 (docs/business-rules.md "엔티티와 관계").
@@ -112,6 +126,13 @@ CREATE TABLE IF NOT EXISTS inquiries (
     -- 비용을 분리해 말할 수 없으므로 별도 컬럼이다. 적재 코드가 채우기 전까지는 0 이다.
     judge_input_tokens  integer    NOT NULL DEFAULT 0,
     judge_output_tokens integer    NOT NULL DEFAULT 0,
+    -- 검색 단계(질의 재작성) 생성 호출 토큰. 생성 토큰과 섞으면 초안을 만들지도 않은
+    -- 문의가 초안 생성 토큰을 쓴 것으로 찍힌다 (docs/contracts.md "토큰 집계 경계").
+    retrieval_input_tokens  integer NOT NULL DEFAULT 0,
+    retrieval_output_tokens integer NOT NULL DEFAULT 0,
+    -- 검색 단계가 폴백한 사유. NULL 은 "폴백하지 않았다"이고 인계 사유가 아니다 —
+    -- 조용한 폴백을 금지하는 것이 이 컬럼의 존재 이유다 (.dryforge/spec.md §8-1).
+    retrieval_fallback_reason text,
     created_at         timestamptz NOT NULL DEFAULT now(),
 
     CONSTRAINT inquiries_pkey PRIMARY KEY (id),
@@ -142,8 +163,36 @@ CREATE TABLE IF NOT EXISTS inquiries (
     ),
     CONSTRAINT inquiries_judge_tokens_nonneg CHECK (
         judge_input_tokens >= 0 AND judge_output_tokens >= 0
+    ),
+    CONSTRAINT inquiries_retrieval_tokens_nonneg CHECK (
+        retrieval_input_tokens >= 0 AND retrieval_output_tokens >= 0
     )
 );
+
+-- 이미 있는 볼륨에도 검색 계열 컬럼을 붙인다.
+--
+-- `CREATE TABLE IF NOT EXISTS` 는 기존 테이블의 컬럼을 바꾸지 못한다. 그래서 지금까지
+-- 스키마 변경은 `docker compose down -v` 로 볼륨째 재생성했지만, 이 세 컬럼은 그럴 수
+-- 없다 — 볼륨을 지우면 보존하기로 한 처리 기록 2건(오탐 버그 시절 기록·데모용
+-- 기각→재생성→통과)이 사라지고, 정책 인덱스 재색인이 다시 과금된다.
+--
+-- 아래 문장은 이 파일의 기존 성질을 지킨다: **재실행 안전**(IF NOT EXISTS)이고,
+-- 새 볼륨에서는 위 CREATE TABLE 이 이미 만든 뒤라 아무 일도 하지 않는다. PG11+ 에서
+-- 기본값이 있는 컬럼 추가는 테이블 재작성 없는 메타데이터 연산이다.
+-- CHECK 제약은 이름이 겹치면 실패하므로 조건부로 붙인다.
+ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS retrieval_input_tokens  integer NOT NULL DEFAULT 0;
+ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS retrieval_output_tokens integer NOT NULL DEFAULT 0;
+ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS retrieval_fallback_reason text;
+
+DO $$
+BEGIN
+    ALTER TABLE inquiries ADD CONSTRAINT inquiries_retrieval_tokens_nonneg CHECK (
+        retrieval_input_tokens >= 0 AND retrieval_output_tokens >= 0
+    );
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END
+$$;
 
 CREATE INDEX IF NOT EXISTS inquiries_created_at_idx ON inquiries (created_at);
 CREATE INDEX IF NOT EXISTS inquiries_status_idx ON inquiries (status);

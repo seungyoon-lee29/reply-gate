@@ -204,7 +204,7 @@ flowchart TD
     INTENT -- "policy · both" --> VEC
     INTENT -- "order · both" --> PRECHK
 
-    VEC["3a. 정책 근거 수집 [코드]<br/>문의 임베딩 → pgvector 코사인 검색<br/>top_k=5 · 유사도 임계값 0.3"]
+    VEC["3a. 정책 근거 수집 [코드]<br/>질의 재작성 [LLM] → 원문·재작성 임베딩 → pgvector 코사인 검색 ×2<br/>합집합(더 큰 유사도) → top_k=5 · 유사도 임계값 0.5<br/>재작성 실패 = 원문으로 폴백(인계 아님)"]
     VEC --> MERGE
 
     PRECHK["3b. 주문 존재성 선검사 [코드]<br/>고정 파라미터 쿼리 · LLM 미개입"]
