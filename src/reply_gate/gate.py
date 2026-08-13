@@ -160,7 +160,7 @@ def evaluate_draft(
 
     # PII 검사는 텍스트만 있으면 할 수 있으므로 스키마가 깨져도 가능한 한 수행한다.
     if _has_unsourced_pii(
-        draft_texts=_collect_texts(raw_draft),
+        draft_texts=_answer_texts(inspection=inspection, raw_draft=raw_draft),
         evidence_texts=[evidence.evidence_text for evidence in evidences],
         patterns=pii_patterns,
     ):
@@ -195,10 +195,15 @@ class _SchemaInspection:
 
     `citation_lists` 는 citation 검사를 할 수 있는 claim 들의 원시 citation_ids 목록이다
     (구조가 깨진 claim 은 빠진다). `draft` 는 구조가 완전할 때만 채워진다.
+
+    `answer_texts` 는 **답변으로 나갈 수 있는 텍스트**다 — claim 의 `text` 중 문자열인 것
+    전부. `draft` 와 달리 구조가 깨져도 채워진다(깨진 claim 옆의 멀쩡한 claim 은 여전히
+    답변 후보다). PII 검사 대상이 이것이다.
     """
 
     ok: bool
     citation_lists: tuple[tuple[object, ...], ...]
+    answer_texts: tuple[str, ...]
     draft: Draft | None
 
 
@@ -212,14 +217,15 @@ def _inspect_schema(raw_draft: object) -> _SchemaInspection:
     계약이고, 추가 키는 claim 이 근거를 딛고 섰는지와 무관하기 때문이다.
     """
     if not isinstance(raw_draft, Mapping):
-        return _SchemaInspection(ok=False, citation_lists=(), draft=None)
+        return _SchemaInspection(ok=False, citation_lists=(), answer_texts=(), draft=None)
 
     claims = raw_draft.get(_CLAIMS_KEY)
     if not isinstance(claims, list | tuple) or not claims:
-        return _SchemaInspection(ok=False, citation_lists=(), draft=None)
+        return _SchemaInspection(ok=False, citation_lists=(), answer_texts=(), draft=None)
 
     ok = True
     citation_lists: list[tuple[object, ...]] = []
+    answer_texts: list[str] = []
     parsed: list[Claim] = []
     for claim in claims:
         if not isinstance(claim, Mapping):
@@ -227,6 +233,8 @@ def _inspect_schema(raw_draft: object) -> _SchemaInspection:
             continue
 
         text = claim.get(_TEXT_KEY)
+        if isinstance(text, str):
+            answer_texts.append(text)
         if not isinstance(text, str) or not text.strip():
             ok = False
 
@@ -246,6 +254,7 @@ def _inspect_schema(raw_draft: object) -> _SchemaInspection:
     return _SchemaInspection(
         ok=ok,
         citation_lists=tuple(citation_lists),
+        answer_texts=tuple(answer_texts),
         draft=Draft(claims=tuple(parsed)) if ok else None,
     )
 
@@ -253,11 +262,30 @@ def _inspect_schema(raw_draft: object) -> _SchemaInspection:
 # ── PII 검사 ────────────────────────────────────────────────────────────────
 
 
-def _collect_texts(value: object, *, depth: int = 0) -> list[str]:
-    """원시 초안에서 검사 대상 문자열을 전부 긁어온다 (dict 순서대로 — 결정론).
+def _answer_texts(*, inspection: _SchemaInspection, raw_draft: object) -> Sequence[str]:
+    """PII 검사 대상을 고른다 — **답변으로 나갈 수 있는 텍스트만.**
 
-    claim 의 text 만 보지 않는 이유: 형식이 깨진 초안(원문 문자열, 엉뚱한 키)에서도
-    PII 는 새어 나갈 수 있고, L1 은 그때도 검사해야 한다.
+    `to_draft` 가 살려내는 것은 claim 의 `text` 뿐이고 답변은 그것들의 연결이다
+    (`Draft.answer_text`). 초안의 나머지 키(최상위 `debug`, claim 안의 `note` 등)는
+    답변에 실리지 않으므로 검사하면 **답변에 없는 값으로 정상 초안을 기각하게 된다.**
+    초안 JSON 은 LLM 산출이라 이런 키가 언제든 늘어날 수 있고, 헤드라인 지표가
+    "정상 초안 오탐률"이므로 그 오탐이 곧 지표 오염이다
+    (`src/reply_gate/AGENTS.md` 불변식 7 · docs/business-rules.md "PII 규칙").
+
+    **답변 후보 텍스트를 하나도 식별할 수 없을 때만** 초안 전체를 긁는다 — 원문 문자열이
+    통째로 넘어온 경우처럼 무엇이 답변인지 코드가 모르는 상태다. 그런 초안은 어차피
+    `schema_violation` 으로 기각되므로 답변이 나가지는 않지만, 게이트는 모르는 쪽에서
+    검사하는 방향으로 보수적으로 간다.
+    """
+    if inspection.answer_texts:
+        return inspection.answer_texts
+    return _collect_texts(raw_draft)
+
+
+def _collect_texts(value: object, *, depth: int = 0) -> list[str]:
+    """원시 초안에서 문자열을 전부 긁어온다 (dict 순서대로 — 결정론).
+
+    답변 후보를 식별할 수 없을 때의 폴백 전용이다(`_answer_texts`).
 
     **`citation_ids` 는 제외한다.** docs/business-rules.md "PII 규칙" 의 검사 대상은
     "초안 텍스트" — 최종 사용자에게

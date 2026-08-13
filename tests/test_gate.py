@@ -746,4 +746,73 @@ def test_형식이_깨진_초안의_PII_는_계속_검사한다() -> None:
     result = evaluate_draft(raw_draft="고객센터는 1588-1234 입니다", evidences=[evidence])
 
     assert RejectReason.SCHEMA_VIOLATION in result.reject_reasons
+
+
+# ── 답변에 나가지 않는 키는 PII 검사 대상이 아니다 (불변식 7) ─────────────────
+
+
+@pytest.mark.parametrize(
+    ("case", "raw_draft"),
+    [
+        (
+            "최상위 추가 키",
+            {"claims": [{"text": NORMAL_TEXT, "citation_ids": [POLICY_ID]}], "debug": "1588-1234"},
+        ),
+        (
+            "claim 안의 추가 키",
+            {
+                "claims": [
+                    {"text": NORMAL_TEXT, "citation_ids": [POLICY_ID], "note": "010-9999-8888"}
+                ]
+            },
+        ),
+        (
+            "중첩된 추가 키",
+            {
+                "claims": [{"text": NORMAL_TEXT, "citation_ids": [POLICY_ID]}],
+                "trace": {"prompt": {"raw": "담당자 010-9999-8888"}},
+            },
+        ),
+    ],
+)
+def test_답변에_나가지_않는_키의_PII_로_기각하지_않는다(case: str, raw_draft: object) -> None:
+    """`to_draft` 가 버리는 키는 답변에 실리지 않으므로 검사 대상이 아니다.
+
+    `src/reply_gate/AGENTS.md` 불변식 7 — "L1 의 PII 검사 대상은 답변 텍스트뿐이다".
+    초안 JSON 은 LLM 산출이라 이런 키가 언제든 늘어날 수 있고, 헤드라인 지표가
+    "정상 초안 오탐률"이라 여기서 기각하면 지표가 직접 오염된다.
+    """
+    result = evaluate_draft(raw_draft=raw_draft, evidences=_evidences())
+
+    assert result.verdict is Verdict.PASS, f"{case}: {result.reject_reasons}"
+    assert to_draft(raw_draft).answer_text == NORMAL_TEXT  # 답변에 그 값이 없다는 확인
+
+
+def test_검사에서_뺀_키가_답변에_실리면_그때는_기각된다() -> None:
+    """양성 대조 — 제외 기준은 '키 이름' 이 아니라 '답변에 나가는가' 다."""
+    raw_draft = {
+        "claims": [{"text": f"{NORMAL_TEXT} 담당자 010-9999-8888", "citation_ids": [POLICY_ID]}],
+        "debug": "무해한 값",
+    }
+
+    result = evaluate_draft(raw_draft=raw_draft, evidences=_evidences())
+
+    assert RejectReason.PII_DETECTED in result.reject_reasons
+
+
+def test_깨진_claim_옆의_멀쩡한_claim_은_계속_검사한다() -> None:
+    """구조가 깨져도 답변 후보 텍스트가 있으면 그것을 검사한다."""
+    raw_draft = {
+        "claims": [
+            {"text": "담당자 010-9999-8888 로 연락주세요.", "citation_ids": [POLICY_ID]},
+            {"text": NORMAL_TEXT, "citation_ids": "리스트가 아니다"},
+        ]
+    }
+
+    result = evaluate_draft(raw_draft=raw_draft, evidences=_evidences())
+
+    assert result.reject_reasons == (
+        RejectReason.SCHEMA_VIOLATION,
+        RejectReason.PII_DETECTED,
+    )
     assert RejectReason.PII_DETECTED in result.reject_reasons
