@@ -165,7 +165,7 @@ class BrokenCollector:
 class ScriptedJudge:
     """`Judging` 대역 — 시도 순서대로 미리 정한 판정을 돌려준다(예외면 던진다).
 
-    T9 가 `testing.py` 에 결정론 판정 대역을 넣기 전까지, 판정 목은 이 파일 안에만 둔다.
+    사이클 2 T9 가 `testing.py` 에 결정론 판정 대역을 넣기 전까지, 판정 목은 이 파일 안에만 둔다.
     """
 
     def __init__(self, outcomes: Sequence[Any]) -> None:
@@ -1044,7 +1044,7 @@ def live_pipeline(client: ScriptedGenerationClient, *, threshold: float = 0.0) -
     """실제 근거 수집기 + 시딩된 DB 로 도는 조립 — **L2 는 꺼서** 사이클 1 동작으로 본다.
 
     인계 사유 6종·응답 골격은 판정 층과 무관하고, 판정을 켜면 확률 층 대역이 필요해진다
-    (그 대역은 T9 이 `testing.py` 에 넣는다).
+    (그 대역은 사이클 2 T9 가 `testing.py` 에 넣는다).
     """
     return build_pipeline(
         generation_client=cast(GenerationClient, client),
