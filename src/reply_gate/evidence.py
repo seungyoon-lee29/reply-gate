@@ -26,8 +26,9 @@ citations 에 남긴다).
 * **SQL 생성의 형식 불일치·안전장치 거부·실행 오류**는 SQL 실패 경로다 — 오류를 피드백으로
   실어 **SQL 생성만 1회 재시도**하고 재실패하면 `sql_failed`. 재시도 상한은 코드가 강제한다.
 * **검색 단계(질의 재작성)의 실패는 인계가 아니라 폴백**이다 — 원문 질의로 검색을 계속한다
-  (`.dryforge/spec.md` §8-1). 검색은 검증이 아니라 재료 수집이라 fail-closed 원칙의 적용
-  대상이 아니다. 대신 폴백 사유와 토큰이 수집 결과에 실려 처리 기록·리포트에 남는다.
+  (docs/business-rules.md "검색 단계 실패"). 검색은 검증이 아니라 재료 수집이라
+  fail-closed 원칙의 적용 대상이 아니다. 대신 폴백 사유와 토큰이 수집 결과에 실려
+  처리 기록·리포트에 남는다.
   **미배선은 폴백이 아니라 조립 시점 오류**다(`RetrievalWiringError`).
 """
 
@@ -104,13 +105,13 @@ __all__ = [
 class RetrievalWiringError(RuntimeError):
     """검색 전략이 켜졌는데 그 클라이언트가 배선되지 않았다 — **조립 시점 오류**다.
 
-    `pipeline.PipelineWiringError` 와 같은 자격이다(`.dryforge/spec.md` §8-1): 기본값·`None`
-    이 조용히 전략을 끄는 fail-open 배선을 금지한다. 이름이 갈린 것은 자리가 다르기
+    `pipeline.PipelineWiringError` 와 같은 자격이다(docs/business-rules.md "검색 단계 실패"):
+    기본값·`None` 이 조용히 전략을 끄는 fail-open 배선을 금지한다. 이름이 갈린 것은 자리가 다르기
     때문이다 — 협력자를 받는 조립자가 각자 자기 배선을 검사하고, `evidence` 는
     `pipeline` 을 import 할 수 없다(순환).
 
     **인계 사유가 아니다.** 업무 판정이 아니라 배선 오류이므로 `llm_call_failed` 로 삼키지
-    않고 그대로 올려보낸다. 재작성 **호출의 실패**는 반대로 폴백이다(spec §8-1) — 배선이
+    않고 그대로 올려보낸다. 재작성 **호출의 실패**는 반대로 폴백이다(같은 절) — 배선이
     없는 것과 호출이 실패한 것을 섞으면, 배선을 빠뜨린 실행이 "재작성을 썼는데 매번
     실패했다"로 집계된다.
     """
@@ -533,7 +534,8 @@ def merge_policy_rankings(
     rewritten: Sequence[PolicySearchHit],
     top_k: int,
 ) -> tuple[PolicySearchHit, ...]:
-    """원문·재작성 질의의 검색 결과를 합집합으로 모아 상위 `top_k` 를 돌려준다 (spec §5-2).
+    """원문·재작성 질의의 검색 결과를 합집합으로 모아 상위 `top_k` 를 돌려준다
+    (docs/architecture.md "대표 흐름" 3단계).
 
     같은 조항이 두 질의에 다 걸리면 **더 큰 유사도**를 쓴다 — 합침 규칙은 오프라인 비교
     하네스와 **같은 구현**(`retrieval_strategies.merge_rewritten_rankings`)이다. 여기서
@@ -769,7 +771,8 @@ class EvidenceCollector:
     ) -> None:
         """(질의 재작성) → 문의 임베딩 → pgvector 유사도 검색 → 임계값을 넘은 상위 k 개 조항.
 
-        **원문과 재작성문을 둘 다 검색해 합집합으로 모은다**(spec §5-2) — 재작성이 주제를
+        **원문과 재작성문을 둘 다 검색해 합집합으로 모은다**
+        (docs/architecture.md "대표 흐름" 3단계) — 재작성이 주제를
         옮겼을 때 원문이 안전망이다. 재작성을 얻지 못하면 원문만으로 계속한다(폴백).
         """
         queries = [content]
@@ -808,8 +811,9 @@ class EvidenceCollector:
     def _rewrite(self, *, ledger: _Ledger, content: str) -> str | None:
         """검색용 질의를 얻는다. 스위치가 꺼져 있거나 폴백이면 `None`.
 
-        **폴백은 인계가 아니다**(spec §8-1). 다만 조용히 지나가지도 않는다 — 사유와
-        실비용 토큰이 원장에 남아 처리 기록·평가 리포트로 흘러간다(하드 게이트 4).
+        **폴백은 인계가 아니다**(docs/business-rules.md "검색 단계 실패"). 다만 조용히
+        지나가지도 않는다 — 사유와 실비용 토큰이 원장에 남아 처리 기록·평가 리포트로
+        흘러간다(하드 게이트 4).
         """
         if not self._settings.query_rewrite_enabled:
             return None

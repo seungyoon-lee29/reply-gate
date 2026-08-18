@@ -1351,7 +1351,7 @@ def test_검색_토큰은_생성_임베딩_어디에도_합산되지_않는다(
 def test_원문과_재작성문을_둘_다_검색해_합집합으로_모은다(
     app_conn: psycopg.Connection[DictRow], ro_conn: psycopg.Connection[DictRow]
 ) -> None:
-    """재작성이 주제를 옮겨도 원문이 안전망이다 (spec §5-2).
+    """재작성이 주제를 옮겨도 원문이 안전망이다 (docs/architecture.md "대표 흐름" 3단계).
 
     두 질의를 따로 돌린 결과의 합집합이 실제 채택 근거와 같은지 본다 — 어느 한쪽만 쓰면
     이 등식이 깨진다.

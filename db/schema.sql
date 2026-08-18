@@ -131,7 +131,8 @@ CREATE TABLE IF NOT EXISTS inquiries (
     retrieval_input_tokens  integer NOT NULL DEFAULT 0,
     retrieval_output_tokens integer NOT NULL DEFAULT 0,
     -- 검색 단계가 폴백한 사유. NULL 은 "폴백하지 않았다"이고 인계 사유가 아니다 —
-    -- 조용한 폴백을 금지하는 것이 이 컬럼의 존재 이유다 (.dryforge/spec.md §8-1).
+    -- 조용한 폴백을 금지하는 것이 이 컬럼의 존재 이유다
+    -- (docs/business-rules.md "검색 단계 실패 — 폴백이지 인계가 아니다").
     retrieval_fallback_reason text,
     created_at         timestamptz NOT NULL DEFAULT now(),
 

@@ -575,8 +575,9 @@ class PipelineAgreement:
     #: 검색 계열도 같은 자격으로 분리해서 센다.
     retrieval_input_tokens_total: int = 0
     retrieval_output_tokens_total: int = 0
-    #: 검색 단계가 폴백한 문의 수. **조용한 폴백을 금지하는 집계**다(`.dryforge/spec.md` §8-1)
-    #: — 0 이 정상이고, 커지면 재작성 층이 사실상 꺼진 실행을 정상 실측으로 읽게 된다.
+    #: 검색 단계가 폴백한 문의 수. **조용한 폴백을 금지하는 집계**다
+    #: (docs/business-rules.md "검색 단계 실패") — 0 이 정상이고, 커지면 재작성 층이
+    #: 사실상 꺼진 실행을 정상 실측으로 읽게 된다.
     retrieval_fallback_total: int = 0
 
     @property
@@ -1270,7 +1271,7 @@ class RunConditions:
     judge: str
     similarity_threshold: float
     top_k: int
-    #: 검색 구성 요약 (`.dryforge/spec.md` §8-3). **필수 필드**다 — 같은 지표를 다른 검색
+    #: 검색 구성 요약 (scripts/AGENTS.md 불변식 15). **필수 필드**다 — 같은 지표를 다른 검색
     #: 설정으로 잰 산출물이 이름 계열은 하나이므로(리포트 이름을 늘리지 않기로 한 판단),
     #: 어떤 구성으로 잰 값인지는 실행 조건이 들고 있어야 한다. `embedding` 문자열이 모델을
     #: 담지만 차원·전략 조합은 거기 없다.

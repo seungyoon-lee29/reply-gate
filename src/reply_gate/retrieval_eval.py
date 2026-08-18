@@ -373,7 +373,7 @@ class UnmeasuredStage:
 
 @dataclass(frozen=True)
 class RerankStats:
-    """리랭크 단의 관측 기록. 조용한 폴백을 막는다(spec §8-1)."""
+    """리랭크 단의 관측 기록. 조용한 폴백을 막는다(docs/business-rules.md "검색 단계 실패")."""
 
     calls: int
     fallbacks: int

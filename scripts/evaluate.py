@@ -287,7 +287,7 @@ def _judge_label(
 
 
 def _retrieval_strategy_label(settings: Settings) -> str:
-    """실행 조건에 남는 검색 전략 조합 (`.dryforge/spec.md` §8-3).
+    """실행 조건에 남는 검색 전략 조합 (scripts/AGENTS.md 불변식 15).
 
     **설정에서 유도한다** — 손으로 적으면 스위치를 껐는데 리포트가 켜졌다고 말한다.
     하이브리드·리랭크는 실행 경로에 없으므로(미채택) 여기 나타날 이름이 없다.
