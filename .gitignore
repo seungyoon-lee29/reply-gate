@@ -2,12 +2,14 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv
 venv/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .retrieval-cache/
+.retrieval-cache
 
 # 환경·시크릿
 .env
