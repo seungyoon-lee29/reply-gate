@@ -48,17 +48,20 @@ from reply_gate.contracts import (
     InquiryStatus,
     RejectReason,
     Verdict,
+    is_policy_evidence_id,
 )
 from reply_gate.gate import DEFAULT_PII_PATTERNS, REASON_ORDER, evaluate_draft
 from reply_gate.judge import L2_REJECT_REASONS
 from reply_gate.llm import LLMCallError, LLMFormatError
 from reply_gate.pipeline import (
+    L2_JUDGE_STAGE,
     Judging,
     ProcessedInquiry,
     ReceiptError,
     accept_inquiry,
     new_inquiry_id,
 )
+from reply_gate.query_rewrite import QUERY_REWRITE_STAGE
 
 __all__ = [
     "DEFAULT_GOLDEN_SET_PATH",
@@ -487,6 +490,8 @@ class GoldenOutcome:
     failed_stage: str | None
     attempt_verdicts: tuple[Verdict, ...]
     reject_reasons: tuple[RejectReason, ...]
+    #: 파이프라인이 실제 수집·채택해 결과에 실은 근거 ID. 검색 라벨은 이 값의 입력이 아니다.
+    adopted_evidence_ids: tuple[str, ...]
     latency_ms: int
     input_tokens: int
     output_tokens: int
@@ -499,6 +504,12 @@ class GoldenOutcome:
     mismatches: tuple[str, ...]
     #: 접수 거부처럼 파이프라인에 진입조차 못한 경우의 사유.
     error: str | None
+    #: 검색 단계(질의 재작성) 토큰 — 같은 규칙의 세 번째 계열이다. 재작성을 쓰지 않은
+    #: 문의는 0 이고, 실패한 호출의 토큰도 실비용이므로 그대로 들어온다.
+    retrieval_input_tokens: int = 0
+    retrieval_output_tokens: int = 0
+    #: 검색 단계가 폴백한 사유. 인계 사유가 아니다 — 폴백한 문의도 답변으로 끝날 수 있다.
+    retrieval_fallback_reason: str | None = None
 
     @property
     def rejected_at_least_once(self) -> bool:
@@ -506,8 +517,29 @@ class GoldenOutcome:
 
         종합 verdict 를 보므로 L1 기각도 L2 기각도 같은 자격으로 들어온다. 기각 재현율의
         정의가 층에 묶이면 L2 도입이 지표 정의를 바꾸게 되고, 도입 전후 비교가 깨진다.
+
+        **이 값만으로 "게이트가 놓쳤다"고 읽으면 안 된다** — 게이트가 아예 돌지 않은
+        경우에도 False 다. 두 상태의 구분은 `gate_never_ran` 이 들고 있다.
         """
         return any(verdict is Verdict.REJECT for verdict in self.attempt_verdicts)
+
+    @property
+    def gate_never_ran(self) -> bool:
+        """L2 판정 호출이 무너져 **판정 자체가 없었던** 케이스인가.
+
+        판정 호출이 실패한 시도의 종합 verdict 는 `pass` 다(docs/contracts.md "층별 판정 키"
+        ③ — 그 시도의 진실은 `escalation_reason` 이 들고 있다). 그래서 `attempt_verdicts`
+        만 보면 **"게이트가 돌았고 놓쳤다"와 "게이트가 안 돌았다"가 같은 값**이 되고,
+        미실행이 관측 실패로 접혀 지표에 0 으로 채워진다
+        (`scripts/AGENTS.md` 불변식 5 — 미실행을 0 으로 채우지 않는다).
+
+        contracts.md 가 지정한 신호를 그대로 쓴다: 인계 사유 `llm_call_failed` +
+        실패 단계 `l2_judge`.
+        """
+        return (
+            self.escalation_reason is EscalationReason.LLM_CALL_FAILED
+            and self.failed_stage == L2_JUDGE_STAGE
+        )
 
 
 @dataclass(frozen=True)
@@ -520,8 +552,12 @@ class PipelineAgreement:
 
     total: int
     matched: int
+    #: 미끼 범주 중 **판정이 실제로 돈** 건수 = 재현율의 분모.
     bait_total: int
     bait_reject_reproduced: int
+    #: 미끼 범주인데 L2 판정 호출이 무너져 **측정되지 않은** 건수. 분모 밖이고, 0 으로
+    #: 채우지 않는다(`scripts/AGENTS.md` 불변식 5). 리포트에 사유와 함께 실린다.
+    bait_unmeasured: int
     forbidden_watch_total: int
     forbidden_violations: int
     latency_p50_ms: int | None
@@ -536,6 +572,12 @@ class PipelineAgreement:
     status_counts: Mapping[str, int]
     escalation_counts: Mapping[str, int]
     outcomes: tuple[GoldenOutcome, ...]
+    #: 검색 계열도 같은 자격으로 분리해서 센다.
+    retrieval_input_tokens_total: int = 0
+    retrieval_output_tokens_total: int = 0
+    #: 검색 단계가 폴백한 문의 수. **조용한 폴백을 금지하는 집계**다(`.dryforge/spec.md` §8-1)
+    #: — 0 이 정상이고, 커지면 재작성 층이 사실상 꺼진 실행을 정상 실측으로 읽게 된다.
+    retrieval_fallback_total: int = 0
 
     @property
     def match_rate(self) -> float | None:
@@ -548,6 +590,10 @@ class PipelineAgreement:
         분자의 정의는 **시도 중 최소 1건 기각, 층 무관**이다(L2 도입으로 바뀌지 않는다).
         분모는 라벨(`expect_reject`)이 아니라 범주다 — 라벨을 판정 규칙에 정렬하면서
         (결정 0008) 기각 요구는 해제했지만 관측은 유지하기 때문이다.
+
+        **판정이 돌지 못한 건(`bait_unmeasured`)은 분모에서 뺀다.** 남겨 두면 인프라
+        실패가 "게이트가 미끼를 놓쳤다"와 같은 값이 되어, 미실행이 관측 실패로 둔갑한다.
+        전부 미측정이면 재현율은 0.0 이 아니라 **None**(미실행)이다.
         """
         return None if self.bait_total == 0 else self.bait_reject_reproduced / self.bait_total
 
@@ -568,8 +614,14 @@ class PipelineAgreement:
         return (self.judge_input_tokens_total + self.judge_output_tokens_total) / self.total
 
     @property
+    def retrieval_tokens_per_inquiry(self) -> float | None:
+        if self.total == 0:
+            return None
+        return (self.retrieval_input_tokens_total + self.retrieval_output_tokens_total) / self.total
+
+    @property
     def total_tokens_per_inquiry(self) -> float | None:
-        """세 계열 합산 — 판정 계열을 빠뜨리면 L2 켜짐 실측의 건당 비용이 거짓이 된다."""
+        """네 계열 합산 — 한 계열이라도 빠지면 건당 비용이 거짓이 된다."""
         if self.total == 0:
             return None
         return _grand_total(self) / self.total
@@ -665,7 +717,16 @@ def _compare(case: GoldenCase, processed: ProcessedInquiry) -> tuple[bool, tuple
 
     rejected = any(attempt.verdict is Verdict.REJECT for attempt in processed.attempts)
     if expected.expect_reject and not rejected:
-        mismatches.append("기각을 기대했으나 어떤 시도도 기각되지 않았다")
+        # 판정이 아예 돌지 못한 경우까지 "기각되지 않았다"로 적으면 거짓이다 — 게이트가
+        # 통과시킨 것이 아니라 게이트에 닿지 못했다. 불일치인 것은 같지만 사유가 다르고,
+        # 사람이 이 문자열을 읽고 게이트 품질을 판단한다.
+        if (
+            processed.escalation_reason is EscalationReason.LLM_CALL_FAILED
+            and processed.failed_stage == L2_JUDGE_STAGE
+        ):
+            mismatches.append("기각을 기대했으나 L2 판정 호출이 실패해 판정이 없었다(미측정)")
+        else:
+            mismatches.append("기각을 기대했으나 어떤 시도도 기각되지 않았다")
 
     seen_reasons = {reason for attempt in processed.attempts for reason in attempt.reject_reasons}
     forbidden = sorted(reason.value for reason in seen_reasons & expected.forbidden_reject_reasons)
@@ -698,6 +759,7 @@ def evaluate_case(
             failed_stage=None,
             attempt_verdicts=(),
             reject_reasons=(),
+            adopted_evidence_ids=(),
             latency_ms=0,
             input_tokens=0,
             output_tokens=0,
@@ -727,6 +789,7 @@ def evaluate_case(
         reject_reasons=tuple(
             reason for attempt in processed.attempts for reason in attempt.reject_reasons
         ),
+        adopted_evidence_ids=tuple(item.id for item in processed.evidence),
         latency_ms=processed.latency_ms,
         input_tokens=processed.input_tokens,
         output_tokens=processed.output_tokens,
@@ -736,6 +799,9 @@ def evaluate_case(
         matched=matched,
         mismatches=mismatches,
         error=None,
+        retrieval_input_tokens=processed.retrieval_input_tokens,
+        retrieval_output_tokens=processed.retrieval_output_tokens,
+        retrieval_fallback_reason=processed.retrieval_fallback_reason,
     )
 
 
@@ -771,11 +837,15 @@ def measure_pipeline_agreement(
             name = outcome.escalation_reason.value
             escalation_counts[name] = escalation_counts.get(name, 0) + 1
 
-    bait = [
+    # 미끼 범주를 "판정이 돈 것"과 "돌지 못한 것"으로 가른다 — 뒤엣것을 분모에 남기면
+    # 인프라 실패가 게이트 실패로 둔갑한다(`GoldenOutcome.gate_never_ran`).
+    bait_all = [
         (case, outcome)
         for case, outcome in zip(cases, outcomes, strict=True)
         if case.category == BAIT_CATEGORY
     ]
+    bait = [(case, outcome) for case, outcome in bait_all if not outcome.gate_never_ran]
+    bait_unmeasured = len(bait_all) - len(bait)
     watch = [
         (case, outcome)
         for case, outcome in zip(cases, outcomes, strict=True)
@@ -788,6 +858,7 @@ def measure_pipeline_agreement(
         matched=sum(1 for outcome in outcomes if outcome.matched),
         bait_total=len(bait),
         bait_reject_reproduced=sum(1 for _, outcome in bait if outcome.rejected_at_least_once),
+        bait_unmeasured=bait_unmeasured,
         forbidden_watch_total=len(watch),
         forbidden_violations=sum(
             1
@@ -804,6 +875,11 @@ def measure_pipeline_agreement(
         status_counts=status_counts,
         escalation_counts=escalation_counts,
         outcomes=tuple(outcomes),
+        retrieval_input_tokens_total=sum(outcome.retrieval_input_tokens for outcome in outcomes),
+        retrieval_output_tokens_total=sum(outcome.retrieval_output_tokens for outcome in outcomes),
+        retrieval_fallback_total=sum(
+            1 for outcome in outcomes if outcome.retrieval_fallback_reason is not None
+        ),
     )
 
 
@@ -1194,6 +1270,13 @@ class RunConditions:
     judge: str
     similarity_threshold: float
     top_k: int
+    #: 검색 구성 요약 (`.dryforge/spec.md` §8-3). **필수 필드**다 — 같은 지표를 다른 검색
+    #: 설정으로 잰 산출물이 이름 계열은 하나이므로(리포트 이름을 늘리지 않기로 한 판단),
+    #: 어떤 구성으로 잰 값인지는 실행 조건이 들고 있어야 한다. `embedding` 문자열이 모델을
+    #: 담지만 차원·전략 조합은 거기 없다.
+    embedding_dimensions: int
+    #: 실행 경로에 켜진 검색 전략 조합. 예: `vector` · `vector+rewrite`.
+    retrieval_strategy: str
     l1_fixture_count: int
     golden_case_count: int
     #: 판정 픽스처 수. **로드하지 못했으면 `None`** — 미실행을 0 으로 채우지 않는다.
@@ -1247,8 +1330,12 @@ class MetricTarget:
 #:
 #: L1 두 지표는 **결정론 층**이라 100%/0% 를 목표로 박을 수 있다: 픽스처가 고정이고
 #: 게이트가 LLM 을 부르지 않으므로 달성은 재현되며, 미달은 곧 회귀다.
-#: 일치율은 확률 층이라 반복 실행마다 흔들린다 — 3회 실측 71.1%(70.0~73.3%) 위에
-#: 75% 를 둔 것은 **지금 닿지 않는 목표**이고, 그 간극을 이번 사이클의 L2·임계값이 겨냥한다.
+#: 일치율 75% 는 사이클 1 실측(71.1%) 위에 "닿지 않는 목표"로 둔 값이었다. **그 전제는
+#: 끝났다** — 결정 0008 의 라벨 재정렬 뒤로는 **L2 를 꺼도 86.7%** 라 이 경계가 층 기여를
+#: 판별하지 못한다. 2026-08-14 재확정으로 **값은 유지하되 성격이 하한 경보선으로 바뀌었고,
+#: 회귀 판정은 케이스 단위(비악화 가드 + 케이스별 귀인)가 맡는다** — 결정 0006 의 "측정 2
+#: 목표치 재확정" 절이 소유자다. 그 가드를 여기 상설 목표로 올리려면 이전 실측을 기준선으로
+#: 들어야 해서(리포트가 리포트를 읽는다) 설계가 필요하다 — 아직 하지 않았다.
 #: 측정 3(L2 판정 단위 정확도)은 **여기 없다**: 목표치를 두지 않기로 했으므로 경계가 없다.
 TARGETS: Final[tuple[MetricTarget, ...]] = (
     MetricTarget(key="detection_rate", label="측정 1 구조적 오류 검출률", bound=1.0),
@@ -1280,6 +1367,57 @@ class TargetAssessment:
 
 
 @dataclass(frozen=True)
+class FailureAttributionCase:
+    """기각·인계 1건을 검색 정답 라벨과 조인한 판정 근거."""
+
+    case_id: str
+    classification: str
+    relevant_evidence_ids: tuple[str, ...]
+    adopted_evidence_ids: tuple[str, ...]
+    missing_relevant_evidence_ids: tuple[str, ...]
+    rejected_at_least_once: bool
+    escalated: bool
+    #: 채택 근거 전체가 0건. SQL 조회 근거도 함께 센다.
+    ended_with_zero_evidence: bool
+    #: 정책 조항 근거가 0건 — "검색 0건"의 정확한 의미. SQL 근거는 검색 결과가 아니다.
+    ended_with_zero_policy_evidence: bool
+    l2_caught_with_evidence: bool
+    #: 빈 정답 케이스에서만 bool. 다른 두 분류에서는 해당 없음.
+    normal_behavior: bool | None
+    normal_behavior_path: str | None
+    anomaly_reason: str | None
+
+
+@dataclass(frozen=True)
+class FailureAttribution:
+    """검색 실패와 생성 문제 분해. 카운트는 산출된 때만 존재한다."""
+
+    labels_path: str
+    generation_issue_count: int
+    #: 정답 조항을 하나도 채택하지 못한 기각·인계.
+    retrieval_failure_count: int
+    #: 정답 조항 중 일부만 채택한 기각·인계. 검색 실패 합계에 포함된다.
+    partial_retrieval_failure_count: int
+    #: 정답 조항이 빠진 채 답변이 확정된 케이스 — 게이트를 통과한 근거 부족.
+    answered_without_relevant_evidence_count: int
+    expected_no_answer_count: int
+    expected_no_answer_anomaly_count: int
+    cases: tuple[FailureAttributionCase, ...]
+
+    @property
+    def retrieval_failure_total(self) -> int:
+        """전부 누락 + 일부 누락. 헤드라인이 검색 실패를 과소 보고하지 않게 한다."""
+        return self.retrieval_failure_count + self.partial_retrieval_failure_count
+
+
+@dataclass(frozen=True)
+class UnavailableBreakdown:
+    """분해를 산출하지 못한 사유. 0건 집계와 구분한다."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
 class EvaluationReport:
     """리포트 1건 — 사람이 읽는 마크다운과 기계가 읽는 JSON 의 공통 원본."""
 
@@ -1287,6 +1425,7 @@ class EvaluationReport:
     gate_accuracy: GateAccuracy
     pipeline: PipelineAgreement | SkippedMeasurement
     judge_accuracy: JudgeAccuracy | SkippedMeasurement
+    failure_attribution: FailureAttribution | UnavailableBreakdown
 
     def measured(self) -> dict[str, float | None]:
         """목표치 대조에 쓰는 실측값. 측정 2 미실행이면 일치율은 `None`.
@@ -1333,14 +1472,154 @@ def build_report(
     gate_accuracy: GateAccuracy,
     pipeline: PipelineAgreement | SkippedMeasurement,
     judge_accuracy: JudgeAccuracy | SkippedMeasurement,
+    retrieval_labels_path: Path | None = None,
 ) -> EvaluationReport:
     """리포트를 조립한다. **측정 3 도 명시해야 한다** — 기본값으로 비워 두면 미실행이
     조용히 "사유 없는 미실행"으로 찍힌다."""
+    failure_attribution = _build_failure_attribution(
+        pipeline=pipeline,
+        retrieval_labels_path=retrieval_labels_path,
+    )
     return EvaluationReport(
         conditions=conditions,
         gate_accuracy=gate_accuracy,
         pipeline=pipeline,
         judge_accuracy=judge_accuracy,
+        failure_attribution=failure_attribution,
+    )
+
+
+def _build_failure_attribution(
+    *,
+    pipeline: PipelineAgreement | SkippedMeasurement,
+    retrieval_labels_path: Path | None,
+) -> FailureAttribution | UnavailableBreakdown:
+    # 지연 import: retrieval_labels 는 골든셋 검증을 위해 evaluation 로더를 쓴다.
+    # 보고서 조립 시점에만 반대 방향을 열어 모듈 순환 import 를 피한다.
+    from reply_gate.retrieval_labels import (
+        DEFAULT_RETRIEVAL_LABELS_PATH,
+        load_retrieval_labels,
+    )
+
+    # 측정 2 미실행이 더 근본적인 사유다. 라벨 로드를 먼저 시도하면 둘 다 성립할 때
+    # 미산출 사유가 라벨 실패로 덮여 진짜 원인이 사라진다.
+    if isinstance(pipeline, SkippedMeasurement):
+        return UnavailableBreakdown(reason=f"측정 2 미실행: {pipeline.reason}")
+
+    path = DEFAULT_RETRIEVAL_LABELS_PATH if retrieval_labels_path is None else retrieval_labels_path
+    try:
+        labels = load_retrieval_labels(path)
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        return UnavailableBreakdown(reason=f"검색 정답 라벨 로드 실패({type(exc).__name__}): {exc}")
+
+    relevant_by_id = {label.id: tuple(sorted(label.relevant_evidence_ids)) for label in labels}
+    # 후보는 기각·인계만이 아니다. 정답 조항을 못 찾았는데도 답변이 확정된 케이스가 이
+    # 제품에서 가장 위험한 실패이고, 그것이 분해표에서 빠지면 검색 실패가 과소 집계된다.
+    candidates = tuple(pipeline.outcomes)
+    missing_labels = sorted(
+        outcome.case_id for outcome in candidates if outcome.case_id not in relevant_by_id
+    )
+    if missing_labels:
+        return UnavailableBreakdown(
+            reason="검색 정답 라벨에 없는 케이스: " + ", ".join(missing_labels)
+        )
+
+    attributed: list[FailureAttributionCase] = []
+    for outcome in candidates:
+        relevant = relevant_by_id[outcome.case_id]
+        adopted = outcome.adopted_evidence_ids
+        adopted_set = set(adopted)
+        policy_adopted = tuple(
+            evidence_id for evidence_id in adopted if is_policy_evidence_id(evidence_id)
+        )
+        is_failure = outcome.rejected_at_least_once or outcome.status is InquiryStatus.ESCALATED
+        if relevant and not is_failure and set(relevant) <= adopted_set:
+            # 정답 조항을 전부 채택하고 정상 답변한 케이스는 분해 대상이 아니다.
+            continue
+        l2_rejected = bool(set(outcome.reject_reasons).intersection(L2_REJECT_REASONS))
+        normal_behavior: bool | None = None
+        normal_behavior_path: str | None = None
+        anomaly_reason: str | None = None
+        if not relevant:
+            classification = "expected_no_answer"
+            zero_evidence_normal = (
+                outcome.status is InquiryStatus.ESCALATED
+                and outcome.escalation_reason is EscalationReason.NO_EVIDENCE
+                and not adopted
+                and not outcome.attempt_verdicts
+            )
+            l2_rejection_normal = (
+                outcome.status is InquiryStatus.ESCALATED
+                and outcome.escalation_reason is EscalationReason.REJECTED_TWICE
+                and bool(adopted)
+                and l2_rejected
+            )
+            normal_behavior = zero_evidence_normal or l2_rejection_normal
+            if zero_evidence_normal:
+                normal_behavior_path = "retrieval_zero_evidence"
+            elif l2_rejection_normal:
+                normal_behavior_path = "l2_rejected_with_evidence"
+            elif not adopted:
+                anomaly_reason = "검색 0건이지만 no_evidence·시도 0건 종료가 아님"
+            elif not l2_rejected:
+                anomaly_reason = "근거를 채택했지만 L2 기각 사유 없음"
+            else:
+                anomaly_reason = "L2 기각 사유가 있지만 rejected_twice 인계가 아님"
+        elif not is_failure:
+            # 답변이 확정됐는데 정답 조항이 빠졌다 — 게이트를 통과한 근거 부족이다.
+            classification = "answered_without_relevant_evidence"
+        elif set(relevant) <= adopted_set:
+            classification = "generation_issue"
+        elif adopted_set.intersection(relevant):
+            # 정답 조항 중 일부만 찾았다. 필요한 조항이 빠진 채 생성한 것이므로 생성 문제로
+            # 세면 검색 실패가 과소 집계된다.
+            classification = "partial_retrieval_failure"
+        else:
+            classification = "retrieval_failure"
+
+        attributed.append(
+            FailureAttributionCase(
+                case_id=outcome.case_id,
+                classification=classification,
+                relevant_evidence_ids=relevant,
+                adopted_evidence_ids=adopted,
+                missing_relevant_evidence_ids=tuple(
+                    evidence_id for evidence_id in relevant if evidence_id not in adopted_set
+                ),
+                rejected_at_least_once=outcome.rejected_at_least_once,
+                escalated=outcome.status is InquiryStatus.ESCALATED,
+                ended_with_zero_evidence=not adopted,
+                ended_with_zero_policy_evidence=not policy_adopted,
+                l2_caught_with_evidence=bool(adopted) and l2_rejected,
+                normal_behavior=normal_behavior,
+                normal_behavior_path=normal_behavior_path,
+                anomaly_reason=anomaly_reason,
+            )
+        )
+
+    return FailureAttribution(
+        labels_path=display_path(path),
+        generation_issue_count=sum(
+            item.classification == "generation_issue" for item in attributed
+        ),
+        retrieval_failure_count=sum(
+            item.classification == "retrieval_failure" for item in attributed
+        ),
+        partial_retrieval_failure_count=sum(
+            item.classification == "partial_retrieval_failure" for item in attributed
+        ),
+        answered_without_relevant_evidence_count=sum(
+            item.classification == "answered_without_relevant_evidence" for item in attributed
+        ),
+        expected_no_answer_count=sum(
+            item.classification == "expected_no_answer" and item.normal_behavior is True
+            for item in attributed
+        ),
+        expected_no_answer_anomaly_count=sum(
+            item.classification == "expected_no_answer" and item.normal_behavior is False
+            for item in attributed
+        ),
+        cases=tuple(attributed),
     )
 
 
@@ -1404,6 +1683,8 @@ def render_markdown(report: EvaluationReport) -> str:
         f"- 생성 LLM: {conditions.generation}",
         f"- 임베딩: {conditions.embedding}",
         f"- L2 판정: {'켜짐' if conditions.l2_enabled else '꺼짐'} / 판정 모델: {conditions.judge}",
+        f"- 검색 전략: {conditions.retrieval_strategy}"
+        f" · 임베딩 {conditions.embedding_dimensions}차원",
         f"- 유사도 임계값: {conditions.similarity_threshold} / top k: {conditions.top_k}",
         f"- L1 픽스처: {conditions.l1_fixture_count}건 (`{conditions.l1_fixtures_path}`)",
         f"- 골든셋: {conditions.golden_case_count}건 (`{conditions.golden_set_path}`)",
@@ -1417,6 +1698,7 @@ def render_markdown(report: EvaluationReport) -> str:
     lines.extend(_render_targets(report))
     lines.extend(_render_measurement_one(report.gate_accuracy))
     lines.extend(_render_measurement_two(report.pipeline, conditions))
+    lines.extend(_render_failure_attribution(report.failure_attribution))
     lines.extend(_render_measurement_three(report.judge_accuracy, conditions))
     lines.append(_LIMITS)
     return "\n".join(lines)
@@ -1526,17 +1808,31 @@ def _render_measurement_two(
             "— **초안 전 인계 경로 포함이며 L1 판정만의 지표가 아니다.**",
             f"- **미끼 문의(reject_bait)의 기각 재현율: {_pct(pipeline.bait_reject_recall)}** "
             f"({pipeline.bait_reject_reproduced}/{pipeline.bait_total}) "
-            "— 목표 없는 관측값이다(결정 0006·0008).",
+            "— 목표 없는 관측값이다(결정 0006·0008)."
+            + (
+                f" **미측정 {pipeline.bait_unmeasured}건은 분모 밖이다**"
+                " — L2 판정 호출이 실패해 게이트가 돌지 못했다."
+                if pipeline.bait_unmeasured
+                else ""
+            ),
             f"- 정상 PII 에코 감시 케이스: {pipeline.forbidden_watch_total}건 중 "
             f"금지 사유 발화 {pipeline.forbidden_violations}건",
             f"- 지연 p50: {_int(pipeline.latency_p50_ms)} ms / "
             f"p95: {_int(pipeline.latency_p95_ms)} ms "
             "(파이프라인 `run` 의 벽시계 시간 — 처리 기록 저장은 포함하지 않는다)",
+            f"- 검색 단계 폴백: {pipeline.retrieval_fallback_total}건"
+            + (
+                " — 재작성을 얻지 못해 원문 질의로 검색한 문의다. **인계가 아니다.** "
+                "이 수가 크면 재작성 층이 사실상 꺼진 실행이므로 검색 지표를 그렇게 읽어야 한다."
+                if pipeline.retrieval_fallback_total
+                else " (전건 재작성 성공 — 검색 구성이 실행 조건 그대로 돌았다)"
+            ),
             "",
-            "### 문의 1건당 토큰 (생성·임베딩·판정 구분)",
+            "### 문의 1건당 토큰 (생성·임베딩·판정·검색 구분)",
             "",
-            "provider 와 단가가 다른 계열을 합산하면 건당 비용 지표가 무너진다 — 세 계열은",
-            "끝까지 분리해서 센다. L2 미실행이면 판정 계열은 0 이다.",
+            "provider 와 단가가 다른 계열을 합산하면 건당 비용 지표가 무너진다 — 네 계열은",
+            "끝까지 분리해서 센다. L2 미실행이면 판정 계열은, 재작성을 쓰지 않았으면 검색",
+            "계열은 0 이다.",
             "",
             "| 계열 | 합계 | 건당 |",
             "| --- | ---: | ---: |",
@@ -1547,8 +1843,16 @@ def _render_measurement_two(
             f"- 최종 상태: {_counts(pipeline.status_counts)}",
             f"- 인계 사유: {_counts(pipeline.escalation_counts)}",
             "",
+            "### 케이스별 채택 근거",
+            "",
         ]
     )
+    lines.extend(
+        f"- `{outcome.case_id}`: "
+        + (", ".join(f"`{evidence_id}`" for evidence_id in outcome.adopted_evidence_ids) or "없음")
+        for outcome in pipeline.outcomes
+    )
+    lines.append("")
 
     mismatched = [outcome for outcome in pipeline.outcomes if not outcome.matched]
     if mismatched:
@@ -1564,10 +1868,14 @@ def _render_measurement_two(
 
 
 def _token_rows(pipeline: PipelineAgreement, conditions: RunConditions) -> list[str]:
-    """토큰 표의 본문 — 계열 셋(생성·임베딩·판정)을 끝까지 분리해서 적는다.
+    """토큰 표의 본문 — 계열 넷(생성·임베딩·판정·검색)을 끝까지 분리해서 적는다.
 
-    대역 실행에서는 **판정 행에 `(대역)` 을 붙인다**: `--stub-llm` 은 판정자까지 대역으로
-    갈아 끼우므로 이 행의 값은 대역의 휴리스틱 산출이고 합산에도 그대로 들어간다.
+    대역 실행에서는 **판정·검색 행에 `(대역)` 을 붙인다**: `--stub-llm` 은 판정자와 생성
+    클라이언트를 모두 대역으로 갈아 끼우므로 이 행들의 값은 대역의 휴리스틱 산출이고
+    합산에도 그대로 들어간다.
+
+    **검색 계열을 생성 소계에 넣지 않는다.** 초안을 만들지도 않은 문의가 초안 생성 토큰을
+    쓴 것으로 찍히면 성공 판정 ②("시도 0건 + 판정 토큰 0")를 표에서 읽을 수 없다.
     """
     # 대역 실행이면 판정 계열도 대역이다 — 표만 보고 실제 판정 비용으로 읽으면 안 된다.
     judge_mark = "" if conditions.measurement2_is_real else " (대역)"
@@ -1577,6 +1885,7 @@ def _token_rows(pipeline: PipelineAgreement, conditions: RunConditions) -> list[
 
     generation_total = pipeline.input_tokens_total + pipeline.output_tokens_total
     judge_total = pipeline.judge_input_tokens_total + pipeline.judge_output_tokens_total
+    retrieval_total = pipeline.retrieval_input_tokens_total + pipeline.retrieval_output_tokens_total
     rows: list[tuple[str, int, float | None]] = [
         ("생성 입력", pipeline.input_tokens_total, per_inquiry(pipeline.input_tokens_total)),
         ("생성 출력", pipeline.output_tokens_total, per_inquiry(pipeline.output_tokens_total)),
@@ -1593,6 +1902,17 @@ def _token_rows(pipeline: PipelineAgreement, conditions: RunConditions) -> list[
             per_inquiry(pipeline.judge_output_tokens_total),
         ),
         (f"판정 소계{judge_mark}", judge_total, pipeline.judge_tokens_per_inquiry),
+        (
+            f"검색 입력{judge_mark}",
+            pipeline.retrieval_input_tokens_total,
+            per_inquiry(pipeline.retrieval_input_tokens_total),
+        ),
+        (
+            f"검색 출력{judge_mark}",
+            pipeline.retrieval_output_tokens_total,
+            per_inquiry(pipeline.retrieval_output_tokens_total),
+        ),
+        (f"검색 소계{judge_mark}", retrieval_total, pipeline.retrieval_tokens_per_inquiry),
     ]
     lines = [f"| {label} | {total} | {_num(value)} |" for label, total, value in rows]
     lines.append(
@@ -1601,14 +1921,80 @@ def _token_rows(pipeline: PipelineAgreement, conditions: RunConditions) -> list[
     return lines
 
 
+def _render_failure_attribution(
+    attribution: FailureAttribution | UnavailableBreakdown,
+) -> list[str]:
+    lines = ["### 검색 실패 / 생성 문제 분해", ""]
+    if isinstance(attribution, UnavailableBreakdown):
+        lines.extend(
+            [
+                f"**미산출 (사유: {attribution.reason})**",
+                "",
+                "미산출을 0건·빈 집계·성공으로 대체하지 않는다.",
+                "",
+            ]
+        )
+        return lines
+
+    lines.extend(
+        [
+            f"- 검색 정답 라벨: `{attribution.labels_path}`",
+            f"- 생성 문제: **{attribution.generation_issue_count}건** — "
+            "정답 조항을 **전부** 채택했지만 기각·인계",
+            f"- 검색 실패 합계: **{attribution.retrieval_failure_total}건** "
+            f"(전부 누락 {attribution.retrieval_failure_count}건 · "
+            f"일부 누락 {attribution.partial_retrieval_failure_count}건)",
+            f"- 근거 없이 답변 확정: **{attribution.answered_without_relevant_evidence_count}건** "
+            "— 정답 조항이 빠진 채 게이트를 통과했다",
+            f"- 빈 정답 정상 인계: **{attribution.expected_no_answer_count}건** — "
+            "앞의 분류에 포함하지 않음",
+            f"- 빈 정답 비정상 종결: **{attribution.expected_no_answer_anomaly_count}건** — "
+            "정상 인계 집계에서 제외",
+            "",
+            "#### 케이스별 판정 근거",
+            "",
+        ]
+    )
+    labels = {
+        "generation_issue": "생성 문제",
+        "retrieval_failure": "검색 실패(전부 누락)",
+        "partial_retrieval_failure": "검색 실패(일부 누락)",
+        "answered_without_relevant_evidence": "근거 없이 답변 확정",
+        "expected_no_answer": "빈 정답 정상 인계",
+    }
+    for item in attribution.cases:
+        relevant = ", ".join(f"`{value}`" for value in item.relevant_evidence_ids) or "없음"
+        adopted = ", ".join(f"`{value}`" for value in item.adopted_evidence_ids) or "없음"
+        route = ""
+        if item.classification == "expected_no_answer":
+            if item.normal_behavior is False:
+                route = f" / 비정상: {item.anomaly_reason}"
+            elif item.normal_behavior_path == "retrieval_zero_evidence":
+                route = " / 검색 0건 종료"
+            elif item.normal_behavior_path == "l2_rejected_with_evidence":
+                route = " / 근거 채택 후 L2 검출"
+        label = (
+            "빈 정답 비정상 종결"
+            if item.classification == "expected_no_answer" and item.normal_behavior is False
+            else labels[item.classification]
+        )
+        lines.append(
+            f"- `{item.case_id}`: **{label}** — 정답 근거 {relevant} / 채택 근거 {adopted}{route}"
+        )
+    lines.append("")
+    return lines
+
+
 def _grand_total(pipeline: PipelineAgreement) -> int:
-    """세 계열 합산 — 판정 계열이 빠지면 L2 켜짐 실측의 건당 비용이 실제보다 작아진다."""
+    """네 계열 합산 — 한 계열이 빠지면 건당 비용이 실제보다 작아진다."""
     return (
         pipeline.input_tokens_total
         + pipeline.output_tokens_total
         + pipeline.embedding_tokens_total
         + pipeline.judge_input_tokens_total
         + pipeline.judge_output_tokens_total
+        + pipeline.retrieval_input_tokens_total
+        + pipeline.retrieval_output_tokens_total
     )
 
 
@@ -1744,8 +2130,10 @@ def report_to_json(report: EvaluationReport) -> dict[str, Any]:
             "started_at": conditions.started_at,
             "generation": conditions.generation,
             "embedding": conditions.embedding,
+            "embedding_dimensions": conditions.embedding_dimensions,
             "judge": conditions.judge,
             "l2_enabled": conditions.l2_enabled,
+            "retrieval_strategy": conditions.retrieval_strategy,
             "similarity_threshold": conditions.similarity_threshold,
             "top_k": conditions.top_k,
             "l1_fixture_count": conditions.l1_fixture_count,
@@ -1806,10 +2194,49 @@ def report_to_json(report: EvaluationReport) -> dict[str, Any]:
         ],
     }
     payload["measurement_2_pipeline_agreement"] = _measurement_two_json(report.pipeline)
+    payload["failure_attribution"] = _failure_attribution_json(report.failure_attribution)
     payload["measurement_3_l2_judge_accuracy"] = _measurement_three_json(
         report.judge_accuracy, conditions
     )
     return payload
+
+
+def _failure_attribution_json(
+    attribution: FailureAttribution | UnavailableBreakdown,
+) -> dict[str, Any]:
+    if isinstance(attribution, UnavailableBreakdown):
+        return {"computed": False, "reason": attribution.reason}
+    return {
+        "computed": True,
+        "labels_path": attribution.labels_path,
+        "generation_issue_count": attribution.generation_issue_count,
+        "retrieval_failure_count": attribution.retrieval_failure_count,
+        "partial_retrieval_failure_count": attribution.partial_retrieval_failure_count,
+        "retrieval_failure_total": attribution.retrieval_failure_total,
+        "answered_without_relevant_evidence_count": (
+            attribution.answered_without_relevant_evidence_count
+        ),
+        "expected_no_answer_count": attribution.expected_no_answer_count,
+        "expected_no_answer_anomaly_count": attribution.expected_no_answer_anomaly_count,
+        "cases": [
+            {
+                "case_id": item.case_id,
+                "classification": item.classification,
+                "relevant_evidence_ids": list(item.relevant_evidence_ids),
+                "adopted_evidence_ids": list(item.adopted_evidence_ids),
+                "missing_relevant_evidence_ids": list(item.missing_relevant_evidence_ids),
+                "rejected_at_least_once": item.rejected_at_least_once,
+                "escalated": item.escalated,
+                "ended_with_zero_evidence": item.ended_with_zero_evidence,
+                "ended_with_zero_policy_evidence": item.ended_with_zero_policy_evidence,
+                "l2_caught_with_evidence": item.l2_caught_with_evidence,
+                "normal_behavior": item.normal_behavior,
+                "normal_behavior_path": item.normal_behavior_path,
+                "anomaly_reason": item.anomaly_reason,
+            }
+            for item in attribution.cases
+        ],
+    }
 
 
 def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> dict[str, Any]:
@@ -1825,19 +2252,26 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
         "bait_total": pipeline.bait_total,
         "bait_reject_reproduced": pipeline.bait_reject_reproduced,
         "bait_reject_recall": pipeline.bait_reject_recall,
+        #: 판정이 돌지 못해 분모 밖으로 뺀 미끼 건수. 0 으로 채우지 않는다.
+        "bait_unmeasured": pipeline.bait_unmeasured,
         "forbidden_watch_total": pipeline.forbidden_watch_total,
         "forbidden_violations": pipeline.forbidden_violations,
         "latency_p50_ms": pipeline.latency_p50_ms,
         "latency_p95_ms": pipeline.latency_p95_ms,
+        #: 검색 단계가 폴백한 문의 수. 인계가 아니라 "재작성 없이 원문으로 돌았다"이다.
+        "retrieval_fallback_total": pipeline.retrieval_fallback_total,
         "tokens": {
             "generation_input_total": pipeline.input_tokens_total,
             "generation_output_total": pipeline.output_tokens_total,
             "embedding_total": pipeline.embedding_tokens_total,
             "judge_input_total": pipeline.judge_input_tokens_total,
             "judge_output_total": pipeline.judge_output_tokens_total,
+            "retrieval_input_total": pipeline.retrieval_input_tokens_total,
+            "retrieval_output_total": pipeline.retrieval_output_tokens_total,
             "generation_per_inquiry": pipeline.generation_tokens_per_inquiry,
             "embedding_per_inquiry": pipeline.embedding_tokens_per_inquiry,
             "judge_per_inquiry": pipeline.judge_tokens_per_inquiry,
+            "retrieval_per_inquiry": pipeline.retrieval_tokens_per_inquiry,
             "total_per_inquiry": pipeline.total_tokens_per_inquiry,
         },
         "status_counts": dict(pipeline.status_counts),
@@ -1852,13 +2286,20 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
                 ),
                 "failed_stage": outcome.failed_stage,
                 "attempt_verdicts": [verdict.value for verdict in outcome.attempt_verdicts],
+                #: 판정 호출이 무너져 게이트가 돌지 못했는가. `attempt_verdicts` 만으로는
+                #: "돌았고 통과"와 구분되지 않는다(docs/contracts.md "층별 판정 키" ③).
+                "gate_never_ran": outcome.gate_never_ran,
                 "reject_reasons": [reason.value for reason in outcome.reject_reasons],
+                "adopted_evidence_ids": list(outcome.adopted_evidence_ids),
                 "latency_ms": outcome.latency_ms,
                 "input_tokens": outcome.input_tokens,
                 "output_tokens": outcome.output_tokens,
                 "embedding_tokens": outcome.embedding_tokens,
                 "judge_input_tokens": outcome.judge_input_tokens,
                 "judge_output_tokens": outcome.judge_output_tokens,
+                "retrieval_input_tokens": outcome.retrieval_input_tokens,
+                "retrieval_output_tokens": outcome.retrieval_output_tokens,
+                "retrieval_fallback_reason": outcome.retrieval_fallback_reason,
                 "matched": outcome.matched,
                 "mismatches": list(outcome.mismatches),
                 "error": outcome.error,
@@ -2052,7 +2493,24 @@ class StubGenerationClient:
             return {"sql": self._build_sql(user)}
         if stage == "draft":
             return self._build_draft(user)
+        if stage == QUERY_REWRITE_STAGE:
+            return {"rewritten": self._rewrite(user)}
         raise AssertionError(f"대역이 모르는 단계다: {stage!r}")
+
+    @staticmethod
+    def _rewrite(user: str) -> str:
+        """**재작성하지 않는다** — 문의 원문을 그대로 돌려준다.
+
+        이 대역이 하는 유일한 정직한 산출이다. 재작성의 값어치는 구어체를 문서체 어휘로
+        옮기는 의미 변환인데, 대역은 어휘 규칙밖에 없어 그것을 흉내내면 실제 모델이 내지
+        않는 질의로 검색 배관을 재게 된다 — `StubJudge` 가 모순 감지를 흉내내지 않는 것과
+        같은 이유다. 원문과 같은 문자열은 픽스처 계약이 명시적으로 허용하는 산출이고,
+        그때 수집기는 검색을 한 번만 돈다(합집합 경로는 단위 테스트가 덮는다).
+
+        **호출 자체는 실제로 나간다** — 토큰이 검색 계열에 집계되고 단계가 기록에 남으므로,
+        대역 완주가 "재작성 배선이 실제로 걸려 있는가"까지 확인한다.
+        """
+        return user.removeprefix("[문의]\n")
 
     @staticmethod
     def _section(pattern: re.Pattern[str], user: str, group: str) -> str:
@@ -2124,8 +2582,13 @@ class StubGenerationClient:
 
 @dataclass(frozen=True)
 class _StubCompletion:
-    """`llm.JsonCompletion` 과 같은 모양의 대역 산출 (llm 모듈을 import 하지 않기 위해)."""
+    """`llm.JsonCompletion` 과 같은 모양의 대역 산출 (llm 모듈을 import 하지 않기 위해).
+
+    `transport_attempts` 는 대역이라 항상 1 이다 — 전송이 없으니 전송 수도 1회분으로 센다.
+    모양을 맞추지 않으면 형식 루프가 이 값을 읽는 자리에서 대역만 터진다(실제로 그랬다).
+    """
 
     data: Any
     input_tokens: int
     output_tokens: int
+    transport_attempts: int = 1

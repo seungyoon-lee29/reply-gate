@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     generation_effort: str | None = None
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 1536
+    #: 오프라인 검색 비교의 LLM 리랭크 모델. 다른 모델 기본값과 같은 자리에서 소유한다.
+    rerank_model: str = "gpt-5.6-luna"
 
     # ── L2 판정 ─────────────────────────────────────────────────────────────
     #: L2 판정 스위치 — 기본 켜짐.
@@ -56,8 +58,22 @@ class Settings(BaseSettings):
     #: (thinking 설정 미전송 = adaptive thinking 켜짐이 모델 기본).
     judge_max_output_tokens: int = 16000
 
+    # ── 검색 전략 ───────────────────────────────────────────────────────────
+    #: 검색용 질의 재작성 스위치 — 기본 켜짐. **켜짐 + 재작성 클라이언트 미배선은 조립 시점
+    #: 오류**다(`evidence.RetrievalWiringError`). 끄려면 `false` 로 명시한다.
+    #: 하이브리드(BM25+RRF)·LLM 리랭크는 채택하지 않아 실행 경로에 스위치가 없다 —
+    #: 조항 26개 코퍼스에서 벡터 단독이 이미 r@5 = 1.000 이라 재정렬은 풀린 문제를 공격한다
+    #: (`docs/tracking/status.md` "검색 전략 비교").
+    query_rewrite_enabled: bool = True
+
     # ── 조정 가능 기본값 (docs/operations.md "환경 변수" 절) ────────────────────────
     vector_top_k: int = 5
+    #: 정책 근거 채택 컷. **사이클 3 T10 라이브 3회가 0.50 을 반증해 0.30 으로 되돌린 값이다**
+    #: (`docs/tracking/status.md` "사이클 3 T10 라이브 재실측"). 0.50 은 무근거 4건(G21-G24)을
+    #: 검색 단계에서 기권시켰지만 같은 컷이 G04 의 정답 조항(0.3571)과 G18 의 상충 조항
+    #: (`policy:refund:2-4`, 0.4676)까지 잘라, 정상 문의가 인계되고 L2 의 모순 기각이
+    #: 사라졌다. 두 조항 모두 0.30 위에 있다. **재작성은 유지한다** — G17 을 3/3 회 고쳤고
+    #: 깎은 케이스가 없다(하드 게이트 10: 실측이 정당화하는 기본값만 남긴다).
     vector_similarity_threshold: float = 0.3
     sql_max_rows: int = 50
     #: text-to-SQL 실행 커넥션의 `statement_timeout`(ms). 0 이면 무제한이므로 0 을 두지 않는다 —

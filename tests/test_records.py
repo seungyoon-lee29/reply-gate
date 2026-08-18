@@ -158,6 +158,10 @@ def _processed(
         embedding_tokens=57,
         judge_input_tokens=433,
         judge_output_tokens=91,
+        # 검색 계열도 0 이 아닌 값을 둔다 — 0 이면 "저장·복원이 이 계열을 통째로 빠뜨렸다"와
+        # 구분되지 않는다(판정 토큰과 같은 이유).
+        retrieval_input_tokens=17,
+        retrieval_output_tokens=5,
     )
 
 

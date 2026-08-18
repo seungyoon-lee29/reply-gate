@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import psycopg
 import pytest
 from psycopg.rows import DictRow
@@ -14,6 +16,7 @@ from psycopg.rows import DictRow
 from reply_gate.policy_index import (
     DEFAULT_POLICY_DIR,
     PlantedKind,
+    PolicyIndexProvenanceError,
     index_policy_documents,
     load_policy_documents,
     parse_policy_document,
@@ -175,7 +178,12 @@ def test_유사도_검색이_관련_조항을_돌려준다(app_conn: psycopg.Con
 
     query = embedder.embed(stage="inquiry", texts=["환불 신청 기간이 어떻게 되나요"]).vectors[0]
     hits = search_policy_chunks(
-        conn=app_conn, query_vector=query, top_k=5, similarity_threshold=0.0
+        conn=app_conn,
+        query_vector=query,
+        top_k=5,
+        similarity_threshold=0.0,
+        embedding_model=embedder.model,
+        embedding_dimensions=embedder.dimensions,
     )
 
     assert hits, "검색 결과가 비면 안 된다"
@@ -191,11 +199,141 @@ def test_임계값_미만_결과는_버린다(app_conn: psycopg.Connection[DictR
     query = embedder.embed(stage="inquiry", texts=["환불 신청 기간"]).vectors[0]
 
     loose = search_policy_chunks(
-        conn=app_conn, query_vector=query, top_k=10, similarity_threshold=0.0
+        conn=app_conn,
+        query_vector=query,
+        top_k=10,
+        similarity_threshold=0.0,
+        embedding_model=embedder.model,
+        embedding_dimensions=embedder.dimensions,
     )
     strict = search_policy_chunks(
-        conn=app_conn, query_vector=query, top_k=10, similarity_threshold=0.99
+        conn=app_conn,
+        query_vector=query,
+        top_k=10,
+        similarity_threshold=0.99,
+        embedding_model=embedder.model,
+        embedding_dimensions=embedder.dimensions,
     )
 
     assert len(loose) > len(strict)
     assert all(hit.similarity >= 0.99 for hit in strict)
+
+
+# ── 임베딩 provenance (불변식: 저장된 벡터와 질의는 같은 공간에서 나와야 한다) ──
+
+
+@pytest.mark.db
+def test_적재는_벡터와_함께_그것을_만든_모델과_차원을_적는다(
+    app_conn: psycopg.Connection[DictRow],
+) -> None:
+    documents = load_policy_documents(DEFAULT_POLICY_DIR)
+    embedder = LexicalEmbeddingClient(dimensions=1536)
+
+    index_policy_documents(conn=app_conn, documents=documents, embedder=embedder)
+
+    with app_conn.cursor() as cur:
+        cur.execute("SELECT DISTINCT embedding_model, embedding_dimensions FROM policy_chunks")
+        assert cur.fetchall() == [
+            {"embedding_model": embedder.model, "embedding_dimensions": embedder.dimensions}
+        ]
+
+
+def test_출처를_밝히지_못하는_임베더는_적재하지_않는다() -> None:
+    """모델 이름이 빈 벡터는 나중에 같은 공간인지 판정할 근거가 없다.
+
+    커넥션 없이 도는 것 자체가 확인이다 — 거부가 DB 왕복이나 임베딩 호출보다 앞에 있다.
+    """
+    documents = load_policy_documents(DEFAULT_POLICY_DIR)
+    embedder = LexicalEmbeddingClient(dimensions=1536, model="   ")
+
+    with pytest.raises(ValueError, match="임베딩 모델 이름이 비어 있다"):
+        index_policy_documents(
+            conn=cast(psycopg.Connection[DictRow], None), documents=documents, embedder=embedder
+        )
+
+
+@pytest.mark.db
+def test_다른_모델의_질의는_유사도를_내지_않고_거부된다(
+    app_conn: psycopg.Connection[DictRow],
+) -> None:
+    """차원이 같으면 pgvector 는 코사인을 계산해 준다 — 오류가 아니라 **근거 없음**으로
+    위장되는 경로이므로, 계산 전에 코드가 막는다."""
+    documents = load_policy_documents(DEFAULT_POLICY_DIR)
+    indexed = LexicalEmbeddingClient(dimensions=1536, model="model-a")
+    index_policy_documents(conn=app_conn, documents=documents, embedder=indexed)
+    query = indexed.embed(stage="inquiry", texts=["환불 신청 기간"]).vectors[0]
+
+    with pytest.raises(PolicyIndexProvenanceError) as excinfo:
+        search_policy_chunks(
+            conn=app_conn,
+            query_vector=query,
+            top_k=5,
+            similarity_threshold=0.0,
+            embedding_model="model-b",
+            embedding_dimensions=1536,
+        )
+
+    assert "model-a" in str(excinfo.value)
+    assert "model-b" in str(excinfo.value)
+    assert "index_policies" in str(excinfo.value)
+
+
+@pytest.mark.db
+def test_차원만_다른_질의도_거부된다(app_conn: psycopg.Connection[DictRow]) -> None:
+    """모델 이름이 같아도 차원이 다르면 다른 공간이다(`3-large` 는 1536·3072 둘 다 낸다)."""
+    documents = load_policy_documents(DEFAULT_POLICY_DIR)
+    embedder = LexicalEmbeddingClient(dimensions=1536, model="model-a")
+    index_policy_documents(conn=app_conn, documents=documents, embedder=embedder)
+    query = embedder.embed(stage="inquiry", texts=["환불 신청 기간"]).vectors[0]
+
+    with pytest.raises(PolicyIndexProvenanceError):
+        search_policy_chunks(
+            conn=app_conn,
+            query_vector=query,
+            top_k=5,
+            similarity_threshold=0.0,
+            embedding_model="model-a",
+            embedding_dimensions=3072,
+        )
+
+
+@pytest.mark.db
+def test_두_공간이_섞인_인덱스는_어느_질의로도_거부된다(
+    app_conn: psycopg.Connection[DictRow],
+) -> None:
+    """적재가 도중에 끊겨 행마다 출처가 다를 수 있다 — 그 상태는 어떤 질의와도 맞지 않는다."""
+    documents = load_policy_documents(DEFAULT_POLICY_DIR)
+    embedder = LexicalEmbeddingClient(dimensions=1536, model="model-a")
+    index_policy_documents(conn=app_conn, documents=documents, embedder=embedder)
+    app_conn.execute(
+        "UPDATE policy_chunks SET embedding_model = 'model-b' WHERE evidence_id = %s",
+        (documents[0].chunks[0].evidence_id,),
+    )
+    query = embedder.embed(stage="inquiry", texts=["환불 신청 기간"]).vectors[0]
+
+    with pytest.raises(PolicyIndexProvenanceError, match=r"model-a.*model-b"):
+        search_policy_chunks(
+            conn=app_conn,
+            query_vector=query,
+            top_k=5,
+            similarity_threshold=0.0,
+            embedding_model="model-a",
+            embedding_dimensions=1536,
+        )
+
+
+@pytest.mark.db
+def test_적재_전_빈_인덱스는_불일치가_아니다(app_conn: psycopg.Connection[DictRow]) -> None:
+    """검색할 것이 없는 것과 다른 공간을 비교하는 것은 다르다."""
+    app_conn.execute("DELETE FROM policy_chunks")
+
+    hits = search_policy_chunks(
+        conn=app_conn,
+        query_vector=[0.0] * 1536,
+        top_k=5,
+        similarity_threshold=0.0,
+        embedding_model="model-a",
+        embedding_dimensions=1536,
+    )
+
+    assert hits == []

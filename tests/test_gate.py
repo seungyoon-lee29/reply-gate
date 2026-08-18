@@ -104,6 +104,37 @@ def test_구조가_온전하면_schema_violation_이_붙지_않는다() -> None:
     assert RejectReason.SCHEMA_VIOLATION not in result.reject_reasons
 
 
+@pytest.mark.parametrize(
+    "raw_draft",
+    [
+        pytest.param(
+            {"claims": [{"text": "", "citation_ids": ["policy:x:1"]}]},
+            id="빈_문자열",
+        ),
+        pytest.param(
+            {"claims": [{"text": "   ", "citation_ids": ["policy:x:1"]}]},
+            id="공백뿐인_문자열",
+        ),
+    ],
+)
+def test_빈_claim_text는_schema_violation_으로_기각된다(raw_draft: object) -> None:
+    evidence = _evidence("policy:x:1", "답변 근거")
+
+    result = evaluate_draft(raw_draft=raw_draft, evidences=[evidence])
+
+    assert result.reject_reasons == (RejectReason.SCHEMA_VIOLATION,)
+
+
+def test_공백이_아닌_claim_text는_계속_통과한다() -> None:
+    """양성 대조 — 비어 있지 않은 문장까지 구조 위반으로 접으면 안 된다."""
+    evidence = _evidence("policy:x:1", "답변 근거")
+    raw_draft = {"claims": [{"text": "답변", "citation_ids": ["policy:x:1"]}]}
+
+    result = evaluate_draft(raw_draft=raw_draft, evidences=[evidence])
+
+    assert result.verdict is Verdict.PASS
+
+
 def test_형식_불일치_원문_문자열도_예외를_던지지_않는다() -> None:
     """초안 생성은 형식 불일치 시 원문 문자열을 그대로 넘긴다 — 게이트가 삼켜야 한다."""
     result = evaluate_draft(raw_draft="죄송합니다, JSON 을 못 만들었습니다", evidences=[])
@@ -225,6 +256,111 @@ def test_근거에_있는_이메일은_대문자로_에코해도_통과한다() 
         _evidence(SQL_ID, '{"email": "hong@example.com"}', source=EvidenceSource.SQL),
     ]
     raw_draft = _draft(text="확인 메일을 HONG@Example.COM 으로 보냈습니다.", citation_ids=(SQL_ID,))
+
+    result = evaluate_draft(raw_draft=raw_draft, evidences=evidences)
+
+    assert result.verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize(
+    "draft_text",
+    [
+        "연락처는 010-1234-5678입니다.",
+        "주민등록번호는 900101-1234567입니다.",
+        "문의는 help@shop.co.kr 로 보내세요.",
+    ],
+)
+def test_기존_PII_표준형도_탐지하고_근거에_있으면_통과한다(draft_text: str) -> None:
+    no_pii_evidence = _evidence(POLICY_ID, "고객센터 운영 시간 안내")
+    matching_evidence = _evidence(SQL_ID, draft_text, source=EvidenceSource.SQL)
+
+    rejected = evaluate_draft(raw_draft=_draft(text=draft_text), evidences=[no_pii_evidence])
+    echoed = evaluate_draft(
+        raw_draft=_draft(text=draft_text, citation_ids=(SQL_ID,)), evidences=[matching_evidence]
+    )
+
+    assert rejected.reject_reasons == (RejectReason.PII_DETECTED,)
+    assert echoed.verdict is Verdict.PASS
+
+
+@pytest.mark.parametrize(
+    ("draft_text", "evidence_text"),
+    [
+        pytest.param(
+            "연락처는 +82 10-1234-5678입니다.",
+            "등록 연락처는 010-1234-5678입니다.",
+            id="국가번호_휴대전화",
+        ),
+        pytest.param(
+            "주민등록번호는 900101 1234567입니다.",
+            "본인확인 값은 900101-1234567입니다.",
+            id="공백_주민등록번호",
+        ),
+        pytest.param(
+            "문의는 support@쇼핑몰.kr 로 보내세요.",
+            "문의 이메일은 support@쇼핑몰.kr 입니다.",
+            id="국제화_도메인_이메일",
+        ),
+        # 아래 셋은 사람 눈에는 같은 값인데 ASCII 정규식만으로는 비껴간다. 눈으로 구분되지
+        # 않는 문자라 **이스케이프로 적는다** — 리터럴로 쓰면 읽는 사람이 무엇을 시험하는지
+        # 알 수 없고, 편집 중에 조용히 반각으로 바뀌어도 아무도 모른다.
+        # 근거 쪽 표기를 일부러 반각으로 둬, 접기가 **양쪽에** 걸려야만 양성 대조가 통과한다.
+        pytest.param(
+            "연락처는 \uff10\uff11\uff10-\uff11\uff12\uff13\uff14-\uff15\uff16\uff17\uff18입니다.",
+            "등록 연락처는 010-1234-5678입니다.",
+            id="전각_숫자_휴대전화",
+        ),
+        pytest.param(
+            "연락처는 010-1234\u200b-5678입니다.",
+            "등록 연락처는 010-1234-5678입니다.",
+            id="폭없는_서식문자_삽입",
+        ),
+        pytest.param(
+            "문의는 help\uff20shop.co.kr 로 보내세요.",
+            "문의 이메일은 help@shop.co.kr 입니다.",
+            id="전각_골뱅이_이메일",
+        ),
+    ],
+)
+def test_흔한_PII_표기_변형은_탐지하고_근거에_있는_값만_통과시킨다(
+    draft_text: str, evidence_text: str
+) -> None:
+    no_pii_evidence = _evidence(POLICY_ID, "고객센터 운영 시간 안내")
+    matching_evidence = _evidence(SQL_ID, evidence_text, source=EvidenceSource.SQL)
+
+    rejected = evaluate_draft(raw_draft=_draft(text=draft_text), evidences=[no_pii_evidence])
+    echoed = evaluate_draft(
+        raw_draft=_draft(text=draft_text, citation_ids=(SQL_ID,)), evidences=[matching_evidence]
+    )
+
+    assert rejected.reject_reasons == (RejectReason.PII_DETECTED,)
+    assert echoed.verdict is Verdict.PASS
+
+
+def test_국가번호와_괄호를_정규화해도_서로_다른_번호는_같은_값으로_접지_않는다() -> None:
+    evidences = [
+        _evidence(
+            SQL_ID,
+            "등록 연락처는 0082 (10) 1234 5679입니다.",
+            source=EvidenceSource.SQL,
+        )
+    ]
+    raw_draft = _draft(text="연락처는 +82 10-1234-5678입니다.", citation_ids=(SQL_ID,))
+
+    result = evaluate_draft(raw_draft=raw_draft, evidences=evidences)
+
+    assert result.reject_reasons == (RejectReason.PII_DETECTED,)
+
+
+def test_더하기와_0082_국가번호_표기는_같은_번호로_정규화해_통과한다() -> None:
+    evidences = [
+        _evidence(
+            SQL_ID,
+            "등록 연락처는 0082 (10) 1234 5678입니다.",
+            source=EvidenceSource.SQL,
+        )
+    ]
+    raw_draft = _draft(text="연락처는 +82 10-1234-5678입니다.", citation_ids=(SQL_ID,))
 
     result = evaluate_draft(raw_draft=raw_draft, evidences=evidences)
 
@@ -610,4 +746,73 @@ def test_형식이_깨진_초안의_PII_는_계속_검사한다() -> None:
     result = evaluate_draft(raw_draft="고객센터는 1588-1234 입니다", evidences=[evidence])
 
     assert RejectReason.SCHEMA_VIOLATION in result.reject_reasons
+
+
+# ── 답변에 나가지 않는 키는 PII 검사 대상이 아니다 (불변식 7) ─────────────────
+
+
+@pytest.mark.parametrize(
+    ("case", "raw_draft"),
+    [
+        (
+            "최상위 추가 키",
+            {"claims": [{"text": NORMAL_TEXT, "citation_ids": [POLICY_ID]}], "debug": "1588-1234"},
+        ),
+        (
+            "claim 안의 추가 키",
+            {
+                "claims": [
+                    {"text": NORMAL_TEXT, "citation_ids": [POLICY_ID], "note": "010-9999-8888"}
+                ]
+            },
+        ),
+        (
+            "중첩된 추가 키",
+            {
+                "claims": [{"text": NORMAL_TEXT, "citation_ids": [POLICY_ID]}],
+                "trace": {"prompt": {"raw": "담당자 010-9999-8888"}},
+            },
+        ),
+    ],
+)
+def test_답변에_나가지_않는_키의_PII_로_기각하지_않는다(case: str, raw_draft: object) -> None:
+    """`to_draft` 가 버리는 키는 답변에 실리지 않으므로 검사 대상이 아니다.
+
+    `src/reply_gate/AGENTS.md` 불변식 7 — "L1 의 PII 검사 대상은 답변 텍스트뿐이다".
+    초안 JSON 은 LLM 산출이라 이런 키가 언제든 늘어날 수 있고, 헤드라인 지표가
+    "정상 초안 오탐률"이라 여기서 기각하면 지표가 직접 오염된다.
+    """
+    result = evaluate_draft(raw_draft=raw_draft, evidences=_evidences())
+
+    assert result.verdict is Verdict.PASS, f"{case}: {result.reject_reasons}"
+    assert to_draft(raw_draft).answer_text == NORMAL_TEXT  # 답변에 그 값이 없다는 확인
+
+
+def test_검사에서_뺀_키가_답변에_실리면_그때는_기각된다() -> None:
+    """양성 대조 — 제외 기준은 '키 이름' 이 아니라 '답변에 나가는가' 다."""
+    raw_draft = {
+        "claims": [{"text": f"{NORMAL_TEXT} 담당자 010-9999-8888", "citation_ids": [POLICY_ID]}],
+        "debug": "무해한 값",
+    }
+
+    result = evaluate_draft(raw_draft=raw_draft, evidences=_evidences())
+
+    assert RejectReason.PII_DETECTED in result.reject_reasons
+
+
+def test_깨진_claim_옆의_멀쩡한_claim_은_계속_검사한다() -> None:
+    """구조가 깨져도 답변 후보 텍스트가 있으면 그것을 검사한다."""
+    raw_draft = {
+        "claims": [
+            {"text": "담당자 010-9999-8888 로 연락주세요.", "citation_ids": [POLICY_ID]},
+            {"text": NORMAL_TEXT, "citation_ids": "리스트가 아니다"},
+        ]
+    }
+
+    result = evaluate_draft(raw_draft=raw_draft, evidences=_evidences())
+
+    assert result.reject_reasons == (
+        RejectReason.SCHEMA_VIOLATION,
+        RejectReason.PII_DETECTED,
+    )
     assert RejectReason.PII_DETECTED in result.reject_reasons

@@ -34,6 +34,13 @@ cp .env.example .env
 `VECTOR_SIMILARITY_THRESHOLD`, `SQL_MAX_ROWS`, `SQL_STATEMENT_TIMEOUT_MS` 등)은
 비워두면 코드 기본값을 쓴다.
 
+**검색 전략 스위치**도 같은 자리에 있다.
+
+| 변수 | 기본값 | 뜻 |
+|---|---|---|
+| `QUERY_REWRITE_ENABLED` | `true` (**기본 켜짐**) | 문의를 정책 문서 어휘의 검색 질의로 다시 써 **원문과 함께** 검색한다. 호출이 실패하면 원문 질의로 폴백하고 그 사실이 처리 기록·리포트에 남는다(인계가 아니다). **끄려면 명시해야 한다** — 켜진 채 클라이언트가 배선되지 않은 조립은 시작 시점에 죽는다 |
+| `VECTOR_SIMILARITY_THRESHOLD` | `0.3` | **사이클 3 T10 이 0.50 을 반증해 되돌린 값이다.** 0.50 은 무근거 4건을 검색 단계에서 기권시키지만 같은 컷이 G04 의 정답 조항(0.3571)과 G18 의 상충 조항(0.4676)까지 잘라 정상 문의가 인계되고 L2 모순 기각이 사라진다(`docs/tracking/status.md` "사이클 3 T10 라이브 재실측") |
+
 **L2 스위치와 판정 모델**도 같은 자리에 있다.
 
 | 변수 | 기본값 | 뜻 |
@@ -77,6 +84,10 @@ uv run python -m scripts.seed_orders
 > (`judge_input_tokens`·`judge_output_tokens`)이 추가됐다. **이전 사이클의 볼륨을 그대로 쓰면
 > 이 컬럼들이 없어 저장이 실패한다.** 위 볼륨 재생성을 반드시 한 번 실행한 뒤 5단계(정책
 > 인덱싱)를 다시 돌린다 — 볼륨을 지우면 정책 청크도 함께 사라진다.
+>
+> **이번 사이클에도 스키마가 바뀌었다** — `policy_chunks` 에 임베딩 출처 컬럼
+> (`embedding_model`·`embedding_dimensions`, 둘 다 NOT NULL)이 추가됐다. 이전 볼륨을 그대로
+> 쓰면 정책 적재가 NOT NULL 위반으로 실패한다. 같은 볼륨 재생성 절차를 한 번 더 돌린다.
 
 ## 5. 정책 인덱싱 — **API 키 필요**
 
@@ -87,6 +98,12 @@ uv run python -m scripts.index_policies
 `data/policies/` 의 문서 4개를 조항 단위로 쪼개 임베딩하고 `policy_chunks` 에 적재한다(26건).
 재실행하면 중복 없이 갱신되고, 문서에서 사라진 조항은 삭제된다.
 **이 단계를 건너뛰면 정책 근거 검색이 항상 0건이라 모든 문의가 `no_evidence` 로 인계된다.**
+
+**`EMBEDDING_MODEL`·`EMBEDDING_DIMENSIONS` 를 바꿨으면 이 단계를 반드시 다시 돌린다.**
+적재된 벡터는 자기 출처를 함께 들고 있고, 질의 임베딩의 출처와 다르면 검색이 유사도를 내지
+않고 **503** 으로 거부한다. 재색인 없이 모델만 바꾸면 서로 다른 공간을 비교하게 되는데,
+그 결과는 오류가 아니라 "근거 없음"처럼 보인다
+(docs/engineering-notes.md "같은 차원의 다른 모델은 아무도 막지 않는다").
 
 ## 6. 서버 기동
 
@@ -174,6 +191,50 @@ L2 켜짐 실측의 기본 이름은 코드가 `evaluation-live-l2-<n>` 으로 *
 돈다. 정책 청크를 어휘 임베딩 대역으로 재적재하되 끝나면 **롤백**하므로 공유 DB 의 실제
 임베딩을 덮어쓰지 않는다. 대역으로 낸 수치는 실제 수치가 아니고, 리포트가 실행 조건과 함께
 그 사실을 찍는다.
+
+## 9. 검색 전략 비교 — **DB 불필요**
+
+정책 검색만 따로 재는 오프라인 하네스다. `scripts.evaluate` 와 다른 진입점이고 DB 를 쓰지 않는다.
+
+```bash
+uv run python -m scripts.compare_retrieval --stub-embedding   # 기본 — 외부 호출 0회, 배관 검증
+uv run python -m scripts.compare_retrieval --live             # 실제 임베딩 + 리랭크 — 과금
+uv run python -m scripts.compare_retrieval --bge-m3           # 로컬 임베딩 — 리랭크 단은 미측정
+uv run python -m scripts.compare_retrieval --live --embedding-axis  # 모델 축 4행 — 과금
+```
+
+산출물은 `reports/retrieval-strategies-<모드>-<모델>-d<차원>-<재작성조건>-k<top_k>-c<컷>.{md,json}`
+이다. 이름에 재작성 조건(blind/oracle)과 컷·top_k 가 들어가므로 결정 기록이 인용할 파일을
+이름으로 식별할 수 있다. 기존 산출물은 덮어쓰지 않는다.
+
+**과금 축은 둘이다.** 임베딩을 실제로 부르는지(`--live`/`--bge-m3`)와 LLM 리랭크를 실제로
+부르는지(`--live` 또는 `--rerank-with-openai`)가 별개다. `--bge-m3` 는 로컬 임베딩만 쓰고,
+리랭크 과금을 승인하지 않으면 그 단을 **0 이 아니라 "미측정 + 사유"** 로 리포트에 남긴다.
+BGE-M3 는 선택 의존성이므로 `uv sync --extra rag-local` 이 필요하고, 미설치는 `--embedding-axis`
+에서 그 행만 미측정으로 남는다.
+
+**채택 판정은 전 전략이 코사인 유사도 하나를 쓴다**(결정 0009). 리포트는 전략마다 컷 스윕과
+자기 최적 컷을 함께 싣고, precision·recall 분모를 값과 같은 표에 인쇄한다. 컷 스윕은 검색을
+다시 돌리지 않으므로 추가 과금이 없다.
+
+`--policy-dir`·`--golden-set`·`--labels` 로 입력을 바꿀 수 있고, 검색 정답 라벨은 **그 실행이
+실제로 쓸** 코퍼스·골든셋 기준으로 교차검증된다 — 없는 조항이 정답으로 남아 recall 이 조용히
+0 으로 계상되지 않는다.
+
+### blind 재작성 픽스처 재생성 — 상시 실행 경로가 아니다
+
+`data/rewritten_queries.jsonl` 은 **정책·라벨을 본 적 없는 생성 모델**이 문의 원문만 보고
+만든 것을 한 번 생성해 커밋한 입력이다(결정 0010). 다시 만들 일이 생기면:
+
+```bash
+uv run python -m scripts.generate_blind_rewrites --out /tmp/rewrites.jsonl        # 프롬프트만 — 무과금
+uv run python -m scripts.generate_blind_rewrites --live --out /tmp/rewrites.jsonl # 30건 생성 — 과금
+```
+
+**기존 픽스처를 스크립트가 직접 덮어쓰지 않는다.** `--out` 경로에만 쓰고, 사람이 산출을 읽은
+뒤 옮긴다. 옮기면 구조 테스트가 G17 문장에 걸려 빨개지므로, 교체는 **의도했을 때만** 통과한다.
+생성 모델은 런타임 의도 해석과 같은 등급(`generation_model`)이어야 한다 — 상위 모델은
+배포 가능한 이득이 아니라 또 하나의 상한이다.
 
 ## 정리
 

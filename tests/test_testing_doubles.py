@@ -6,6 +6,7 @@ from typing import Any, cast
 
 from reply_gate.config import Settings
 from reply_gate.contracts import Claim, Draft, Evidence, EvidenceSource, RejectReason, Verdict
+from reply_gate.evidence import EvidenceCollector
 from reply_gate.llm import GenerationClient
 from reply_gate.pipeline import build_pipeline
 from reply_gate.testing import LexicalEmbeddingClient, StubJudge, build_stub_pipeline
@@ -122,6 +123,11 @@ def test_대역_조립기는_실제_조립과_같은_협력자를_쓴다() -> No
     assert type(stub._collector) is type(real._collector)
     assert type(stub._drafter) is type(real._drafter)
     assert stub._l2_enabled == real._l2_enabled is True
+    # 검색 전략 배선까지 같아야 한다 — 여기서 `None` 이면 대역 실행이 재작성 없는
+    # 파이프라인을 재고, 그 수치가 "대역 완주"로 보고된다. 타입 대조만으로는 못 잡는다.
+    stub_collector = cast(EvidenceCollector, stub._collector)
+    real_collector = cast(EvidenceCollector, real._collector)
+    assert stub_collector._rewrite_client is real_collector._rewrite_client is generation
     # 다른 것은 판정자 하나뿐이다 — 그게 이 조립기의 존재 이유다.
     assert isinstance(stub._judge, StubJudge)
     assert not isinstance(real._judge, StubJudge)

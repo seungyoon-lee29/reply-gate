@@ -72,6 +72,7 @@ from reply_gate.pipeline import (
 )
 from reply_gate.pipeline import _LazyJudgeClient as LazyJudgeClient
 from reply_gate.policy_index import index_policy_documents, load_policy_documents
+from reply_gate.query_rewrite import QUERY_REWRITE_STAGE
 from reply_gate.testing import LexicalEmbeddingClient
 
 INQUIRY = "환불은 언제까지 신청할 수 있나요?"
@@ -94,6 +95,11 @@ class ScriptedGenerationClient:
 
     큐에 담긴 항목이 예외면 던지고, 호출 가능 객체면 호출 인자를 넘겨 실행한다
     (근거 ID 를 프롬프트에서 읽어 인용하는 초안 대역에 쓴다).
+
+    **재작성 단계만 예외**다: 대본에 아예 없으면 "원문 그대로"를 돌려준다 — 재작성은 정책
+    경로의 기본 호출이라 대본에 넣기를 강제하면 관계없는 테스트가 전부 재작성 대본을 이고
+    다니게 된다. 원문 그대로는 픽스처 계약이 허용하는 산출이고, 그때 수집기는 검색을 한 번만
+    돈다. **대본이 지정했으면 그것이 이기고, 큐가 마르면 그때는 오류다.**
     """
 
     def __init__(self, script: Mapping[str, Sequence[Any]]) -> None:
@@ -103,6 +109,8 @@ class ScriptedGenerationClient:
     def complete_json(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
         stage = kwargs["stage"]
+        if stage == QUERY_REWRITE_STAGE and stage not in self._script:
+            return echo_rewrite(kwargs["user"])
         queue = self._script.get(stage)
         if not queue:
             raise AssertionError(f"대본에 없는 호출이다: stage={stage!r}")
@@ -115,6 +123,23 @@ class ScriptedGenerationClient:
 
     def calls_for(self, stage: str) -> list[dict[str, Any]]:
         return [call for call in self.calls if call["stage"] == stage]
+
+
+def echo_rewrite(user_prompt: str) -> JsonCompletion:
+    """재작성 대역의 기본 산출 — 프롬프트에 실린 문의 원문을 그대로 되돌려준다."""
+    return JsonCompletion(
+        data={"rewritten": user_prompt.removeprefix("[문의]\n")},
+        input_tokens=7,
+        output_tokens=3,
+    )
+
+
+def rewrite_completion(
+    text: str, *, input_tokens: int = 7, output_tokens: int = 3
+) -> JsonCompletion:
+    return JsonCompletion(
+        data={"rewritten": text}, input_tokens=input_tokens, output_tokens=output_tokens
+    )
 
 
 class StubCollector:
@@ -140,7 +165,7 @@ class BrokenCollector:
 class ScriptedJudge:
     """`Judging` 대역 — 시도 순서대로 미리 정한 판정을 돌려준다(예외면 던진다).
 
-    T9 가 `testing.py` 에 결정론 판정 대역을 넣기 전까지, 판정 목은 이 파일 안에만 둔다.
+    사이클 2 T9 가 `testing.py` 에 결정론 판정 대역을 넣기 전까지, 판정 목은 이 파일 안에만 둔다.
     """
 
     def __init__(self, outcomes: Sequence[Any]) -> None:
@@ -1019,7 +1044,7 @@ def live_pipeline(client: ScriptedGenerationClient, *, threshold: float = 0.0) -
     """실제 근거 수집기 + 시딩된 DB 로 도는 조립 — **L2 는 꺼서** 사이클 1 동작으로 본다.
 
     인계 사유 6종·응답 골격은 판정 층과 무관하고, 판정을 켜면 확률 층 대역이 필요해진다
-    (그 대역은 T9 이 `testing.py` 에 넣는다).
+    (그 대역은 사이클 2 T9 가 `testing.py` 에 넣는다).
     """
     return build_pipeline(
         generation_client=cast(GenerationClient, client),

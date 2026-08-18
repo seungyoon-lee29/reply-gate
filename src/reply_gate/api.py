@@ -15,13 +15,23 @@
 않는다 — `null` 은 "통과"가 아니라 "판정이 없었다"는 뜻이며, 그 시도의 진실은 인계 사유가
 들고 있다.
 
-`metrics.tokens` 의 `input`/`output` 은 **생성 LLM 합산**이고 임베딩·판정 토큰을 여기
-섞지 않는다. 판정 토큰은 `judge_input`/`judge_output` 으로 **분리 신설**한다(L2 미실행이면
-0) — provider 와 단가가 달라 생성 합산에 섞으면 건당 비용 지표가 무너진다. 임베딩 토큰은
-지금도 응답에 싣지 않고 처리 기록에만 남는다.
+`metrics.tokens` 의 `input`/`output` 은 **생성 LLM 합산**이고 임베딩·판정·검색 토큰을 여기
+섞지 않는다. 판정 토큰은 `judge_input`/`judge_output` 으로(L2 미실행이면 0), 검색 단계
+재작성 토큰은 `retrieval_input`/`retrieval_output` 으로 **분리 신설**한다 — provider·단가가
+다르고, 검색 계열은 특히 "초안 없이 끝난 문의"의 비용을 초안 생성 칸에 찍지 않기 위한
+분리다. 임베딩 토큰은 지금도 응답에 싣지 않고 처리 기록에만 남는다.
+
+`metrics.retrieval_fallback_reason` 은 검색 단계가 폴백한 사유다. `null` 이 기본이고
+**인계 사유가 아니다** — 폴백한 문의도 그대로 답변될 수 있다.
 
 접수 검증(내용 필수·주문번호 형식)은 **파이프라인에 들어가기 전에** 422 로 끝난다.
 형식이 틀린 주문번호는 인계가 아니라 요청 오류다.
+
+**DB 커넥션도 첫 사용 직전에 연다** — 의존성 해석 시점에 열면 DB 가 없을 때 요청 오류와
+설정 오류가 모두 500 에 가린다(422 도 503 도 커넥션이 먼저 터진다). 라우트가 자기 선검사를
+끝낸 뒤 `with open_service() as service` 로 여는 형태라, 이 순서는 프레임워크가 의존성을
+어떤 차례로 푸는지와 무관하게 성립한다. DB 가 **진짜** 필요한 경로(조회·처리)는 그대로
+500 이다 — DB 장애를 업무 판정으로 바꾸지 않는다(docs/standards.md).
 
 생성·임베딩 클라이언트는 **첫 호출 직전에** 만든다(`_LazyGenerationClient`). 의존성 해석
 시점에 만들면 API 키가 없는 환경에서 LLM 을 전혀 쓰지 않는 경로 — 조회 전용
@@ -40,7 +50,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from typing import Annotated, Any, Self
 
@@ -72,6 +83,7 @@ from reply_gate.pipeline import (
     build_pipeline,
     new_inquiry_id,
 )
+from reply_gate.policy_index import PolicyIndexProvenanceError
 from reply_gate.records import load_inquiry, save_inquiry
 
 __all__ = [
@@ -79,6 +91,7 @@ __all__ = [
     "InquiryResponse",
     "InquiryService",
     "MissingCredentialsError",
+    "ServiceOpener",
     "app",
     "build_embedding_client",
     "build_generation_client",
@@ -202,20 +215,30 @@ class TokensOut(BaseModel):
     키이며 **L2 미실행이면 0** 이다. 판정 토큰을 생성 합산에 섞으면 건당 비용 지표가
     무너진다 — 임베딩 토큰을 섞지 않는 것과 같은 이유다(임베딩은 지금도 응답에 싣지 않고
     처리 기록에만 남는다).
+
+    `retrieval_input`/`retrieval_output` 은 **검색 단계 생성 호출**(질의 재작성)의 토큰이다.
+    같은 규칙의 세 번째 계열이고 분리하는 이유가 특히 뾰족하다: 무근거 문의가 검색에서
+    걸러져 **초안 없이** 끝나는 것이 이 사이클의 성공 판정인데, 재작성 토큰이 생성 칸에
+    들어가면 초안을 만들지도 않은 문의가 초안 생성 토큰을 쓴 것으로 찍힌다.
     """
 
     input: int
     output: int
     judge_input: int
     judge_output: int
+    retrieval_input: int
+    retrieval_output: int
 
 
 class MetricsOut(BaseModel):
-    """`latency_ms` 는 파이프라인 벽시계 시간이다 — **L2 호출을 포함**하고 처리 기록
-    저장은 포함하지 않는다."""
+    """`latency_ms` 는 파이프라인 벽시계 시간이다 — **L2 호출과 검색 단계 재작성 호출을
+    포함**하고 처리 기록 저장은 포함하지 않는다."""
 
     latency_ms: int
     tokens: TokensOut
+    #: 검색 단계가 폴백한 사유. `null` 은 "폴백하지 않았다"이고 **인계 사유가 아니다** —
+    #: 폴백한 문의도 그대로 답변될 수 있다.
+    retrieval_fallback_reason: str | None
 
 
 def _gate_out(result: GateResult | None) -> GateOut | None:
@@ -309,7 +332,10 @@ class InquiryResponse(BaseModel):
                     output=processed.output_tokens,
                     judge_input=processed.judge_input_tokens,
                     judge_output=processed.judge_output_tokens,
+                    retrieval_input=processed.retrieval_input_tokens,
+                    retrieval_output=processed.retrieval_output_tokens,
                 ),
+                retrieval_fallback_reason=processed.retrieval_fallback_reason,
             ),
         )
 
@@ -354,6 +380,11 @@ class InquiryService:
         return load_inquiry(conn=self._app_conn, inquiry_id=inquiry_id)
 
 
+#: 요청 수명의 조립품을 **필요해진 순간에** 여는 것. 의존성 해석 시점이 아니다 —
+#: 이유는 `get_service` 의 docstring 에 있다.
+type ServiceOpener = Callable[[], AbstractContextManager[InquiryService]]
+
+
 def _require_api_key(settings: Settings) -> str:
     if not settings.openai_api_key:
         raise MissingCredentialsError(
@@ -386,11 +417,15 @@ class _LazyGenerationClient:
 
 
 class _LazyEmbeddingClient:
-    """`EmbeddingClient` 의 지연 생성판. `dimensions` 는 설정만으로 답한다."""
+    """`EmbeddingClient` 의 지연 생성판. `model`·`dimensions` 는 설정만으로 답한다."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._client: EmbeddingClient | None = None
+
+    @property
+    def model(self) -> str:
+        return self._settings.embedding_model
 
     @property
     def dimensions(self) -> int:
@@ -417,8 +452,16 @@ def build_embedding_client(settings: Settings) -> EmbeddingClient:
     return _LazyEmbeddingClient(settings)
 
 
-def get_service() -> Iterator[InquiryService]:
-    """요청마다 커넥션 2개를 열고 닫는다 (text-to-SQL 은 반드시 read-only 계정으로).
+def get_service() -> ServiceOpener:
+    """조립만 돌려준다 — **커넥션은 아직 열지 않는다.**
+
+    의존성 해석 시점에 연결하면 DB 가 없을 때 **요청 오류와 설정 오류가 500 에 가린다**:
+    형식이 틀린 주문번호(422)도, 판정 키 부재(503)도 커넥션이 먼저 터져 전부 500 이 됐다.
+    라우트가 자기 선검사를 끝낸 뒤 `with open_service() as service` 로 여는 형태여야
+    그 순서가 **프레임워크의 의존성 해석 순서와 무관하게** 성립한다.
+
+    이 모듈은 같은 교훈을 LLM 클라이언트에는 이미 적용해 두었다(`_LazyGenerationClient`)
+    — 커넥션도 같은 종류의 자원이다.
 
     테스트는 `app.dependency_overrides[get_service]` 로 이 함수를 통째로 갈아 끼운다 —
     LLM 목과 트랜잭션 커넥션을 주입하는 지점이다.
@@ -429,16 +472,33 @@ def get_service() -> Iterator[InquiryService]:
         embedding_client=build_embedding_client(settings),
         settings=settings,
     )
-    with connect(settings=settings) as app_conn, readonly_connect(settings=settings) as ro_conn:
-        yield InquiryService(pipeline=pipeline, app_conn=app_conn, readonly_conn=ro_conn)
+
+    @contextmanager
+    def _open() -> Iterator[InquiryService]:
+        """요청마다 커넥션 2개를 열고 닫는다 (text-to-SQL 은 반드시 read-only 계정으로)."""
+        with connect(settings=settings) as app_conn, readonly_connect(settings=settings) as ro:
+            yield InquiryService(pipeline=pipeline, app_conn=app_conn, readonly_conn=ro)
+
+    return _open
 
 
-ServiceDep = Annotated[InquiryService, Depends(get_service)]
+ServiceDep = Annotated[ServiceOpener, Depends(get_service)]
 
 
 @app.exception_handler(MissingCredentialsError)
 def missing_credentials_handler(request: Request, exc: Exception) -> JSONResponse:
     """설정 오류는 503 — 처리 기록을 남기지 않는다 (인계로 집계되면 지표가 오염된다)."""
+    del request
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+
+@app.exception_handler(PolicyIndexProvenanceError)
+def stale_policy_index_handler(request: Request, exc: Exception) -> JSONResponse:
+    """낡은 정책 인덱스도 **설정 오류(503)** 다 — 자격 증명 부재와 같은 계열이다.
+
+    `no_evidence` 인계로 바꾸면 "검색이 못 찾았다"로 집계되어, 재색인을 빠뜨린 운영 실수가
+    검색 품질 지표로 위장한다. 처리 기록은 커넥션 롤백으로 남지 않는다.
+    """
     del request
     return JSONResponse(status_code=503, content={"detail": str(exc)})
 
@@ -479,18 +539,23 @@ def _require_judge_credentials() -> None:
 
 
 @app.post("/inquiries")
-def create_inquiry(payload: InquiryRequest, service: ServiceDep) -> InquiryResponse:
-    """문의 접수 + 동기 처리. 접수 검증 실패는 이 함수에 닿기 전에 422 로 끝난다."""
+def create_inquiry(payload: InquiryRequest, open_service: ServiceDep) -> InquiryResponse:
+    """문의 접수 + 동기 처리. 접수 검증 실패는 이 함수에 닿기 전에 422 로 끝난다.
+
+    **커넥션은 선검사 뒤에 연다.** 먼저 열면 DB 가 없을 때 422·503 이 500 에 가린다.
+    """
     # 처리 기록을 남기기 전에 끝낸다 — 설정 오류는 인계(`llm_call_failed`)가 아니다.
     _require_judge_credentials()
-    processed = service.process(content=payload.content, order_no=payload.order_no)
+    with open_service() as service:
+        processed = service.process(content=payload.content, order_no=payload.order_no)
     return InquiryResponse.of(processed)
 
 
 @app.get("/inquiries/{inquiry_id}")
-def read_inquiry(inquiry_id: str, service: ServiceDep) -> InquiryResponse:
+def read_inquiry(inquiry_id: str, open_service: ServiceDep) -> InquiryResponse:
     """처리 기록 조회 — **DB 에 저장된 값**에서 같은 골격을 재구성한다."""
-    processed = service.fetch(inquiry_id)
+    with open_service() as service:
+        processed = service.fetch(inquiry_id)
     if processed is None:
         raise HTTPException(status_code=404, detail="그런 문의가 없다")
     return InquiryResponse.of(processed)

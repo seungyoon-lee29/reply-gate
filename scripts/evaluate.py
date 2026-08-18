@@ -286,6 +286,18 @@ def _judge_label(
     return f"{label}{_ABORTED_MARK}" if aborted else label
 
 
+def _retrieval_strategy_label(settings: Settings) -> str:
+    """실행 조건에 남는 검색 전략 조합 (`.dryforge/spec.md` §8-3).
+
+    **설정에서 유도한다** — 손으로 적으면 스위치를 껐는데 리포트가 켜졌다고 말한다.
+    하이브리드·리랭크는 실행 경로에 없으므로(미채택) 여기 나타날 이름이 없다.
+    """
+    stages = ["vector"]
+    if settings.query_rewrite_enabled:
+        stages.append("rewrite")
+    return "+".join(stages)
+
+
 def _run_measurement_two(
     *,
     cases: tuple[GoldenCase, ...],
@@ -515,6 +527,8 @@ def main(argv: list[str] | None = None) -> int:
         generation=generation_label,
         embedding=embedding_label,
         judge=_judge_label(args=args, settings=settings, skip=skip, aborted=measurement2_aborted),
+        embedding_dimensions=run_settings.embedding_dimensions,
+        retrieval_strategy=_retrieval_strategy_label(run_settings),
         similarity_threshold=run_settings.vector_similarity_threshold,
         top_k=run_settings.vector_top_k,
         l1_fixture_count=len(fixtures),

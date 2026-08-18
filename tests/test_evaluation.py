@@ -77,7 +77,7 @@ from reply_gate.gate import evaluate_draft
 from reply_gate.judge import JUDGE_STAGE, JudgeOutcome
 from reply_gate.llm import GenerationClient, LLMFormatError
 from reply_gate.order_ref import is_valid_order_no
-from reply_gate.pipeline import AttemptRecord, ProcessedInquiry
+from reply_gate.pipeline import L2_JUDGE_STAGE, AttemptRecord, ProcessedInquiry
 from reply_gate.policy_index import index_policy_documents, load_policy_documents
 from reply_gate.testing import LexicalEmbeddingClient, StubJudge, build_stub_pipeline
 
@@ -102,6 +102,8 @@ def _processed(
     embedding_tokens: int = 0,
     judge_input_tokens: int = 0,
     judge_output_tokens: int = 0,
+    evidence: tuple[Evidence, ...] = (),
+    failed_stage: str | None = None,
 ) -> ProcessedInquiry:
     return ProcessedInquiry(
         inquiry_id="00000000-0000-4000-8000-000000000000",
@@ -112,8 +114,8 @@ def _processed(
         answer="답변" if status is InquiryStatus.ANSWERED else None,
         claims=(Claim(text="답변", citation_ids=("policy:refund:2-1",)),),
         escalation_reason=escalation,
-        failed_stage=None,
-        evidence=(),
+        failed_stage=failed_stage,
+        evidence=evidence,
         sql_snapshots=(),
         sql_failures=(),
         attempts=attempts,
@@ -167,12 +169,15 @@ def _conditions(
     judge_is_real: bool = False,
     l2_enabled: bool = True,
     judge: str = "결정론 대역",
+    retrieval_strategy: str = "vector+rewrite",
 ) -> RunConditions:
     return RunConditions(
         started_at=utc_now_iso(),
         generation="대역",
         embedding="대역",
+        embedding_dimensions=1536,
         judge=judge,
+        retrieval_strategy=retrieval_strategy,
         similarity_threshold=0.05,
         top_k=5,
         l1_fixture_count=len(FIXTURES),
@@ -549,10 +554,106 @@ def test_기각_재현율은_시도_판정에서_나온다() -> None:
     assert agreement.bait_total == 2
     assert agreement.bait_reject_reproduced == 1
     assert agreement.bait_reject_recall == 0.5
+    assert agreement.bait_unmeasured == 0
     assert agreement.outcomes[0].matched is True
     assert agreement.outcomes[1].matched is False
     # 비미끼 케이스도 expect_reject 요구는 그대로 받는다 — 불일치로는 찍히되 분모 밖이다.
     assert agreement.outcomes[2].matched is False
+
+
+def _bait_case(*, expect_reject: bool = False) -> GoldenCase:
+    return _case(
+        "B",
+        statuses=(InquiryStatus.ANSWERED, InquiryStatus.ESCALATED),
+        reasons=(EscalationReason.REJECTED_TWICE,),
+        expect_reject=expect_reject,
+        category="reject_bait",
+    )
+
+
+def _judge_call_died() -> ProcessedInquiry:
+    """L2 호출이 무너진 시도 — L1 통과, L2 판정 없음, 종합 verdict 는 `pass` 다."""
+    return _processed(
+        status=InquiryStatus.ESCALATED,
+        escalation=EscalationReason.LLM_CALL_FAILED,
+        failed_stage=L2_JUDGE_STAGE,
+        attempts=(AttemptRecord(attempt_no=1, verdict=Verdict.PASS, reject_reasons=(), draft={}),),
+    )
+
+
+def _gate_ran_and_missed() -> ProcessedInquiry:
+    return _processed(
+        attempts=(AttemptRecord(attempt_no=1, verdict=Verdict.PASS, reject_reasons=(), draft={}),)
+    )
+
+
+def test_판정이_돌지_못한_미끼는_게이트가_놓친_것과_구분된다() -> None:
+    """두 상태의 `attempt_verdicts` 는 똑같이 `['pass']` 다.
+
+    구분하지 않으면 인프라 실패가 "게이트가 미끼를 놓쳤다"로 접혀 분모에 0 으로 채워진다
+    (`scripts/AGENTS.md` 불변식 5 — 미실행을 0 으로 채우지 않는다).
+    """
+    died, missed = _judge_call_died(), _gate_ran_and_missed()
+    assert [a.verdict for a in died.attempts] == [a.verdict for a in missed.attempts]
+
+    unmeasured = measure_pipeline_agreement(
+        cases=[_bait_case()],
+        pipeline=ScriptedPipeline([died]),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+    measured = measure_pipeline_agreement(
+        cases=[_bait_case()],
+        pipeline=ScriptedPipeline([missed]),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    # 판정이 없었던 건은 분모 밖 — 재현율은 0.0 이 아니라 "미실행"이다.
+    assert unmeasured.bait_total == 0
+    assert unmeasured.bait_unmeasured == 1
+    assert unmeasured.bait_reject_recall is None
+    assert unmeasured.outcomes[0].gate_never_ran is True
+
+    # 게이트가 실제로 돌았고 놓친 건은 그대로 0.0 이다.
+    assert measured.bait_total == 1
+    assert measured.bait_unmeasured == 0
+    assert measured.bait_reject_recall == 0.0
+    assert measured.outcomes[0].gate_never_ran is False
+
+
+def test_판정이_없었던_케이스의_불일치_사유는_기각_실패가_아니다() -> None:
+    """`어떤 시도도 기각되지 않았다` 는 거짓이다 — 게이트에 닿지 못했다."""
+    agreement = measure_pipeline_agreement(
+        cases=[_bait_case(expect_reject=True)],
+        pipeline=ScriptedPipeline([_judge_call_died()]),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    mismatches = agreement.outcomes[0].mismatches
+    assert any("판정이 없었다(미측정)" in item for item in mismatches)
+    assert not any("어떤 시도도 기각되지 않았다" in item for item in mismatches)
+
+
+def test_분모에서_뺀_미측정은_리포트와_JSON_에_남는다(tmp_path: Path) -> None:
+    """분모에서 빼기만 하고 말하지 않으면 그냥 사라진 것이다."""
+    agreement = measure_pipeline_agreement(
+        cases=[_bait_case()],
+        pipeline=ScriptedPipeline([_judge_call_died()]),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    markdown_path, json_path = write_report(
+        _report(pipeline=agreement), out_dir=tmp_path, stem="unmeasured"
+    )
+    markdown = markdown_path.read_text(encoding="utf-8")
+    payload = json.loads(json_path.read_text(encoding="utf-8"))["measurement_2_pipeline_agreement"]
+
+    assert "미측정 1건은 분모 밖이다" in markdown
+    assert payload["bait_unmeasured"] == 1
+    assert payload["outcomes"][0]["gate_never_ran"] is True
 
 
 def test_금지_기각_사유가_발화하면_오탐으로_집계된다() -> None:
@@ -641,6 +742,271 @@ def test_L2_기각도_미끼_기각_재현율에_들어간다() -> None:
     assert agreement.bait_reject_reproduced == 1
     assert agreement.bait_reject_recall == 1.0
     assert agreement.outcomes[0].matched is True
+
+
+def test_골든_산출물은_파이프라인이_채택한_근거_ID를_보존한다() -> None:
+    evidence = Evidence(
+        id="policy:support:4-1",
+        source=EvidenceSource.POLICY,
+        content="고객센터 운영 안내",
+        evidence_text="고객센터 운영 안내",
+    )
+    agreement = measure_pipeline_agreement(
+        cases=[_case("G17")],
+        pipeline=ScriptedPipeline([_processed(evidence=(evidence,))]),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    assert agreement.outcomes[0].adopted_evidence_ids == ("policy:support:4-1",)
+    payload = report_to_json(_report(pipeline=agreement))
+    outcome = payload["measurement_2_pipeline_agreement"]["outcomes"][0]
+    assert outcome["adopted_evidence_ids"] == ["policy:support:4-1"]
+    markdown = render_markdown(_report(pipeline=agreement))
+    assert "### 케이스별 채택 근거" in markdown
+    assert "`G17`: `policy:support:4-1`" in markdown
+
+
+def test_평가_보고서는_검색_실패_생성_문제_빈_정답_정상_경로를_분해한다(
+    tmp_path: Path,
+) -> None:
+    support = Evidence(
+        id="policy:support:4-1",
+        source=EvidenceSource.POLICY,
+        content="고객센터 운영 안내",
+        evidence_text="고객센터 운영 안내",
+    )
+    rejected = AttemptRecord(
+        attempt_no=1,
+        verdict=Verdict.REJECT,
+        reject_reasons=(RejectReason.PII_DETECTED,),
+        draft={},
+    )
+    l2_rejected = AttemptRecord(
+        attempt_no=1,
+        verdict=Verdict.REJECT,
+        reject_reasons=(RejectReason.UNSUPPORTED_CLAIM,),
+        draft={},
+    )
+    channel = Evidence(
+        id="policy:support:4-2",
+        source=EvidenceSource.POLICY,
+        content="문의 접수 채널",
+        evidence_text="문의 접수 채널",
+    )
+    # G01 은 정답이 2조항(2-1·2-2)인 케이스다 — 일부만 찾은 경로를 만들려면 분모가 2 여야 한다.
+    refund_period = Evidence(
+        id="policy:refund:2-1",
+        source=EvidenceSource.POLICY,
+        content="단순 변심 환불 기간",
+        evidence_text="단순 변심 환불 기간",
+    )
+    escalated_statuses = (InquiryStatus.ESCALATED,)
+    escalated_reasons = (EscalationReason.NO_EVIDENCE, EscalationReason.REJECTED_TWICE)
+    agreement = measure_pipeline_agreement(
+        cases=[
+            _case("G01", statuses=escalated_statuses, reasons=escalated_reasons),
+            _case("G17", statuses=escalated_statuses, reasons=escalated_reasons),
+            _case("G20", statuses=escalated_statuses, reasons=escalated_reasons),
+            _case("G19"),
+            _case(
+                "G21",
+                statuses=escalated_statuses,
+                reasons=escalated_reasons,
+                category="no_evidence",
+            ),
+            _case(
+                "G22",
+                statuses=escalated_statuses,
+                reasons=escalated_reasons,
+                category="no_evidence",
+            ),
+        ],
+        pipeline=ScriptedPipeline(
+            [
+                # G01: 정답 2조항 중 1조항만 채택 — 필요한 조항이 빠진 채 생성했다.
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.REJECTED_TWICE,
+                    attempts=(rejected,),
+                    evidence=(refund_period,),
+                ),
+                # G17: 정답 조항을 하나도 못 찾았다.
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.NO_EVIDENCE,
+                ),
+                # G20: 정답 2조항을 전부 채택했는데도 기각·인계 — 생성 문제.
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.REJECTED_TWICE,
+                    attempts=(rejected,),
+                    evidence=(support, channel),
+                ),
+                # G19: 정답 조항 없이 답변이 확정됐다 — 게이트를 통과한 근거 부족.
+                _processed(status=InquiryStatus.ANSWERED, evidence=(support,)),
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.NO_EVIDENCE,
+                ),
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.REJECTED_TWICE,
+                    attempts=(l2_rejected,),
+                    evidence=(support,),
+                ),
+            ]
+        ),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    markdown_path, json_path = write_report(_report(pipeline=agreement), out_dir=tmp_path)
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    breakdown = payload["failure_attribution"]
+    assert breakdown["computed"] is True
+    assert breakdown["generation_issue_count"] == 1
+    assert breakdown["retrieval_failure_count"] == 1
+    assert breakdown["partial_retrieval_failure_count"] == 1
+    assert breakdown["retrieval_failure_total"] == 2
+    assert breakdown["answered_without_relevant_evidence_count"] == 1
+    assert breakdown["expected_no_answer_count"] == 2
+    by_id = {item["case_id"]: item for item in breakdown["cases"]}
+    # 정답 조항 일부만 찾은 것은 생성 문제가 아니다 — 필요한 근거가 빠져 있었다.
+    assert by_id["G01"]["classification"] == "partial_retrieval_failure"
+    assert by_id["G01"]["missing_relevant_evidence_ids"] == ["policy:refund:2-2"]
+    assert by_id["G17"]["classification"] == "retrieval_failure"
+    assert by_id["G20"]["classification"] == "generation_issue"
+    assert by_id["G19"]["classification"] == "answered_without_relevant_evidence"
+    assert by_id["G21"]["ended_with_zero_evidence"] is True
+    assert by_id["G21"]["l2_caught_with_evidence"] is False
+    assert by_id["G21"]["normal_behavior"] is True
+    assert by_id["G21"]["normal_behavior_path"] == "retrieval_zero_evidence"
+    assert by_id["G22"]["ended_with_zero_evidence"] is False
+    assert by_id["G22"]["l2_caught_with_evidence"] is True
+    assert by_id["G22"]["normal_behavior"] is True
+    assert by_id["G22"]["normal_behavior_path"] == "l2_rejected_with_evidence"
+    assert by_id["G21"]["classification"] == "expected_no_answer"
+    assert by_id["G22"]["classification"] == "expected_no_answer"
+
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert "### 검색 실패 / 생성 문제 분해" in markdown
+    assert "생성 문제: **1건**" in markdown
+    assert "검색 실패 합계: **2건**" in markdown
+    assert "일부 누락 1건" in markdown
+    assert "근거 없이 답변 확정: **1건**" in markdown
+    assert "빈 정답 정상 인계: **2건**" in markdown
+    assert "`G21`" in markdown and "검색 0건 종료" in markdown
+    assert "`G22`" in markdown and "근거 채택 후 L2 검출" in markdown
+
+
+def test_빈_정답의_LLM_실패와_L1만_기각은_정상_인계로_위장하지_않는다(
+    tmp_path: Path,
+) -> None:
+    unrelated = Evidence(
+        id="policy:support:4-1",
+        source=EvidenceSource.POLICY,
+        content="고객센터 운영 안내",
+        evidence_text="고객센터 운영 안내",
+    )
+    l1_rejected = AttemptRecord(
+        attempt_no=1,
+        verdict=Verdict.REJECT,
+        reject_reasons=(RejectReason.PII_DETECTED,),
+        draft={},
+    )
+    agreement = measure_pipeline_agreement(
+        cases=[
+            _case(
+                "G23",
+                statuses=(InquiryStatus.ESCALATED,),
+                reasons=(EscalationReason.LLM_CALL_FAILED,),
+                category="no_evidence",
+            ),
+            _case(
+                "G24",
+                statuses=(InquiryStatus.ESCALATED,),
+                reasons=(EscalationReason.REJECTED_TWICE,),
+                category="no_evidence",
+            ),
+        ],
+        pipeline=ScriptedPipeline(
+            [
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.LLM_CALL_FAILED,
+                    failed_stage="intent",
+                ),
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.REJECTED_TWICE,
+                    attempts=(l1_rejected,),
+                    evidence=(unrelated,),
+                ),
+            ]
+        ),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    markdown_path, json_path = write_report(_report(pipeline=agreement), out_dir=tmp_path)
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    breakdown = payload["failure_attribution"]
+    assert breakdown["expected_no_answer_count"] == 0
+    assert breakdown["expected_no_answer_anomaly_count"] == 2
+    by_id = {item["case_id"]: item for item in breakdown["cases"]}
+    assert by_id["G23"]["classification"] == "expected_no_answer"
+    assert by_id["G23"]["normal_behavior"] is False
+    assert by_id["G23"]["anomaly_reason"] == ("검색 0건이지만 no_evidence·시도 0건 종료가 아님")
+    assert by_id["G24"]["classification"] == "expected_no_answer"
+    assert by_id["G24"]["normal_behavior"] is False
+    assert by_id["G24"]["anomaly_reason"] == "근거를 채택했지만 L2 기각 사유 없음"
+
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert "빈 정답 정상 인계: **0건**" in markdown
+    assert "빈 정답 비정상 종결: **2건**" in markdown
+    assert "`G23`: **빈 정답 비정상 종결**" in markdown
+    assert "`G24`: **빈 정답 비정상 종결**" in markdown
+
+
+def test_검색_라벨이_없으면_분해만_미산출하고_측정_1_2_3은_유지한다(
+    tmp_path: Path,
+) -> None:
+    agreement = measure_pipeline_agreement(
+        cases=[_case("G17")],
+        pipeline=ScriptedPipeline([_processed()]),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+    judge_accuracy = measure_judge_accuracy(
+        fixtures=JUDGE_FIXTURES,
+        judge=OracleJudge(JUDGE_FIXTURES),
+    )
+    report = build_report(
+        conditions=_conditions(judge_is_real=True),
+        gate_accuracy=measure_gate_accuracy(FIXTURES),
+        pipeline=agreement,
+        judge_accuracy=judge_accuracy,
+        retrieval_labels_path=tmp_path / "missing-retrieval-labels.jsonl",
+    )
+
+    markdown_path, json_path = write_report(report, out_dir=tmp_path, stem="missing-labels")
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    breakdown = payload["failure_attribution"]
+    assert breakdown["computed"] is False
+    assert "FileNotFoundError" in breakdown["reason"]
+    assert "generation_issue_count" not in breakdown
+    assert payload["measurement_1_l1_gate_accuracy"]["total"] == len(FIXTURES)
+    assert payload["measurement_2_pipeline_agreement"]["executed"] is True
+    assert payload["measurement_2_pipeline_agreement"]["total"] == 1
+    assert payload["measurement_3_l2_judge_accuracy"]["executed"] is True
+    assert payload["measurement_3_l2_judge_accuracy"]["total"] == len(JUDGE_FIXTURES)
+
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert "**미산출 (사유: 검색 정답 라벨 로드 실패(FileNotFoundError):" in markdown
+    assert "## 측정 1 —" in markdown
+    assert "## 측정 2 —" in markdown
+    assert "## 측정 3 —" in markdown
 
 
 # ── 측정 3 — L2 판정 단위 정확도 (확률 층·과금) ─────────────────────────────

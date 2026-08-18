@@ -27,9 +27,8 @@ DB 가 필요한 테스트는 `db` 마커가 붙고, 쓰기는 전부 `app_conn`
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, cast
 
 import psycopg
@@ -40,6 +39,7 @@ from psycopg.rows import DictRow
 from reply_gate.api import (
     InquiryResponse,
     InquiryService,
+    ServiceOpener,
     app,
     build_embedding_client,
     build_generation_client,
@@ -98,8 +98,17 @@ RESPONSE_KEYS = {
 ATTEMPT_KEYS = {"verdict", "reject_reasons", "l1", "l2"}
 L1_KEYS = {"verdict", "reject_reasons"}
 L2_KEYS = {"verdict", "reject_reasons", "claim_judgments", "contradictions"}
-#: 생성 합산(기존 키·기존 의미) + 판정 계열 분리 키.
-TOKEN_KEYS = {"input", "output", "judge_input", "judge_output"}
+#: 생성 합산(기존 키·기존 의미) + 판정·검색 계열 분리 키.
+TOKEN_KEYS = {
+    "input",
+    "output",
+    "judge_input",
+    "judge_output",
+    "retrieval_input",
+    "retrieval_output",
+}
+#: `metrics` 의 키 — 폴백 사유는 인계 사유가 아니라 검색 층의 관측이므로 여기 산다.
+METRICS_KEYS = {"latency_ms", "tokens", "retrieval_fallback_reason"}
 
 
 def layer(verdict: Verdict, reasons: Sequence[RejectReason] = ()) -> dict[str, Any]:
@@ -146,8 +155,8 @@ class RecordingService:
 def recorder() -> Iterator[RecordingService]:
     service = RecordingService()
 
-    def _override() -> RecordingService:
-        return service
+    def _override() -> ServiceOpener:
+        return lambda: nullcontext(cast(InquiryService, service))
 
     app.dependency_overrides[get_service] = _override
     try:
@@ -186,10 +195,16 @@ def service_client(
     app_conn: psycopg.Connection[DictRow],
     ro_conn: psycopg.Connection[DictRow],
 ) -> Iterator[TestClient]:
-    """주어진 파이프라인 + 테스트 커넥션으로 앱을 돌린다 (의존성 주입 지점)."""
+    """주어진 파이프라인 + 테스트 커넥션으로 앱을 돌린다 (의존성 주입 지점).
 
-    def _override() -> InquiryService:
-        return InquiryService(pipeline=pipeline, app_conn=app_conn, readonly_conn=ro_conn)
+    주입한 커넥션은 **이미 열려 있으므로** 여는 계층은 `nullcontext` 로 비운다 — 테스트
+    커넥션의 수명은 픽스처가 소유하고, 요청이 끝날 때 닫히면 안 된다.
+    """
+
+    def _override() -> ServiceOpener:
+        return lambda: nullcontext(
+            InquiryService(pipeline=pipeline, app_conn=app_conn, readonly_conn=ro_conn)
+        )
 
     app.dependency_overrides[get_service] = _override
     try:
@@ -238,6 +253,7 @@ def l2_live_pipeline(
             generation_client=client,
             embedding_client=LexicalEmbeddingClient(dimensions=1536),
             settings=settings,
+            rewrite_client=client,
         ),
         drafter=DraftGenerator(client=client, effort=settings.generation_effort),
         judge=cast(Judging, judge),
@@ -439,7 +455,7 @@ def _assert_skeleton(payload: dict[str, Any]) -> None:
         assert set(item) == ATTEMPT_KEYS
         assert item["l1"] is None or set(item["l1"]) == L1_KEYS
         assert item["l2"] is None or set(item["l2"]) == L2_KEYS
-    assert set(payload["metrics"]) == {"latency_ms", "tokens"}
+    assert set(payload["metrics"]) == METRICS_KEYS
     assert set(payload["metrics"]["tokens"]) == TOKEN_KEYS
     assert isinstance(payload["metrics"]["latency_ms"], int)
 
@@ -549,10 +565,18 @@ def test_GET_은_메모리가_아니라_저장된_기록에서_재구성한다(
     _assert_skeleton(payload)
     assert payload["inquiry_id"] == stored.inquiry_id
     assert payload["answer"] == stored.answer
-    # 판정 토큰은 생성 합산(910/210)에 섞이지 않고 **분리된 키**로 복원된다.
+    # 판정·검색 토큰은 생성 합산(910/210)에 섞이지 않고 **분리된 키**로 복원된다.
     assert payload["metrics"] == {
         "latency_ms": 1234,
-        "tokens": {"input": 910, "output": 210, "judge_input": 433, "judge_output": 91},
+        "tokens": {
+            "input": 910,
+            "output": 210,
+            "judge_input": 433,
+            "judge_output": 91,
+            "retrieval_input": 17,
+            "retrieval_output": 5,
+        },
+        "retrieval_fallback_reason": None,
     }
     l1_reasons = (RejectReason.MISSING_CITATION, RejectReason.PII_DETECTED)
     stored_l2 = stored.attempts[1].l2_result
@@ -749,11 +773,14 @@ def test_판정_토큰은_생성_합산에_섞이지_않는다() -> None:
     tokens = InquiryResponse.of(processed).model_dump()["metrics"]["tokens"]
 
     assert processed.judge_input_tokens and processed.judge_output_tokens  # 양성 대조
+    assert processed.retrieval_input_tokens and processed.retrieval_output_tokens  # 양성 대조
     assert tokens == {
         "input": processed.input_tokens,
         "output": processed.output_tokens,
         "judge_input": processed.judge_input_tokens,
         "judge_output": processed.judge_output_tokens,
+        "retrieval_input": processed.retrieval_input_tokens,
+        "retrieval_output": processed.retrieval_output_tokens,
     }
 
 
@@ -834,6 +861,36 @@ def test_API_키가_없으면_POST_는_503_이고_인계로_기록하지_않는�
 
     assert response.status_code == 503
     assert "OPENAI_API_KEY" in response.text
+    after = app_conn.execute("SELECT count(*) AS n FROM inquiries").fetchone()
+    assert after is not None
+    assert after["n"] == before["n"]
+
+
+@pytest.mark.db
+@pytest.mark.usefixtures("indexed_policies")
+def test_인덱스와_다른_모델로_질의하면_503_이고_인계로_기록하지_않는다(
+    app_conn: psycopg.Connection[DictRow], ro_conn: psycopg.Connection[DictRow]
+) -> None:
+    """낡은 정책 인덱스는 설정 오류다 — `no_evidence` 로 집계되면 재색인 누락이 검색 품질로 위장한다.
+
+    `indexed_policies` 는 기본 모델 이름으로 적재하고, 여기서는 다른 이름의 임베더로 질의한다.
+    차원은 같으므로 pgvector 는 아무 불평 없이 코사인을 계산해 줄 것이다 — 그래서 코드가 막는다.
+    """
+    before = app_conn.execute("SELECT count(*) AS n FROM inquiries").fetchone()
+    assert before is not None
+    pipeline = build_pipeline(
+        generation_client=cast(
+            GenerationClient, scripted_client({INTENT_STAGE: [intent_completion("policy")]})
+        ),
+        embedding_client=LexicalEmbeddingClient(dimensions=1536, model="다른-모델"),
+        settings=Settings(vector_top_k=5, vector_similarity_threshold=0.0, l2_enabled=False),
+    )
+
+    with service_client(pipeline=pipeline, app_conn=app_conn, ro_conn=ro_conn) as test_client:
+        response = test_client.post("/inquiries", json={"content": INQUIRY})
+
+    assert response.status_code == 503
+    assert "index_policies" in response.text
     after = app_conn.execute("SELECT count(*) AS n FROM inquiries").fetchone()
     assert after is not None
     assert after["n"] == before["n"]
@@ -924,6 +981,77 @@ def test_스위치가_꺼져_있으면_판정_키_없이도_POST_가_처리된�
     assert response.json()["status"] == InquiryStatus.ANSWERED.value
 
 
+# ── DB 가 없을 때의 순서 (요청 오류·설정 오류가 500 에 가리지 않는다) ───────
+#
+# 이 절의 테스트는 **DB 가 없어야 의미가 있다** — `db` 마커를 붙이지 않고, 살아 있는
+# 컨테이너를 건드리는 대신 설정을 죽은 포트로 돌려 "DB 없음"을 만든다. 의존성 override 도
+# 하지 않는다: 실제 `get_service` 가 언제 연결하는지가 검사 대상이기 때문이다.
+
+
+def _dbless(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> Settings:
+    """DB 가 없는 환경. 포트 1 은 어떤 Postgres 도 듣지 않는다."""
+    return api_settings(monkeypatch, postgres_port=1, **overrides)
+
+
+def test_의존성_해석만으로는_커넥션을_열지_않는다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`get_service()` 자체가 연결하면 라우트의 선검사가 무엇을 하든 늦는다.
+
+    프레임워크의 의존성 해석 순서에 기대지 않는 지점이 여기다 — 해석이 공짜면 순서가
+    무엇이든 선검사가 먼저 끝난다.
+    """
+    _dbless(monkeypatch)
+
+    open_service = get_service()  # DB 가 없는데도 여기서 터지면 안 된다
+
+    with pytest.raises(psycopg.OperationalError), open_service():  # 열 때에야 터진다
+        pass
+
+
+def test_DB_가_없어도_접수_거부는_422다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """형식이 틀린 주문번호는 요청 오류다 — DB 가 떠 있느냐와 무관하다."""
+    _dbless(monkeypatch, l2_enabled=False)
+
+    with TestClient(app) as test_client:
+        response = test_client.post("/inquiries", json={"content": INQUIRY, "order_no": "12345"})
+
+    assert response.status_code == 422
+
+
+def test_DB_가_없어도_빈_내용은_422다(monkeypatch: pytest.MonkeyPatch) -> None:
+    _dbless(monkeypatch, l2_enabled=False)
+
+    with TestClient(app) as test_client:
+        response = test_client.post("/inquiries", json={"content": "   "})
+
+    assert response.status_code == 422
+
+
+def test_DB_가_없어도_판정키_부재는_503이다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """설정 오류는 DB 상태와 무관하게 설정 오류다."""
+    _dbless(monkeypatch, l2_enabled=True, anthropic_api_key="")
+
+    with TestClient(app) as test_client:
+        response = test_client.post("/inquiries", json={"content": INQUIRY})
+
+    assert response.status_code == 503
+    assert "ANTHROPIC_API_KEY" in response.text
+
+
+def test_DB_가_진짜_필요한_경로는_그대로_500이다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DB 장애를 업무 판정으로 바꾸지 않는다(docs/standards.md).
+
+    위 세 건을 "DB 오류를 삼켜서" 통과시키면 이 테스트가 깨진다.
+    """
+    _dbless(monkeypatch, l2_enabled=False)
+
+    with TestClient(app, raise_server_exceptions=False) as test_client:
+        lookup = test_client.get("/inquiries/3b0a5a1e-0000-4000-8000-000000000000")
+        process = test_client.post("/inquiries", json={"content": INQUIRY})
+
+    assert lookup.status_code == 500
+    assert process.status_code == 500
+
+
 # ── 커넥션 배선 자체 (목으로 덮이는 구간) ────────────────────────────────────
 
 
@@ -935,9 +1063,8 @@ def test_get_service_가_계정_두_개로_커넥션을_열고_닫는다() -> No
     실제로 열리는 커넥션이 각각 어느 계정인지 한 번은 DB 에 물어 확인한다.
     """
     settings = get_settings()
-    generator = get_service()
-    service = next(generator)
-    try:
+    open_service = get_service()
+    with open_service() as service:
         with service._app_conn.cursor() as cur:
             cur.execute("SELECT current_user AS who")
             row = cur.fetchone()
@@ -949,10 +1076,7 @@ def test_get_service_가_계정_두_개로_커넥션을_열고_닫는다() -> No
             row = cur.fetchone()
             assert row is not None
             assert row["who"] == settings.postgres_ro_user
-    finally:
-        with contextlib.suppress(StopIteration):
-            next(generator)
 
-    # 제너레이터가 끝나면 두 커넥션 모두 닫혀 있어야 한다 — 요청마다 새는 것을 막는다.
+    # 블록이 끝나면 두 커넥션 모두 닫혀 있어야 한다 — 요청마다 새는 것을 막는다.
     assert service._app_conn.closed
     assert service._readonly_conn.closed

@@ -55,9 +55,10 @@ class Evidence:
     """이번 문의에서 실제로 수집된 근거 1건.
 
     `content` 는 API 응답과 화면에 그대로 실리는 표시용 요약이고,
-    `evidence_text` 는 PII allowlist 대조에 쓰는 **원문 전체**다(정책 청크 텍스트,
-    SQL 결과 스냅샷 전문). 정책 근거에서는 보통 두 값이 같지만, SQL 근거에서는
-    표시용 요약만으로 대조하면 근거에 있는 값을 놓쳐 오탐이 난다.
+    `evidence_text` 는 PII allowlist 대조에 쓰는 **근거 원문 전체**다(정책 청크 텍스트,
+    SQL 결과 행). 정책 근거에서는 보통 두 값이 같지만, SQL 근거의 `content` 에만 실행 SQL 을
+    두고 `evidence_text` 에서는 계산된 패턴형 PII를 제외한다. 비PII 계산값은 L2용으로 유지하고,
+    가드가 `orders` 직접 컬럼으로 증명한 값은 정상 에코 대조를 위해 마스킹하지 않는다.
     """
 
     id: str
@@ -69,6 +70,11 @@ class Evidence:
 def policy_evidence_id(*, document_slug: str, article: str) -> str:
     """정책 조항 청크의 안정 식별자: `policy:<문서 slug>:<조항 번호>`."""
     return f"policy:{document_slug}:{article}"
+
+
+def is_policy_evidence_id(evidence_id: str) -> bool:
+    """정책 조항 근거인지 판정한다. SQL 조회 근거와 섞어 세지 않기 위한 경계다."""
+    return evidence_id.startswith("policy:")
 
 
 def sql_evidence_id(*, inquiry_id: str, sequence: int) -> str:

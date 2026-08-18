@@ -385,6 +385,9 @@ def test_형식_실패_뒤_전송_오류는_누적_토큰을_실어_전파한다
     assert excinfo.value.stage == JUDGE_STAGE
     assert excinfo.value.reason == "transport_error"
     assert (excinfo.value.input_tokens, excinfo.value.output_tokens) == (30, 5)
+    # **횟수도 같은 자격으로 누적한다.** 앞선 형식 실패의 전송 1회 + 래퍼가 센 2회 = 3회.
+    # 구 코드는 `attempts=exc.attempts` 라, 비용은 세면서 그 시도가 있었다는 사실은 버렸다.
+    assert excinfo.value.attempts == 3
     # 원본 예외는 원인으로 남는다 — 새로 던지는 것은 토큰을 싣기 위해서다.
     assert excinfo.value.__cause__ is transport_error
 
@@ -483,9 +486,9 @@ def _break_unknown_claim_text(payload: dict[str, Any]) -> None:
 
 
 def _break_duplicate_claim_judgment(payload: dict[str, Any]) -> None:
-    """같은 claim 을 두 번 판정한 산출 — 집합 대응 검사만으로는 통과해버린다.
+    """초안에 1건뿐인 claim 을 두 번 판정한 산출 — 개수가 초안을 넘는다.
 
-    짝짓기는 `claim_text` 로 한다(docs/contracts.md "층별 판정 키"). 같은 text 가 두 번
+    짝짓기는 `claim_text` 로 한다(docs/contracts.md "층별 판정 키"). 초안에 없는 개수만큼
     실리면 어느 판정이 그 문장의 것인지 정할 수 없고, 두 판정이 엇갈리면(pass/reject)
     "어느 문장이 왜 기각됐는지"가 화면과 재생성 피드백에서 갈린다.
     """
@@ -532,6 +535,102 @@ def test_정합성이_깨진_판정_산출은_거부된다(mutate: Any) -> None:
         judge.judge(draft=draft, evidence=(REFUND_7, REFUND_30))
 
     assert len(recorder.calls) == 2
+
+
+# ── 같은 text 의 claim 이 둘일 때 (초안은 LLM 산출이라 text 가 유일하지 않다) ──
+
+
+def _repeated_claim_draft() -> Draft:
+    """같은 문장을 두 번 담은 초안 — **인용 근거가 다르다.**
+
+    한쪽은 실제로 뒷받침되고 다른 쪽은 무관한 조항을 딛는다. 두 claim 의 판정이 갈릴 수
+    있으므로 하나로 접으면 판정받지 못한 문장이 답변에 실린다.
+    """
+    text = "환불 신청은 상품 수령일로부터 7일 이내에 가능합니다."
+    return _draft((text, (REFUND_7.id,)), (text, (REFUND_30.id,)))
+
+
+def test_같은_text_의_claim_이_둘이면_판정도_둘이어야_한다() -> None:
+    """판정 1건이 claim 2건을 덮으면 통과시키지 않는다 — 커버리지가 조용히 절반이 된다."""
+    draft = _repeated_claim_draft()
+    covered_once = {
+        "claim_judgments": [
+            {
+                "claim_text": draft.claims[0].text,
+                "verdict": "pass",
+                "explanation": "근거가 뒷받침한다.",
+            }
+        ],
+        "contradictions": [],
+        "verdict": "pass",
+        "reject_reasons": [],
+    }
+    judge, recorder = _judge([_completion(covered_once)])
+
+    with pytest.raises(LLMFormatError) as caught:
+        judge.judge(draft=draft, evidence=(REFUND_7, REFUND_30))
+
+    # 재시도 피드백이 무엇이 빠졌는지 말해야 모델이 고칠 수 있다.
+    assert "판정 누락" in str(caught.value)
+    assert len(recorder.calls) == 2
+
+
+def test_같은_text_의_claim_둘에_판정_둘을_내면_수용된다() -> None:
+    """옳은 산출이 '중복' 으로 거부되면 모델이 맞게 답할 길이 없다 — 반대 방향 고정."""
+    draft = _repeated_claim_draft()
+    text = draft.claims[0].text
+    payload = {
+        "claim_judgments": [
+            {"claim_text": text, "verdict": "pass", "explanation": "환불 기간 조항이 뒷받침한다."},
+            {"claim_text": text, "verdict": "reject", "explanation": "FAQ 12 는 30일이라 다르다."},
+        ],
+        "contradictions": [],
+        "verdict": "reject",
+        "reject_reasons": ["unsupported_claim"],
+    }
+    judge, recorder = _judge([_completion(payload)])
+
+    outcome = judge.judge(draft=draft, evidence=(REFUND_7, REFUND_30))
+
+    assert len(outcome.result.claim_judgments) == len(draft.claims)
+    assert [item.verdict for item in outcome.result.claim_judgments] == [
+        Verdict.PASS,
+        Verdict.REJECT,
+    ]
+    assert len(recorder.calls) == 1  # 재시도 없이 한 번에 받았다
+
+
+def test_판정_개수가_초안을_넘으면_거부된다() -> None:
+    """같은 text 라도 초안 개수보다 많으면 짝지을 수 없다 — 위쪽 경계."""
+    draft = _repeated_claim_draft()
+    text = draft.claims[0].text
+    payload = {
+        "claim_judgments": [
+            {"claim_text": text, "verdict": "pass", "explanation": f"{index}번째."}
+            for index in "가나다"
+        ],
+        "contradictions": [],
+        "verdict": "pass",
+        "reject_reasons": [],
+    }
+    judge, _ = _judge([_completion(payload)])
+
+    with pytest.raises(LLMFormatError) as caught:
+        judge.judge(draft=draft, evidence=(REFUND_7, REFUND_30))
+
+    assert "개수를 넘긴 판정" in str(caught.value)
+
+
+def test_프롬프트가_같은_문장의_반복을_어떻게_다룰지_알려준다() -> None:
+    """검사만 조이고 지시를 안 주면 모델은 계속 1건만 낸다 — 재시도 2회를 태우고 인계된다."""
+    draft = _repeated_claim_draft()
+    judge, recorder = _judge([_completion(_all_pass_payload(draft))])
+
+    judge.judge(draft=draft, evidence=(REFUND_7, REFUND_30))
+
+    system_prompt = recorder.calls[0]["system"]
+    assert "개수가 claim 목록과 정확히 같아야 한다" in system_prompt
+    assert "두 번 나오면 판정도" in system_prompt
 
 
 # ── 토큰 노출·호출 인자 ─────────────────────────────────────────────────────

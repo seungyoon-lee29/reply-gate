@@ -239,6 +239,12 @@ class ProcessedInquiry:
     embedding_tokens: int
     judge_input_tokens: int = 0
     judge_output_tokens: int = 0
+    #: 검색 단계(질의 재작성) 생성 호출의 토큰. 생성·임베딩·판정 어디에도 합산하지 않는다
+    #: (docs/contracts.md "토큰 집계 경계"). 재작성을 쓰지 않은 문의는 0 이다.
+    retrieval_input_tokens: int = 0
+    retrieval_output_tokens: int = 0
+    #: 검색 단계가 폴백한 사유. `None` 이면 폴백하지 않았다 — 인계 사유가 **아니다**.
+    retrieval_fallback_reason: str | None = None
 
     @property
     def escalated(self) -> bool:
@@ -614,6 +620,11 @@ class InquiryPipeline:
             # (docs/contracts.md "토큰 집계 경계"). L2 미실행이면 0 이다.
             judge_input_tokens=tally.judge_input_tokens,
             judge_output_tokens=tally.judge_output_tokens,
+            # 검색 단계 토큰도 같은 규칙의 세 번째 계열이다 — 수집기가 이미 분리해서
+            # 들고 있으므로 원장을 거치지 않고 그대로 옮긴다(초안 루프가 만들지 않는다).
+            retrieval_input_tokens=collection.retrieval_input_tokens,
+            retrieval_output_tokens=collection.retrieval_output_tokens,
+            retrieval_fallback_reason=collection.retrieval_fallback_reason,
         )
 
 
@@ -675,6 +686,12 @@ def build_pipeline(
     **판정자는 스위치와 무관하게 항상 배선한다.** 스위치 켜짐 + 판정자 미배선은
     `InquiryPipeline` 조립 시점 오류이므로, 하위호환(키 없이도 조립은 성공)을 지는 것은
     이 함수다 — 지연 생성 클라이언트라 배선 자체는 키를 요구하지 않는다.
+
+    **재작성 클라이언트도 스위치와 무관하게 항상 배선한다** — 같은 이유이고, 값은 생성
+    클라이언트다. 재작성은 픽스처를 만든 조건과 같은 계열·같은 모델이어야 오프라인
+    비교표가 런타임을 예측한다(`docs/tracking/decisions/0010`). 판정 계열 분리
+    (결정 0004)의 대상이 아니다 — 재작성은 자기 출력을 평가하는 것이 아니라 검색어를
+    만드는 일이고, 그 뒤에 L1·L2 두 층이 그대로 서 있다.
     """
     resolved = settings if settings is not None else get_settings()
     return InquiryPipeline(
@@ -682,6 +699,7 @@ def build_pipeline(
             generation_client=generation_client,
             embedding_client=embedding_client,
             settings=resolved,
+            rewrite_client=generation_client,
         ),
         drafter=DraftGenerator(client=generation_client, effort=resolved.generation_effort),
         judge=build_judge(resolved),

@@ -1,0 +1,30 @@
+{"id": "G01", "relevant_evidence_ids": ["policy:refund:2-1", "policy:refund:2-2"], "note": "단순 변심 환불 기간을 서로 다르게 정한 두 조항이 모두 관련 근거다."}
+{"id": "G02", "relevant_evidence_ids": ["policy:shipping:1-3", "policy:shipping:1-4"], "note": "배송비와 무료 배송 기준을 서로 다르게 정한 두 조항이 모두 관련 근거다."}
+{"id": "G03", "relevant_evidence_ids": ["policy:exchange:3-2"], "note": "교환 가능 사유를 직접 정한 조항이다."}
+{"id": "G04", "relevant_evidence_ids": ["policy:support:4-6"], "note": "적립률과 유효기간을 함께 정한 조항이다."}
+{"id": "G05", "relevant_evidence_ids": ["policy:support:4-3"], "note": "출고 전후 주문 취소 가능 여부를 정한 조항이다."}
+{"id": "G06", "relevant_evidence_ids": ["policy:shipping:1-6"], "note": "출고 전후 배송지 변경 가능 여부를 정한 조항이다."}
+{"id": "G07", "relevant_evidence_ids": ["policy:support:4-7"], "note": "회원 탈퇴 신청 경로와 제한을 정한 조항이다."}
+{"id": "G08", "relevant_evidence_ids": ["policy:shipping:1-7"], "note": "수령인 부재 시 배송 처리 방식을 정한 조항이다."}
+{"id": "G09", "relevant_evidence_ids": ["policy:shipping:1-5"], "note": "특정 주문 값은 주문 데이터가 필요하지만 배송 상태 조회와 상태 전이를 직접 다루는 정책 조항이다."}
+{"id": "G10", "relevant_evidence_ids": ["policy:shipping:1-5"], "note": "특정 주문 값은 주문 데이터가 필요하지만 현재 배송 상태 조회를 직접 다루는 정책 조항이다."}
+{"id": "G11", "relevant_evidence_ids": ["policy:shipping:1-1"], "note": "주문 상태와 함께 일반 상품 출고 소요 기간이 필요한 문의다."}
+{"id": "G12", "relevant_evidence_ids": ["policy:refund:2-4"], "note": "취소 주문 상태와 함께 환불 처리 기간이 필요한 문의다."}
+{"id": "G13", "relevant_evidence_ids": ["policy:refund:2-4"], "note": "특정 주문 값은 주문 데이터가 필요하지만 환불 처리 시점과 완료까지의 기간을 직접 다루는 조항이다."}
+{"id": "G14", "relevant_evidence_ids": ["policy:exchange:3-5"], "note": "교환 접수 상태와 함께 상품 수거 절차가 필요한 문의다."}
+{"id": "G15", "relevant_evidence_ids": ["policy:refund:2-5"], "note": "반품 사유별 배송비 부담 주체를 정한 조항이다."}
+{"id": "G16", "relevant_evidence_ids": ["policy:support:4-1"], "note": "전화번호를 정면으로 다루는 조항은 고객센터 운영 안내 하나다. 4-2 는 이메일을 포함한 접수 채널 안내라 전화번호만 묻는 문의의 직접 근거가 아니다 — 두 채널을 함께 묻는 G20 에서만 두 조항이 든다."}
+{"id": "G17", "relevant_evidence_ids": ["policy:support:4-1"], "note": "구어체 전화 상담 문의도 G16 과 같은 조항 하나를 정면 근거로 한다. 표현이 달라도 정답이 달라지지 않아야 검색 실패를 표현 차이로 읽을 수 있다."}
+{"id": "G18", "relevant_evidence_ids": ["policy:refund:2-6", "policy:refund:2-4"], "note": "이메일 값이 비어 있어도 하자 환불 서류 제출처를 정면으로 다루는 조항(2-6)이 근거다. 2-6 의 '검수 절차 없이 즉시 환불' 과 2-4 의 '검수 완료 후 3영업일' 이 같은 상황을 다르게 정하므로 상충 조항 2-4 도 직접 관련된다 — L2 가 모순을 잡으려면 검색이 둘을 함께 올려야 한다."}
+{"id": "G19", "relevant_evidence_ids": ["policy:support:4-2"], "note": "이메일 값이 비어 있어도 이메일 문의 접수를 정면으로 다루는 조항이다."}
+{"id": "G20", "relevant_evidence_ids": ["policy:support:4-1", "policy:support:4-2"], "note": "전화 상담과 이메일 접수를 각각 다루는 두 미끼 조항이 모두 관련 근거다."}
+{"id": "G21", "relevant_evidence_ids": [], "note": "정책 문서에 해외 배송 조항이 없다."}
+{"id": "G22", "relevant_evidence_ids": [], "note": "정책 문서에 기업 대량 구매나 B2B 할인 조항이 없다."}
+{"id": "G23", "relevant_evidence_ids": [], "note": "정책 문서에 오프라인 매장 픽업 조항이 없다."}
+{"id": "G24", "relevant_evidence_ids": [], "note": "정책 문서에 선물 포장 서비스 조항이 없다."}
+{"id": "G25", "relevant_evidence_ids": ["policy:shipping:1-5"], "note": "실행 요청이어도 1-5 가 배송 상태를 고객이 직접 확인하는 방법을 정면으로 준다. 정답 유무를 가르는 것은 실행 요청인지가 아니라 조항이 그 요청에 답하거나 스스로 할 방법을 주는지다(빈 정답인 G28 과 대조). 주문번호 안내 같은 단순 처리 전제는 검색 정답에서 제외한다."}
+{"id": "G26", "relevant_evidence_ids": ["policy:shipping:1-1"], "note": "주문번호가 빠졌어도 문의 주제인 출고 후 도착 소요 기간을 직접 다루는 정책 조항이다."}
+{"id": "G27", "relevant_evidence_ids": ["policy:shipping:1-5"], "note": "주문이 존재하지 않아도 문의 주제인 배송 상태 조회를 직접 다루는 정책 조항이다."}
+{"id": "G28", "relevant_evidence_ids": [], "note": "환불을 요청하는 방법이나 그 요청에 답하는 조항이 없다. 2-4 는 반품 상품이 입고·검수된 뒤의 처리 기간이라 '환불해 달라' 에 답하지 않는다 — 고객이 스스로 할 방법을 주는 G25 의 1-5 와 갈리는 지점이다. 기권이 정답인 케이스다."}
+{"id": "G29", "relevant_evidence_ids": ["policy:support:4-5"], "note": "주문 상세 주소와 연락처의 공개를 안전하게 제한하는 접근 통제 조항이 직접 관련된다."}
+{"id": "G30", "relevant_evidence_ids": ["policy:support:4-5"], "note": "카드 번호를 보유하거나 공개할 근거는 아니지만 주문 상세 정보의 공개 제한에 직접 적용되는 접근 통제 조항이다."}

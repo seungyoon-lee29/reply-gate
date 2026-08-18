@@ -194,6 +194,7 @@ class SqlGuardRule(StrEnum):
     NO_WHITELISTED_TABLE = "no_whitelisted_table"
     UNKNOWN_COLUMN = "unknown_column"
     FORBIDDEN_FUNCTION = "forbidden_function"
+    UNSUPPORTED_PROJECTION = "unsupported_projection"
     ORDER_SCOPE = "order_scope"
     UNSUPPORTED_LIMIT = "unsupported_limit"
 
@@ -224,6 +225,8 @@ class ValidatedQuery:
     tables: tuple[str, ...]
     #: 이 쿼리가 한정된 주문번호 — 선검사를 통과한 그 1건이다.
     order_no: str
+    #: PII allowlist 에 써도 되는 최상위 출력명. `orders` 직접 컬럼 projection 만 들어간다.
+    pii_safe_output_columns: tuple[str, ...]
 
 
 def describe_whitelist(whitelist: Mapping[str, tuple[str, ...]] = SCHEMA_WHITELIST) -> str:
@@ -804,6 +807,114 @@ def _check_functions(statement: exp.Select) -> None:
         )
 
 
+def _check_projections(statement: exp.Select) -> None:
+    """최상위 직접 상수 projection 을 중복 방어로 거부한다.
+
+    PII allowlist 의 권위 있는 경계는 ValidatedQuery.pii_safe_output_columns 다. 이 검사는
+    정확 재현인 직접 상수 형태를 실행 전에 빠르게 거부하되, 허용 함수·계산식을 막지 않는다.
+    계산 결과는 표시용 content 에는 남지만 allowlist 근거 컬럼에는 포함되지 않는다.
+    """
+    for projection in statement.expressions:
+        value = projection.this if isinstance(projection, exp.Alias) else projection
+        if not isinstance(value.unnest(), exp.Literal):
+            continue
+        raise _reject(
+            SqlGuardRule.UNSUPPORTED_PROJECTION,
+            "상수만 결과 컬럼으로 내보낼 수 없다: "
+            f"{_sql_of(projection)}. orders 의 화이트리스트 컬럼을 직접 조회한다.",
+        )
+
+
+def _database_output_name(projection: exp.Expr) -> str:
+    """PostgreSQL 결과 메타데이터에 나타나는 projection 이름을 반환한다."""
+    if isinstance(projection, exp.Alias):
+        alias = projection.args.get("alias")
+        if isinstance(alias, exp.Identifier) and alias.args.get("quoted"):
+            return projection.output_name
+    return projection.output_name.lower()
+
+
+def _projection_output_names(scope: _Scope) -> tuple[str, ...]:
+    """최상위 결과 컬럼 이름을 별표까지 펼쳐 반환한다.
+
+    psycopg ``DictRow`` 는 같은 이름의 결과 컬럼을 dict 로 낮출 때 뒤 값을 남긴다. 따라서
+    provenance 를 출력명으로 전달하려면 이름이 유일하다는 전제가 먼저 증명돼야 한다.
+    """
+    names: list[str] = []
+    for projection in scope.select.expressions:
+        if isinstance(projection, exp.Star):
+            for source in scope.sources.values():
+                names.extend(sorted(source.columns))
+            continue
+
+        value = projection.this if isinstance(projection, exp.Alias) else projection
+        if isinstance(value, exp.Column) and isinstance(value.this, exp.Star):
+            qualified_source = scope.sources.get(value.table.lower())
+            if qualified_source is not None:
+                names.extend(sorted(qualified_source.columns))
+            continue
+        if projection.output_name:
+            names.append(_database_output_name(projection))
+    return tuple(names)
+
+
+def _check_unique_output_names(scope: _Scope) -> None:
+    """dict 행에서 provenance 가 다른 값으로 덮이지 않도록 출력 이름 중복을 거부한다."""
+    names = _projection_output_names(scope)
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for name in names:
+        if name in seen and name not in duplicates:
+            duplicates.append(name)
+        seen.add(name)
+    if duplicates:
+        raise _reject(
+            SqlGuardRule.UNSUPPORTED_PROJECTION,
+            "결과 컬럼 이름은 서로 달라야 한다: "
+            f"{', '.join(duplicates)}. 각 projection 에 고유한 별칭을 붙인다.",
+        )
+
+
+def _pii_safe_output_columns(scope: _Scope) -> tuple[str, ...]:
+    """`orders` 직접 컬럼에서 온 최상위 출력명만 PII allowlist 출처로 승인한다.
+
+    계산식·함수·CTE·파생 테이블은 결과가 DB 에서 돌아와도 LLM 이 쓴 리터럴을 합성할 수 있다.
+    그 값은 표시·L2 근거로는 남기되 PII allowlist 에는 쓰지 않는다. 직접 컬럼과 base-table
+    별표만 승인하므로 검증기가 모르는 새 표현식은 자동으로 불승인된다.
+    """
+    safe: list[str] = []
+    for projection in scope.select.expressions:
+        if isinstance(projection, exp.Star):
+            for source in scope.sources.values():
+                if source.base_table is not None:
+                    safe.extend(sorted(source.columns))
+            continue
+
+        value = projection.this if isinstance(projection, exp.Alias) else projection
+        if isinstance(value, exp.Column) and isinstance(value.this, exp.Star):
+            qualified_source = scope.sources.get(value.table.lower())
+            if qualified_source is not None and qualified_source.base_table is not None:
+                safe.extend(sorted(qualified_source.columns))
+            continue
+        if not isinstance(value, exp.Column):
+            continue
+
+        if value.table:
+            qualified_source = scope.sources.get(value.table.lower())
+            from_base_table = (
+                qualified_source is not None and qualified_source.base_table is not None
+            )
+        else:
+            from_base_table = any(
+                source.base_table is not None and value.name.lower() in source.columns
+                for source in scope.sources.values()
+            )
+        if from_base_table and projection.output_name:
+            safe.append(_database_output_name(projection))
+
+    return tuple(dict.fromkeys(safe))
+
+
 # ── 4. 주문 1건 한정 ────────────────────────────────────────────────────────
 
 
@@ -955,11 +1066,13 @@ def validate_sql(
     _check_joins(statement)
 
     analyzer = _Analyzer(whitelist)
-    analyzer.build(statement, None, {})
+    root_scope = analyzer.build(statement, None, {})
     analyzer.verify_all_tables_resolved(statement)
     tables = analyzer.referenced_tables()
     analyzer.check_columns()
     _check_functions(statement)
+    _check_projections(statement)
+    _check_unique_output_names(root_scope)
     analyzer.check_order_scope(order_no)
 
     limited, effective = _enforce_limit(statement, max_rows)
@@ -970,4 +1083,5 @@ def validate_sql(
         max_rows=max_rows,
         tables=tables,
         order_no=order_no,
+        pii_safe_output_columns=_pii_safe_output_columns(root_scope),
     )

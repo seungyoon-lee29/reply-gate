@@ -19,6 +19,7 @@ from reply_gate.contracts import (
     EscalationReason,
     EvidenceSource,
     IntentSource,
+    RejectReason,
     Verdict,
 )
 from reply_gate.db import readonly_connect
@@ -28,6 +29,7 @@ from reply_gate.evidence import (
     SQL_GENERATION_STAGE,
     EvidenceCollector,
     SqlFailureKind,
+    _sql_evidence_texts,
     classify_intent,
     generate_sql,
     order_exists,
@@ -35,6 +37,7 @@ from reply_gate.evidence import (
 from reply_gate.gate import evaluate_draft
 from reply_gate.llm import GenerationClient, JsonCompletion, LLMCallError, LLMFormatError
 from reply_gate.policy_index import index_policy_documents, load_policy_documents
+from reply_gate.query_rewrite import QUERY_REWRITE_STAGE
 from reply_gate.testing import LexicalEmbeddingClient
 
 INQUIRY_ID = "11111111-2222-3333-4444-555555555555"
@@ -45,8 +48,20 @@ MISSING_ORDER_NO = "ORD-20991231-9999"
 # ── 목 / 픽스처 ─────────────────────────────────────────────────────────────
 
 
+#: 대본에 재작성이 없을 때 기본으로 돌려주는 토큰 — 0 이 아니어야 "검색 계열이 생성
+#: 합산에 섞이지 않는다"를 대조할 수 있다.
+_DEFAULT_REWRITE_TOKENS = (7, 3)
+
+
 class _ScriptedClient:
-    """`GenerationClient` 대역 — 단계별로 미리 정한 결과를 순서대로 돌려준다."""
+    """`GenerationClient` 대역 — 단계별로 미리 정한 결과를 순서대로 돌려준다.
+
+    **재작성 단계만 예외**다: 대본에 아예 없으면 "원문 그대로"를 돌려준다. 재작성은 정책
+    경로의 기본 호출이라 대본에 넣기를 강제하면 관계없는 테스트 수십 개가 재작성 대본을
+    이고 다니게 되고, 원문 그대로는 픽스처 계약이 명시적으로 허용하는 산출이라
+    (`rewritten` == `original`) 수집기가 검색을 한 번만 돌아 기존 기대가 그대로 선다.
+    **대본이 재작성을 지정했으면 그것이 이기고, 큐가 마르면 그때는 오류다.**
+    """
 
     def __init__(self, script: Mapping[str, Sequence[Any]]) -> None:
         self._script = {stage: list(outcomes) for stage, outcomes in script.items()}
@@ -55,6 +70,8 @@ class _ScriptedClient:
     def complete_json(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
         stage = kwargs["stage"]
+        if stage == QUERY_REWRITE_STAGE and stage not in self._script:
+            return _echo_rewrite(kwargs["user"])
         queue = self._script.get(stage)
         if not queue:
             raise AssertionError(f"대본에 없는 호출이다: stage={stage!r}")
@@ -65,6 +82,22 @@ class _ScriptedClient:
 
     def calls_for(self, stage: str) -> list[dict[str, Any]]:
         return [call for call in self.calls if call["stage"] == stage]
+
+
+def _echo_rewrite(user_prompt: str) -> JsonCompletion:
+    """재작성 대역의 기본 산출 — 프롬프트에 실린 문의 원문을 그대로 되돌려준다."""
+    inquiry = user_prompt.removeprefix("[문의]\n")
+    return JsonCompletion(
+        data={"rewritten": inquiry},
+        input_tokens=_DEFAULT_REWRITE_TOKENS[0],
+        output_tokens=_DEFAULT_REWRITE_TOKENS[1],
+    )
+
+
+def _rewrite(text: str, *, input_tokens: int = 7, output_tokens: int = 3) -> JsonCompletion:
+    return JsonCompletion(
+        data={"rewritten": text}, input_tokens=input_tokens, output_tokens=output_tokens
+    )
 
 
 def _client(script: Mapping[str, Sequence[Any]]) -> _ScriptedClient:
@@ -89,7 +122,10 @@ def _collector(
     threshold: float = 0.0,
     top_k: int = 5,
     max_rows: int = 50,
+    query_rewrite_enabled: bool = True,
 ) -> EvidenceCollector:
+    """기본은 **제품 기본값(재작성 켜짐)** 이다 — 테스트가 제품이 쓰지 않는 구성을 재면
+    배관 검증이 실제 실행과 다른 것을 검증한다."""
     return EvidenceCollector(
         generation_client=cast(GenerationClient, client),
         embedding_client=LexicalEmbeddingClient(dimensions=1536),
@@ -97,7 +133,9 @@ def _collector(
             vector_top_k=top_k,
             vector_similarity_threshold=threshold,
             sql_max_rows=max_rows,
+            query_rewrite_enabled=query_rewrite_enabled,
         ),
+        rewrite_client=cast(GenerationClient, client) if query_rewrite_enabled else None,
     )
 
 
@@ -200,6 +238,31 @@ def test_전송_오류는_재시도하지_않고_그대로_올린다() -> None:
         classify_intent(client=cast(GenerationClient, client), inquiry=INQUIRY)
 
     assert len(client.calls_for(INTENT_STAGE)) == 1
+
+
+def test_형식_실패_뒤_전송_오류면_앞선_전송까지_세어_올린다() -> None:
+    """토큰은 누적하면서 횟수만 버리면 '1회 재시도'라고 적힌 기록이 실제와 갈린다.
+
+    1차 시도가 형식 오류(전송 1회) + 2차 시도가 전송 오류(래퍼가 2회 전송) = 실제 3회.
+    """
+    broken = LLMFormatError(
+        stage=INTENT_STAGE,
+        detail="형식 불일치",
+        input_tokens=7,
+        output_tokens=1,
+        transport_attempts=1,
+    )
+    died = LLMCallError(
+        stage=INTENT_STAGE, reason="transport_error", attempts=2, input_tokens=3, output_tokens=0
+    )
+    client = _client({INTENT_STAGE: [broken, died]})
+
+    with pytest.raises(LLMCallError) as excinfo:
+        classify_intent(client=cast(GenerationClient, client), inquiry=INQUIRY)
+
+    assert excinfo.value.attempts == 3
+    # 토큰 누적은 원래도 맞았다 — 같은 자리에서 횟수만 빠져 있었다.
+    assert (excinfo.value.input_tokens, excinfo.value.output_tokens) == (10, 1)
 
 
 # ── SQL 생성 (DB 불필요) ────────────────────────────────────────────────────
@@ -492,6 +555,82 @@ def test_상위_k_개까지만_근거로_삼는다(
     assert len(result.evidence) == 2
 
 
+def test_SQL_원문은_표시용_content에만_남고_allowlist_근거는_결과_행만_쓴다() -> None:
+    sql = "SELECT status FROM orders WHERE order_no = '<선검사 주문>' AND '010-9999-9999' <> ''"
+
+    content, evidence_text = _sql_evidence_texts(
+        sql=sql,
+        rows=({"status": "배송중"},),
+        pii_safe_output_columns=("status",),
+    )
+
+    assert sql in content
+    assert "010-9999-9999" in content
+    assert evidence_text == "1) status=배송중"
+
+
+def test_SQL_계산_결과의_PII는_evidence_text에서_출처로_승인하지_않는다() -> None:
+    sql = "SELECT concat('010', '-9999-', '9999') AS customer_phone FROM orders"
+
+    content, evidence_text = _sql_evidence_texts(
+        sql=sql,
+        rows=({"customer_phone": "010-9999-9999"},),
+        pii_safe_output_columns=(),
+    )
+
+    assert "customer_phone=010-9999-9999" in content
+    assert "010-9999-9999" not in evidence_text
+
+
+def test_출력_별칭_이름에_심은_PII도_allowlist_근거가_되지_않는다() -> None:
+    """출력 이름은 LLM 이 정한다 — 값만 거르면 같은 공격이 이름 자리로 내려온다.
+
+    `SELECT status AS "010-9999-9999"` 는 가드를 통과하고 별칭이 결과 dict 의 **키**가 되며,
+    직접 컬럼으로 증명된 이름 집합에도 그 별칭이 들어온다. `key=value` 로 렌더되는 순간
+    지어낸 번호가 근거 유래로 승인됐다.
+    """
+    sql = "SELECT status AS \"010-9999-9999\" FROM orders WHERE order_no = '<선검사 주문>'"
+
+    content, evidence_text = _sql_evidence_texts(
+        sql=sql,
+        rows=({"010-9999-9999": "배송중"},),
+        pii_safe_output_columns=("010-9999-9999",),
+    )
+
+    assert "010-9999-9999" in content
+    assert "010-9999-9999" not in evidence_text
+
+
+def test_SQL_계산_결과가_비PII면_L2용_evidence_text에_계속_남긴다() -> None:
+    content, evidence_text = _sql_evidence_texts(
+        sql="SELECT upper(status) AS status_label FROM orders",
+        rows=({"status_label": "배송중"},),
+        pii_safe_output_columns=(),
+    )
+
+    assert "status_label=배송중" in content
+    assert evidence_text == "1) status_label=배송중"
+
+
+@pytest.mark.parametrize(
+    ("safe_name", "row_name"),
+    [
+        pytest.param("phone", "phone", id="따옴표_없는_별칭은_소문자"),
+        pytest.param("Phone", "Phone", id="따옴표_별칭은_대소문자_보존"),
+    ],
+)
+def test_DB가_노출하는_별칭과_직접_컬럼_provenance가_일치하면_PII를_보존한다(
+    safe_name: str, row_name: str
+) -> None:
+    _, evidence_text = _sql_evidence_texts(
+        sql="SELECT customer_phone FROM orders",
+        rows=({row_name: "010-1234-5678"},),
+        pii_safe_output_columns=(safe_name,),
+    )
+
+    assert evidence_text == f"1) {row_name}=010-1234-5678"
+
+
 # ── text-to-SQL (DB 필요) ───────────────────────────────────────────────────
 
 
@@ -574,6 +713,57 @@ def test_SQL_근거의_evidence_text_에_연락처_원문이_그대로_들어간
         ]
     }
     assert evaluate_draft(raw_draft=draft, evidences=result.evidence).verdict is Verdict.PASS
+
+
+@pytest.mark.db
+def test_SQL_WHERE_리터럴은_표시용_content에만_남고_PII_allowlist에는_들어가지_않는다(
+    app_conn: psycopg.Connection[DictRow],
+    ro_conn: psycopg.Connection[DictRow],
+    sample_order: dict[str, Any],
+) -> None:
+    order_no = sample_order["order_no"]
+    sql = f"SELECT status FROM orders WHERE order_no = '{order_no}' AND '010-9999-9999' <> ''"
+    client = _client(
+        {
+            INTENT_STAGE: [_intent("order")],
+            SQL_GENERATION_STAGE: [_sql(sql)],
+        }
+    )
+
+    result = _collector(client).collect(
+        inquiry_id=INQUIRY_ID,
+        content=INQUIRY,
+        order_no=order_no,
+        app_conn=app_conn,
+        readonly_conn=ro_conn,
+    )
+
+    evidence = result.evidence[0]
+    assert sql in evidence.content
+    assert sql not in evidence.evidence_text
+    assert "010-9999-9999" not in evidence.evidence_text
+
+    fabricated = {
+        "claims": [
+            {
+                "text": "연락처는 010-9999-9999입니다.",
+                "citation_ids": [evidence.id],
+            }
+        ]
+    }
+    status_echo = {
+        "claims": [
+            {
+                "text": f"주문 상태는 {sample_order['status']}입니다.",
+                "citation_ids": [evidence.id],
+            }
+        ]
+    }
+
+    assert evaluate_draft(raw_draft=fabricated, evidences=result.evidence).reject_reasons == (
+        RejectReason.PII_DETECTED,
+    )
+    assert evaluate_draft(raw_draft=status_echo, evidences=result.evidence).verdict is Verdict.PASS
 
 
 @pytest.mark.db
@@ -1118,3 +1308,151 @@ def test_임베딩은_정책_검색이_필요할_때만_호출된다(
     assert result.embedding_tokens == 0
     assert result.escalation_reason is None
     assert INQUIRY_EMBEDDING_STAGE == "inquiry_embedding"
+    # 재작성도 정책 검색의 일부다 — 검색하지 않는 의도에서는 부르지 않는다(과금 0).
+    assert client.calls_for(QUERY_REWRITE_STAGE) == []
+    assert (result.retrieval_input_tokens, result.retrieval_output_tokens) == (0, 0)
+
+
+@pytest.mark.db
+@pytest.mark.usefixtures("indexed_policies")
+def test_검색_토큰은_생성_임베딩_어디에도_합산되지_않는다(
+    app_conn: psycopg.Connection[DictRow], ro_conn: psycopg.Connection[DictRow]
+) -> None:
+    """계열이 섞이면 초안을 만들지도 않은 문의가 초안 생성 토큰을 쓴 것으로 찍힌다."""
+    content = "환불 언제까지 되나요"
+    client = _client(
+        {
+            INTENT_STAGE: [_intent("policy", input_tokens=100, output_tokens=5)],
+            QUERY_REWRITE_STAGE: [_rewrite("환불 신청 기간", input_tokens=40, output_tokens=8)],
+        }
+    )
+
+    result = _collector(client, threshold=0.0).collect(
+        inquiry_id=INQUIRY_ID,
+        content=content,
+        order_no=None,
+        app_conn=app_conn,
+        readonly_conn=ro_conn,
+    )
+
+    # 생성 합산은 의도 해석 몫 그대로다 — 재작성 40/8 이 여기 들어오지 않는다.
+    assert (result.input_tokens, result.output_tokens) == (100, 5)
+    assert (result.retrieval_input_tokens, result.retrieval_output_tokens) == (40, 8)
+    # 임베딩 계열도 따로다 — 두 질의를 실었으므로 두 문자열의 길이 합이다.
+    assert result.embedding_tokens == len(content) + len("환불 신청 기간")
+    assert result.retrieval_fallback_reason is None
+
+
+# ── 질의 재작성 (DB 필요) ───────────────────────────────────────────────────
+
+
+@pytest.mark.db
+@pytest.mark.usefixtures("indexed_policies")
+def test_원문과_재작성문을_둘_다_검색해_합집합으로_모은다(
+    app_conn: psycopg.Connection[DictRow], ro_conn: psycopg.Connection[DictRow]
+) -> None:
+    """재작성이 주제를 옮겨도 원문이 안전망이다 (spec §5-2).
+
+    두 질의를 따로 돌린 결과의 합집합이 실제 채택 근거와 같은지 본다 — 어느 한쪽만 쓰면
+    이 등식이 깨진다.
+    """
+    original = "환불 신청 기간이 어떻게 되나요"
+    rewritten = "교환 신청 조건"
+
+    def adopted(content: str) -> set[str]:
+        """재작성을 끄고 그 질의 하나만으로 검색한 결과."""
+        result = _collector(
+            _client({INTENT_STAGE: [_intent("policy")]}),
+            threshold=0.0,
+            top_k=3,
+            query_rewrite_enabled=False,
+        ).collect(
+            inquiry_id=INQUIRY_ID,
+            content=content,
+            order_no=None,
+            app_conn=app_conn,
+            readonly_conn=ro_conn,
+        )
+        return {item.id for item in result.evidence}
+
+    only_original = adopted(original)
+    only_rewritten = adopted(rewritten)
+
+    union = _collector(
+        _client({INTENT_STAGE: [_intent("policy")], QUERY_REWRITE_STAGE: [_rewrite(rewritten)]}),
+        threshold=0.0,
+        top_k=3,
+    ).collect(
+        inquiry_id=INQUIRY_ID,
+        content=original,
+        order_no=None,
+        app_conn=app_conn,
+        readonly_conn=ro_conn,
+    )
+    merged = {item.id for item in union.evidence}
+
+    # 두 질의가 실제로 다른 조항을 물어야 합집합이 관측된다(양성 대조).
+    assert only_rewritten - only_original
+    assert merged <= only_original | only_rewritten
+    assert merged & only_rewritten and merged & only_original
+    # 합집합이어도 채택 상한은 그대로다 — 재작성이 후보를 2배로 늘리지 않는다.
+    assert len(union.evidence) == 3
+
+
+@pytest.mark.db
+@pytest.mark.usefixtures("indexed_policies")
+def test_재작성이_원문과_같으면_임베딩을_한_번만_태운다(
+    app_conn: psycopg.Connection[DictRow], ro_conn: psycopg.Connection[DictRow]
+) -> None:
+    """픽스처 계약이 허용하는 산출이다(`rewritten` == `original`) — 같은 벡터를 두 번 사지 않는다."""
+    content = "환불 신청 기간이 어떻게 되나요"
+    client = _client({INTENT_STAGE: [_intent("policy")], QUERY_REWRITE_STAGE: [_rewrite(content)]})
+
+    result = _collector(client, threshold=0.0).collect(
+        inquiry_id=INQUIRY_ID,
+        content=content,
+        order_no=None,
+        app_conn=app_conn,
+        readonly_conn=ro_conn,
+    )
+
+    # `LexicalEmbeddingClient` 는 문자 수를 토큰으로 센다 — 두 번 실렸으면 2배가 된다.
+    assert result.embedding_tokens == len(content)
+
+
+@pytest.mark.db
+@pytest.mark.usefixtures("indexed_policies")
+def test_재작성_실패는_인계가_아니라_폴백이고_기록에_남는다(
+    app_conn: psycopg.Connection[DictRow], ro_conn: psycopg.Connection[DictRow]
+) -> None:
+    """검색은 검증이 아니라 재료 수집이다 — 재료가 덜 좋아진 것은 검증 없이 내보내는 것과 다르다.
+
+    같은 문의를 재작성 성공 조건에서도 돌려 **폴백이 결과를 망치지 않았다**를 함께 본다.
+    """
+    content = "환불 신청 기간이 어떻게 되나요"
+    client = _client(
+        {
+            INTENT_STAGE: [_intent("policy")],
+            QUERY_REWRITE_STAGE: [
+                LLMCallError(stage=QUERY_REWRITE_STAGE, reason="연결 실패", attempts=2)
+            ],
+        }
+    )
+
+    result = _collector(client, threshold=0.0).collect(
+        inquiry_id=INQUIRY_ID,
+        content=content,
+        order_no=None,
+        app_conn=app_conn,
+        readonly_conn=ro_conn,
+    )
+
+    # 인계가 아니다 — 원문 질의로 그대로 진행해 근거를 모았다.
+    assert result.escalation_reason is None
+    assert result.failed_stage is None
+    assert result.evidence
+    # 조용하지도 않다 — 사유가 수집 결과에 실려 처리 기록·리포트로 흘러간다.
+    assert result.retrieval_fallback_reason is not None
+    assert "전송 오류" in result.retrieval_fallback_reason
+    # 폴백은 사이클 2 동작과 같다 — 원문만 검색한 것과 임베딩 비용이 같다.
+    assert result.embedding_tokens == len(content)

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import json
+import pathlib
+from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -14,6 +17,7 @@ import pytest
 from reply_gate.llm import (
     MAX_ATTEMPTS,
     AnthropicGenerationClient,
+    BgeM3EmbeddingClient,
     LLMCallError,
     LLMFormatError,
     OpenAIEmbeddingClient,
@@ -80,6 +84,87 @@ def test_sdk_자동재시도를_끈다() -> None:
         api_key="test", model="text-embedding-3-small", dimensions=1536
     )
     assert embedder._client.max_retries == 0
+
+
+# ── 주입 경로도 같은 정책을 받는다 (`or` 우변은 주입 시 평가되지 않는다) ──────
+
+
+def test_주입한_SDK_클라이언트도_자동재시도가_꺼지고_타임아웃이_고정된다() -> None:
+    """구 코드는 `client or SDK(..., max_retries=0, timeout=...)` 라 주입 시 우변을 평가조차
+    하지 않았다. SDK 기본 `max_retries=2` 와 래퍼 재시도가 곱해져 **최대 6회 전송**인데
+    `LLMCallError.attempts` 는 2 로 신고됐고, 타임아웃도 120초 의도가 SDK 기본 600초였다.
+    """
+    injected_openai = openai.OpenAI(api_key="test")
+    injected_anthropic = anthropic.Anthropic(api_key="test")
+    assert injected_openai.max_retries == 2  # 주입 전에는 SDK 기본값이다
+    assert injected_anthropic.max_retries == 2
+
+    generation = OpenAIGenerationClient(
+        api_key="test", model="gpt-5.6-terra", client=injected_openai
+    )
+    judging = AnthropicGenerationClient(
+        api_key="test", model="claude-sonnet-5", client=injected_anthropic
+    )
+    embedding = OpenAIEmbeddingClient(
+        api_key="test",
+        model="text-embedding-3-small",
+        dimensions=1536,
+        client=openai.OpenAI(api_key="test"),
+    )
+
+    for wrapper in (generation, judging, embedding):
+        assert wrapper._client.max_retries == 0
+
+    # 타임아웃도 같은 표현식의 같은 구멍이었다 — 래퍼 값으로 고정한다.
+    assert generation._client.timeout == 120.0
+    assert judging._client.timeout == 120.0
+    assert embedding._client.timeout == 60.0
+
+
+def test_테스트_대역_주입은_그대로_통과한다() -> None:
+    """대역 주입은 정상 용법이다 — `max_retries`·`with_options` 가 없어도 막지 않는다."""
+    double = SimpleNamespace(responses=SimpleNamespace(create=lambda **_: None))
+
+    client = OpenAIGenerationClient(
+        api_key="test", model="gpt-5.6-terra", client=cast(openai.OpenAI, double)
+    )
+
+    assert cast(object, client._client) is double  # 사본을 만들지도 않는다
+
+
+def test_재시도를_끌_수_없는_클라이언트는_조립에서_거부된다() -> None:
+    """fail-closed — 재시도가 켜져 있는데 끌 수단이 없으면 조용히 받아들이지 않는다."""
+    unfixable = SimpleNamespace(max_retries=2)
+
+    with pytest.raises(ValueError, match="자동 재시도를 끌 수 없다"):
+        OpenAIGenerationClient(
+            api_key="test", model="gpt-5.6-terra", client=cast(openai.OpenAI, unfixable)
+        )
+
+
+def test_llm_모듈의_모든_클라이언트_대입은_관문을_지난다() -> None:
+    """구조 테스트 — 네 번째 래퍼가 생기거나 누가 `client or SDK(...)` 로 되돌리면 잡는다.
+
+    인스턴스 속성 assert 만으로는 **새로 추가된 래퍼**를 잡지 못한다. 대입 지점 자체를
+    검사해야 관문이 우회 불가능한 통로가 된다(`tests/test_gate.py` 의 격리 구조 테스트와
+    같은 방식).
+    """
+    source = pathlib.Path("src/reply_gate/llm.py").read_text(encoding="utf-8")
+    assignments = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Attribute) and target.attr == "_client"
+    ]
+
+    assert len(assignments) >= 3, "클라이언트 대입 지점을 찾지 못했다 — 검사가 헛돌고 있다"
+    for node in assignments:
+        call = node.value
+        assert isinstance(call, ast.Call), f"line {node.lineno}: 관문 호출이 아니다"
+        assert isinstance(call.func, ast.Name) and call.func.id == "_pin_transport_policy", (
+            f"line {node.lineno}: `self._client` 는 `_pin_transport_policy(...)` 결과여야 한다"
+        )
 
 
 def test_정상_응답은_데이터와_토큰을_돌려준다() -> None:
@@ -163,6 +248,46 @@ def test_거절_응답은_사용가능한_산출이_없으므로_실패다() -> 
     assert excinfo.value.reason == "refusal"
     # 거절은 200 으로 온 응답이라 토큰이 이미 과금됐다 — 실패에 실어야 실비용이 남는다.
     assert (excinfo.value.input_tokens, excinfo.value.output_tokens) == (11, 7)
+
+
+# ── attempts 는 상수가 아니라 실측이다 ─────────────────────────────────────
+
+
+def test_전송_수는_상수가_아니라_실제로_나간_횟수다() -> None:
+    """성공한 산출에도 실린다 — 형식 루프를 도는 호출자가 이 값을 누적하기 때문이다."""
+    once, _ = _generation_client([_response(json.dumps({"intent": "policy"}))])
+    twice, calls = _generation_client(
+        [_connection_error(), _response(json.dumps({"intent": "policy"}))]
+    )
+
+    assert once.complete_json(stage="intent", system="s", user="u", schema=SCHEMA)
+    assert (
+        once.complete_json(stage="intent", system="s", user="u", schema=SCHEMA).transport_attempts
+        == 1
+    )
+    result = twice.complete_json(stage="intent", system="s", user="u", schema=SCHEMA)
+    assert result.transport_attempts == len(calls.calls) == 2
+
+
+def test_형식오류에도_그때까지_나간_전송_수가_실린다() -> None:
+    """1차 전송 실패 뒤 2차가 비 JSON 이면 전송은 2회다 — 호출자가 이어 세야 한다."""
+    client, calls = _generation_client([_connection_error(), _response("이건 JSON 이 아니다")])
+
+    with pytest.raises(LLMFormatError) as excinfo:
+        client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
+
+    assert excinfo.value.transport_attempts == len(calls.calls) == 2
+
+
+def test_거절_경로의_attempts_도_실측이다() -> None:
+    """구 코드는 `attempts=1` 하드코딩이라, 재시도 뒤에 온 거절이 1회로 신고됐다."""
+    client, calls = _generation_client([_connection_error(), _response("", refusal="정책상 불가")])
+
+    with pytest.raises(LLMCallError) as excinfo:
+        client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
+
+    assert excinfo.value.reason == "refusal"
+    assert excinfo.value.attempts == len(calls.calls) == 2
 
 
 def test_형식오류는_재시도하지_않고_호출자에게_위임한다() -> None:
@@ -387,3 +512,32 @@ def test_빈_입력은_호출하지_않는다() -> None:
 
     assert result.vectors == []
     assert embeddings.calls == []
+
+
+class _LocalEmbeddingModel:
+    def __init__(self, vectors: list[list[float]]) -> None:
+        self.vectors = vectors
+        self.calls: list[tuple[tuple[str, ...], bool]] = []
+
+    def encode(self, sentences: Sequence[str], *, normalize_embeddings: bool) -> object:
+        self.calls.append((tuple(sentences), normalize_embeddings))
+        return self.vectors
+
+
+def test_BGE_M3_는_선택_모델_경계에서_1024차원_dense_벡터를_만든다() -> None:
+    model = _LocalEmbeddingModel([[0.0] * 1024, [1.0] * 1024])
+    client = BgeM3EmbeddingClient(model=model)
+
+    result = client.embed(stage="retrieval", texts=["문의", "정책"])
+
+    assert client.dimensions == 1024
+    assert result.vectors == model.vectors
+    assert result.total_tokens == 0
+    assert model.calls == [(("문의", "정책"), True)]
+
+
+def test_BGE_M3_는_잘못된_차원을_거부한다() -> None:
+    client = BgeM3EmbeddingClient(model=_LocalEmbeddingModel([[0.0] * 1536]))
+
+    with pytest.raises(ValueError, match="1024차원"):
+        client.embed(stage="retrieval", texts=["문의"])
