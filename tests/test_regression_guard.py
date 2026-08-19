@@ -28,7 +28,11 @@ from reply_gate.regression_guard import (
     GuardUnavailable,
     PromotedBaseline,
     RegressionGuard,
+    RunSet,
+    RunSummary,
     build_regression_guard,
+    compare_run_sets,
+    fingerprint_from_conditions,
     guard_to_json,
     load_promoted_baseline,
     render_guard_section,
@@ -203,10 +207,13 @@ def _run_guard(
 ) -> RegressionGuard:
     """기준선 3회를 심고 새 실측 N 회를 흘린 뒤 마지막 실행의 가드를 돌려준다."""
     reports_dir = tmp_path / "reports"
-    stems = _seed_baseline(reports_dir, cases=baseline_cases, **(baseline_kwargs or {}))
+    baseline_kwargs = dict(baseline_kwargs or {})
+    stems = _seed_baseline(reports_dir, cases=baseline_cases, **baseline_kwargs)
     reference = tmp_path / "data" / "promoted_baseline.json"
     if promoted:
-        _promotion(reference, stems=stems)
+        # 등재는 **자기가 가리키는 산출물과 같은 조건**을 적어야 한다 — 어긋나면 가드가
+        # 대조 전에 재등재를 요구한다(그 경로는 따로 테스트한다).
+        _promotion(reference, stems=stems, fingerprint=baseline_kwargs.get("fingerprint"))
 
     payloads = [
         _payload(
@@ -455,7 +462,11 @@ def test_기준선에_근거_필드가_없으면_없다고_적고_0으로_채우
     )
     assert guard.binding.evidence_losses == ()
     assert any("기준선" in note for note in guard.binding.unknown_notes)
-    assert guard.binding.verdict != "미달"
+    # **통과가 아니다.** 판정의 정의인 검사가 돌지 않았는데 헤드라인이 통과라고 적히면
+    # 그것이 곧 "미실행을 통과로 채우기"다.
+    assert guard.binding.verdict == "보류"
+    assert "근거 부분 손실 검사가 돌지 않았다" in guard.binding.verdict_reason
+    assert "근거 부분 손실 없음" not in guard.binding.verdict_reason
     rendered = "\n".join(render_guard_section(guard))
     assert "미산출" in rendered or "없" in rendered
 
@@ -479,8 +490,43 @@ def test_측정_3_은_무변경_검사_대상이_아니다(tmp_path: Path) -> No
     )
     assert guard.binding.verdict == "통과"
     rendered = "\n".join(render_guard_section(guard))
-    assert "측정 3" in rendered
-    assert "선언된 실험 변인" in rendered
+    assert "측정 3 은 무변경 검사 대상이 아니다" in rendered
+
+
+def test_측정_3_표기는_이_실행에서_실제로_성립하는_것을_적는다(tmp_path: Path) -> None:
+    """규칙은 고정이지만 그 뒤 문장은 실행마다 다르다 — 선언하지 않은 실행의 리포트가
+    "선언된 실험 변인이라" 라고 적으면 그것은 거짓이다."""
+    # ① 아무것도 선언하지 않았는데 값이 달라졌다.
+    silent = _run_guard(
+        tmp_path / "silent",
+        candidate_cases=[_healthy_cases()] * RUN_SET_SIZE,
+        candidate_kwargs={"measurement3_detection_rate": 0.5},
+    )
+    note = next(item for item in silent.binding.notes if "측정 3" in item)
+    assert "선언하지 않았다" in note
+    assert "선언된 실험 변인" not in note
+
+    # ② 판정 층 변경을 선언했다.
+    judged = dict(_BASE_FINGERPRINT)
+    judged["judge_prompt_version"] = "p-cccc"
+    declared_guard = _run_guard(
+        tmp_path / "declared",
+        candidate_cases=[_healthy_cases()] * RUN_SET_SIZE,
+        candidate_fingerprint=judged,
+        declared=["judge_prompt_version"],
+        candidate_kwargs={"measurement3_detection_rate": 0.5},
+    )
+    note = next(item for item in declared_guard.binding.notes if "측정 3" in item)
+    assert "판정 층 변경을 선언했다" in note
+    assert "judge_prompt_version" in note
+
+    # ③ 값이 그대로면 변화 자체가 없다.
+    same = _run_guard(
+        tmp_path / "same",
+        candidate_cases=[_healthy_cases()] * RUN_SET_SIZE,
+    )
+    note = next(item for item in same.binding.notes if "측정 3" in item)
+    assert "값이 같다" in note
 
 
 def test_멀쩡한_실행은_어떤_경보도_내지_않는다(tmp_path: Path) -> None:
@@ -708,3 +754,242 @@ def test_모든_커밋된_라이브_리포트가_읽힌다(stem: str) -> None:
     summary = run_summary_from_payload(payload, stem=stem, source=stem)
     assert summary.cases
     assert summary.started_at
+
+
+def test_기준선이_3회_모두_멀쩡했던_케이스도_근거_손실을_감시한다(tmp_path: Path) -> None:
+    """**이 층이 가장 지켜야 할 모집단이다.**
+
+    귀인 절은 "정답 조항을 전부 채택하고 정상 답변한" 케이스를 싣지 않는다. 그래서 기준선이
+    3회 모두 멀쩡했던 케이스는 산출물에 정답 근거 ID 가 한 번도 안 나온다 — 없는 쪽 라벨을
+    있는 쪽에서 빌려 오지 않으면 그 케이스가 통째로 감시 밖으로 나가고, 리포트는 그 자리에
+    "근거 부분 손실 없음"이라고 적는다. 커밋된 산출물 기준으로 30건 중 10건이 그 모양이고
+    그중에 라이브가 이름으로 지켜봐야 할 케이스가 들어 있다.
+    """
+    baseline: dict[str, CaseSpec] = {
+        "G18": (True, ["policy:refund:2-4", "policy:refund:2-6"], []),
+        # 기준선에서 완벽했던 케이스 — 귀인 절에 실리지 않는다.
+        "G20": (True, None, None),
+    }
+    degraded: dict[str, CaseSpec] = {
+        "G18": (True, ["policy:refund:2-4", "policy:refund:2-6"], []),
+        # 같은 케이스가 정답 조항 하나를 잃었다. `matched` 는 여전히 True 다.
+        "G20": (True, ["policy:support:4-1", "policy:support:4-2"], ["policy:support:4-2"]),
+    }
+    guard = _run_guard(
+        tmp_path,
+        baseline_cases=baseline,
+        candidate_cases=[degraded] * RUN_SET_SIZE,
+    )
+    assert guard.binding.match_shortfalls == (), "`matched` 는 셋 다 True 다"
+    assert guard.binding.verdict == "미달"
+    losses = {item.case_id: item for item in guard.binding.evidence_losses}
+    assert "G20" in losses
+    assert losses["G20"].dropped_evidence_ids == ("policy:support:4-2",)
+    rendered = "\n".join(render_guard_section(guard))
+    assert "G20" in rendered and "policy:support:4-2" in rendered
+    assert "근거 부분 손실 없음" not in rendered
+
+
+def test_반대_방향_보정은_거짓_손실을_만들지_않는다(tmp_path: Path) -> None:
+    """음성 대조 — 기준선이 일부만 채택했고 이번에 전부 채택했으면 손실이 아니라 개선이다."""
+    baseline: dict[str, CaseSpec] = {
+        "G20": (True, ["policy:support:4-1", "policy:support:4-2"], ["policy:support:4-2"]),
+    }
+    improved: dict[str, CaseSpec] = {"G20": (True, None, None)}
+    guard = _run_guard(
+        tmp_path,
+        baseline_cases=baseline,
+        candidate_cases=[improved] * RUN_SET_SIZE,
+    )
+    assert guard.binding.evidence_losses == ()
+    assert guard.binding.verdict == "통과"
+
+
+def test_양쪽_모두_관측하지_못한_ID_는_한_줄로_묶어_적는다(tmp_path: Path) -> None:
+    """무지를 "손실 없음"으로 읽히게 두지 않는다 — 다만 케이스마다 한 줄씩 쌓지도 않는다."""
+    both_clean: dict[str, CaseSpec] = {
+        "G03": (True, None, None),
+        "G05": (True, None, None),
+    }
+    guard = _run_guard(
+        tmp_path,
+        baseline_cases=both_clean,
+        candidate_cases=[both_clean] * RUN_SET_SIZE,
+    )
+    notes = [note for note in guard.binding.unknown_notes if "관측하지 못한" in note]
+    assert len(notes) == 1
+    assert "`G03`" in notes[0] and "`G05`" in notes[0]
+    assert guard.binding.verdict == "통과"
+
+
+def test_모델_지문은_설명이_아니라_벌거벗은_id_로_비교한다() -> None:
+    """옛 산출물의 설명 문자열과 새 실행의 명시 지문이 형식만 달라 어긋나면, 아무것도
+    바뀌지 않았는데 커밋된 기준선마다 "대조 불가"가 뜬다 — 지문이 스스로를 무력화한다."""
+    baseline = run_summary_from_payload(
+        json.loads((_ROOT / "reports" / "evaluation-live-l2-1.json").read_text(encoding="utf-8")),
+        stem="evaluation-live-l2-1",
+        source="evaluation-live-l2-1",
+    ).fingerprint
+    assert baseline.values["generation_model"] == "gpt-5.6-terra"
+    assert baseline.values["judge_model"] == "claude-sonnet-5"
+    # τ 짝인 임베딩 모델도 옛 산출물에서 읽혀야 한다 — 미상이면 짝 규칙이 통째로 무력해진다.
+    assert baseline.values["embedding_model"] == "text-embedding-3-small"
+    assert baseline.values["judge_effort"] == "기본값"
+
+    current = ConditionFingerprint.from_values(
+        {
+            "acceptance_cut": "0.3",
+            "top_k": "5",
+            "generation_model": "gpt-5.6-terra",
+            "judge_model": "claude-sonnet-5",
+            "embedding_model": "text-embedding-3-small",
+            "judge_effort": "기본값",
+        }
+    )
+    comparison = current.compare(baseline)
+    assert comparison.undeclared_differences == (), [
+        item.describe() for item in comparison.undeclared_differences
+    ]
+    assert comparison.comparable is True
+
+
+def test_모델_설명이_없으면_추측하지_않고_미상으로_남긴다() -> None:
+    """ "미실행" 처럼 id 를 담지 않은 설명에서 값을 지어내면 조용한 드리프트가 된다."""
+    fingerprint = fingerprint_from_conditions(
+        {"generation": "미실행", "judge": "미실행", "embedding": "미실행"}
+    )
+    assert fingerprint.values["generation_model"] is None
+    assert fingerprint.values["judge_model"] is None
+    assert fingerprint.values["embedding_model"] is None
+
+
+def test_커밋된_옛_기준선에_대한_판정은_통과가_아니라_보류다() -> None:
+    """실제 산출물로 확인한다 — `evaluation-live-l2-1/2/3` 에는 귀인 절이 아예 없다.
+
+    그 세트를 기준선으로 삼으면 근거 부분 손실 검사가 통째로 돌지 않는다. 그때 나오는
+    판정이 "통과"이면, 이 가드가 존재하는 이유인 그 회귀를 못 본 채 성공 신호를 낸다.
+    """
+
+    def _load(stem: str) -> RunSummary:
+        return run_summary_from_payload(
+            json.loads((_ROOT / "reports" / f"{stem}.json").read_text(encoding="utf-8")),
+            stem=stem,
+            source=stem,
+        )
+
+    old_set = RunSet(
+        label="옛 기준선",
+        runs=tuple(_load(f"evaluation-live-l2-{n}") for n in (1, 2, 3)),
+    )
+    assert all(not run.attribution_computed for run in old_set.runs)
+    line = compare_run_sets(
+        baseline=old_set,
+        candidate=old_set,
+        label="승격 기준선",
+        role="구속",
+    )
+    assert line.verdict == "보류"
+    assert "돌지 않았다" in line.verdict_reason
+
+
+def test_대조된_케이스가_없으면_통과로_적지_않는다(tmp_path: Path) -> None:
+    """측정 2 를 건너뛴 실측은 케이스가 없다 — 비어 있는 대조는 성공이 아니다."""
+    reports_dir = tmp_path / "reports"
+    stems = _seed_baseline(reports_dir)
+    reference = tmp_path / "promoted_baseline.json"
+    _promotion(reference, stems=stems)
+
+    empty = _payload(started_at="2026-08-11T00:00:00+00:00", cases={})
+    current = run_summary_from_payload(
+        empty, stem="evaluation-live-l2-4", source="evaluation-live-l2-4"
+    )
+    guard = build_regression_guard(
+        current=current, reports_dir=reports_dir, promoted_reference_path=reference
+    )
+    assert isinstance(guard, RegressionGuard)
+    assert guard.binding.verdict == "보류"
+    assert "케이스 단위 판정이 돌지 않았다" in guard.binding.verdict_reason
+
+
+def test_등재된_지문이_산출물과_어긋나면_재등재를_요구한다(tmp_path: Path) -> None:
+    """참조 파일은 "승격 대상 리포트 스템 + 조건 지문" 한 쌍이다 — 둘이 갈리면 그 등재는
+    자기가 가리키는 기준선을 설명하지 못한다. 조용히 통과시키지 않는다."""
+    reports_dir = tmp_path / "reports"
+    stems = _seed_baseline(reports_dir)
+    reference = tmp_path / "promoted_baseline.json"
+    drifted = dict(_BASE_FINGERPRINT)
+    drifted["acceptance_cut"] = "0.5"  # 산출물은 0.3 인데 등재는 0.5 라고 적었다
+    _promotion(reference, stems=stems, fingerprint=drifted)
+
+    payloads = [
+        _payload(started_at=f"2026-08-1{index}T00:00:00+00:00", cases=_healthy_cases())
+        for index in range(1, 4)
+    ]
+    for index, payload in enumerate(payloads[:-1], start=4):
+        _write(reports_dir, f"evaluation-live-l2-{index}", payload)
+    current = run_summary_from_payload(
+        payloads[-1], stem="evaluation-live-l2-6", source="evaluation-live-l2-6"
+    )
+    guard = build_regression_guard(
+        current=current, reports_dir=reports_dir, promoted_reference_path=reference
+    )
+    assert isinstance(guard, RegressionGuard)
+    assert guard.binding.verdict == "대조 불가"
+    assert "참조 파일의 조건 지문이 산출물과 다르다" in guard.binding.verdict_reason
+    assert "acceptance_cut" in guard.binding.verdict_reason
+    assert "재등재" in guard.binding.verdict_reason
+
+
+def test_등재된_산출물끼리_조건이_다르면_한_세트가_아니다(tmp_path: Path) -> None:
+    """섞인 세트를 기준선으로 승격하면 축별 귀인이 처음부터 불가능하다."""
+    reports_dir = tmp_path / "reports"
+    _write(
+        reports_dir,
+        "evaluation-live-l2-1",
+        _payload(started_at="2026-08-01T00:00:00+00:00", cases=_healthy_cases()),
+    )
+    other = dict(_BASE_FINGERPRINT)
+    other["top_k"] = "8"
+    _write(
+        reports_dir,
+        "evaluation-live-l2-2",
+        _payload(started_at="2026-08-02T00:00:00+00:00", cases=_healthy_cases(), fingerprint=other),
+    )
+    reference = tmp_path / "promoted_baseline.json"
+    _promotion(reference, stems=("evaluation-live-l2-1", "evaluation-live-l2-2"))
+
+    current = run_summary_from_payload(
+        _payload(started_at="2026-08-11T00:00:00+00:00", cases=_healthy_cases()),
+        stem="evaluation-live-l2-3",
+        source="evaluation-live-l2-3",
+    )
+    guard = build_regression_guard(
+        current=current, reports_dir=reports_dir, promoted_reference_path=reference
+    )
+    assert isinstance(guard, RegressionGuard)
+    assert guard.binding.verdict == "대조 불가"
+    assert "등재된 산출물끼리 조건이 다르다" in guard.binding.verdict_reason
+    assert "top_k" in guard.binding.verdict_reason
+
+
+def test_참조에_적지_않은_지문_항목은_어긋남이_아니다(tmp_path: Path) -> None:
+    """음성 대조 — 사람이 지문을 다 적지 않아도 된다. 적은 것만 맞으면 된다."""
+    reports_dir = tmp_path / "reports"
+    stems = _seed_baseline(reports_dir)
+    reference = tmp_path / "promoted_baseline.json"
+    _promotion(reference, stems=stems, fingerprint={"acceptance_cut": "0.3"})
+
+    payloads = [
+        _payload(started_at=f"2026-08-1{index}T00:00:00+00:00", cases=_healthy_cases())
+        for index in range(1, 4)
+    ]
+    for index, payload in enumerate(payloads[:-1], start=4):
+        _write(reports_dir, f"evaluation-live-l2-{index}", payload)
+    current = run_summary_from_payload(
+        payloads[-1], stem="evaluation-live-l2-6", source="evaluation-live-l2-6"
+    )
+    guard = build_regression_guard(
+        current=current, reports_dir=reports_dir, promoted_reference_path=reference
+    )
+    assert isinstance(guard, RegressionGuard)
+    assert guard.binding.verdict == "통과"

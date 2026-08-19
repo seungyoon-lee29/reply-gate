@@ -120,6 +120,27 @@ from reply_gate.testing import LexicalEmbeddingClient, StubJudge, build_stub_pip
 #: 배관 검증용 실행에서만 쓰는 낮춘 기본값이고, 리포트에 그대로 기록된다.
 STUB_SIMILARITY_THRESHOLD = 0.05
 
+#: 선택 가능한 **과금** 측정. 측정 1 은 무과금·결정론(LLM 호출 0회)이라 선택 대상이 아니고
+#: 항상 돈다 — 리포트의 헤드라인 수치가 거기서 나오기 때문이다.
+BILLED_MEASUREMENTS: Final[frozenset[str]] = frozenset({"2", "3"})
+
+
+def selected_measurements(args: argparse.Namespace) -> frozenset[str]:
+    """`--measurements` 를 해석한다. 잘못된 값은 **측정 시작 전에** 거부한다."""
+    raw = [item.strip() for item in str(args.measurements).split(",") if item.strip()]
+    unknown = sorted(set(raw) - BILLED_MEASUREMENTS)
+    if unknown:
+        raise SystemExit(
+            f"거부: --measurements 에 알 수 없는 값이 있다: {', '.join(unknown)} "
+            f"(고를 수 있는 값: {', '.join(sorted(BILLED_MEASUREMENTS))})"
+        )
+    if not raw:
+        raise SystemExit(
+            "거부: --measurements 가 비었다 — 과금 측정을 하나도 고르지 않은 실행은 "
+            "측정 1 만 도는 기본 실행과 같다. 그때는 `--live` 를 빼라."
+        )
+    return frozenset(raw)
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -133,8 +154,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--live",
         action="store_true",
         help=(
-            "측정 2·3 을 실제 모델로 실행한다 "
-            "(과금·비결정론, OPENAI_API_KEY + L2 켜짐이면 ANTHROPIC_API_KEY 필요)"
+            "고른 과금 측정을 실제 모델로 실행한다 (과금·비결정론). 측정 2 는 "
+            "OPENAI_API_KEY + DB, 측정 3 은 L2 켜짐 + ANTHROPIC_API_KEY 를 요구한다 — "
+            "무엇을 고를지는 `--measurements` 다"
         ),
     )
     mode.add_argument(
@@ -167,6 +189,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--top-k", type=int, default=None, help="정책 검색 상위 k (기본: 설정값)")
     parser.add_argument(
+        "--measurements",
+        default=",".join(sorted(BILLED_MEASUREMENTS)),
+        metavar="번호목록",
+        help=(
+            "돌릴 **과금 측정**을 고른다 (쉼표 구분: `2`·`3`·`2,3`. 기본: 둘 다). "
+            "측정 1 은 무과금·결정론이라 항상 돈다. 예: `--live --measurements 3` 은 "
+            "판정 픽스처만 사는 측정 3 단독 실측이고, DB 도 OPENAI_API_KEY 도 필요 없다. "
+            "고르지 않은 측정은 리포트에 '미실행 + 사유'로 적힌다(0 채움 금지)."
+        ),
+    )
+    parser.add_argument(
         "--declare-experiment",
         action="append",
         metavar="지문항목",
@@ -179,8 +212,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _skip_reason(*, args: argparse.Namespace, settings: Settings) -> str | None:
-    """측정 2 를 실행하지 못하는 사유. 실행 가능하면 `None`."""
+def _skip_reason(
+    *, args: argparse.Namespace, settings: Settings, selected: frozenset[str]
+) -> str | None:
+    """측정 2 를 실행하지 못하는 사유. 실행 가능하면 `None`.
+
+    **선택 제외를 가장 먼저 본다** — 측정 2 를 고르지 않은 실행에까지 DB·생성 키를
+    요구하면 측정 3 단독 실측이 있지도 않은 전제 때문에 죽는다.
+    """
+    if "2" not in selected:
+        return "측정 2 를 실행 선택에서 제외했다 (`--measurements`) — 고르지 않은 측정이다"
     if not args.live and not args.stub_llm:
         key_state = "설정됨" if settings.openai_api_key else "없음"
         return (
@@ -203,16 +244,24 @@ def _skip_reason(*, args: argparse.Namespace, settings: Settings) -> str | None:
 
 
 def _judge_skip_reason(
-    *, args: argparse.Namespace, settings: Settings, skip: str | None
+    *, args: argparse.Namespace, settings: Settings, skip: str | None, selected: frozenset[str]
 ) -> str | None:
     """측정 3 을 실행하지 못하는 사유. 실행 가능하면 `None`.
 
-    `--live` + L2 켜짐이 아니면 애초에 돌지 않고, 그 조건을 만족해도 **측정 2 의 사유를
-    그대로 물려받는다**: 키 부재도, DB 부재도 마찬가지다. DB 자체는 측정 3 에 필요 없지만,
-    두 측정의 실측 여부가 갈리면 과금된 판정 수치가 실측 이름을 받지 못하는 리포트
-    (덮어쓸 수 있는 `evaluation` 계열)에 실린다 — 재생성에 돈이 드는 산출물이 재생성이
-    공짜인 산출물과 같은 경로를 쓰는, 한 번 겪은 그 사고다.
+    측정 3 이 실제로 필요로 하는 것은 **판정 키 + L2 켜짐**뿐이다 — DB 도, 생성 키도,
+    골든셋도 필요 없다(입력은 판정 픽스처다). 그래서 선검사도 그것만 본다.
+
+    **측정 2 의 사유를 무조건 물려받지 않는다.** 예전에는 그렇게 했고 근거는 "두 측정의
+    실측 여부가 갈리면 과금된 판정 수치가 덮어쓸 수 있는 이름으로 샌다"였는데, 그 근거는
+    리포트 이름의 자격이 **과금 실행 여부**로 바뀌면서 사라졌다(`scripts/AGENTS.md`
+    불변식 7·11). 이제 측정 3 단독 실측도 라이브 이름을 받는다.
+
+    다만 **측정 2 를 함께 고른 실행**에서는 여전히 물려받는다: 사용자가 요청한 것은 두
+    측정이 함께 도는 한 세트인데 한쪽만 사는 것은 요청되지 않은 부분 구매이고,
+    "강등 실행 금지"(불변식 10)와 같은 규칙이다.
     """
+    if "3" not in selected:
+        return "측정 3 을 실행 선택에서 제외했다 (`--measurements`) — 고르지 않은 측정이다"
     if not args.live:
         return (
             "측정 3 은 판정 모델을 실제로 부르는 확률 층이라 `--live` 로만 돈다 — "
@@ -223,7 +272,10 @@ def _judge_skip_reason(
             "L2 판정이 꺼져 있다 — 이 실행은 꺼짐 기준선이므로 판정 계열 측정을 돌리지 않는다 "
             "(L2_ENABLED=true 로 다시 실행한다)"
         )
-    if skip is not None:
+    if not settings.anthropic_api_key:
+        # 시작해 놓고 첫 판정 호출에서 죽으면 과금만 하고 산출물이 없다 — 선검사가 먼저다.
+        return "ANTHROPIC_API_KEY 가 없다 — 판정 모델을 부를 수 없다"
+    if "2" in selected and skip is not None:
         return f"측정 2 와 같은 사유로 미실행: {skip}"
     return None
 
@@ -418,9 +470,15 @@ def _run_measurement_three(
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     settings = get_settings()
+    selected = selected_measurements(args)
     # 키·DB 선검사는 **측정 시작 전**이다 — 도중에 발견하면 과금만 하고 산출물이 없다.
-    skip = _skip_reason(args=args, settings=settings)
-    judge_skip = _judge_skip_reason(args=args, settings=settings, skip=skip)
+    skip = _skip_reason(args=args, settings=settings, selected=selected)
+    judge_skip = _judge_skip_reason(args=args, settings=settings, skip=skip, selected=selected)
+    # 측정 3 이 **돌 조건이었는가** — 판정 선검사(선택 · `--live` · L2 켜짐 · 판정 키)를
+    # 통과했는가다. 그 **뒤에** 생기는 사유(판정 픽스처 로드 실패·중단)는 "돌 조건이었는데
+    # 못 돌았다"이지 "돌 조건이 아니었다"가 아니다 — 그래서 여기서 잡아 둔다. 종료 코드
+    # 규칙(`scripts/AGENTS.md` 불변식 12 ①)이 이 구분 위에 서 있다.
+    measurement3_was_due = bool(args.live) and judge_skip is None
 
     fixtures = load_l1_fixtures(args.l1_fixtures)
     cases = load_golden_set(args.golden_set)
@@ -446,16 +504,16 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     run_settings = _measurement_two_settings(args=args, settings=settings)
-    # **과금 실행인가** — `--live` 로 선검사를 통과해 측정 2 가 실측으로 돌 조건이었던 실행.
-    # 리포트 이름(라이브 계열)과 종료 코드 규칙이 둘 다 이 하나의 값을 본다. 측정 2 가 도중에
-    # 중단돼도 이 값은 True 로 남는다: 이름은 이미 이 값으로 확정됐고(측정 시작 전 결정),
-    # 무엇보다 그 이름이 곧 "이 실행은 과금될 수 있었다"는 저장소에 남는 기록이다.
+    # 측정 2 가 **실측으로 돌 조건이었는가**. 도중에 중단돼도 이 값은 True 로 남는다:
+    # 이름은 이미 확정됐고(측정 시작 전 결정), 그 이름이 곧 "이 실행은 과금될 수 있었다"는
+    # 저장소에 남는 기록이다.
     measurement2_is_real = bool(args.live) and skip is None
     # **과금 실행 여부**가 리포트 이름의 자격을 판정한다 — "측정 2 실측 여부"는 그 목적의
-    # 낡은 대리 변수였다. 지금은 값이 같지만, 측정 2 를 건너뛰고 측정 3 만 사는 실행이
-    # 생기면 갈린다. 그때 라이브 이름을 거부당하면 과금된 산출물이 gitignore 되는 이름으로
-    # 새어 다음 실행에 덮인다(`scripts/AGENTS.md` 불변식 7).
-    billed = measurement2_is_real
+    # 낡은 대리 변수였다. 둘 중 **하나라도** 실제로 살 조건이면 과금 실행이다: 측정 2 를
+    # 건너뛰고 판정 픽스처만 사는 측정 3 단독 실측이 라이브 이름을 거부당하면, 그 산출물이
+    # gitignore 되는 `evaluation` 스템으로 떨어져 다음 실행에 덮인다
+    # (`scripts/AGENTS.md` 불변식 7 — 실제로 한 번 그렇게 잃었다).
+    billed = measurement2_is_real or measurement3_was_due
 
     # 리포트 이름은 **측정을 시작하기 전에** 확정한다 — 여기서 거부될 실행이 과금(라이브
     # 30건)이나 대역 재적재를 먼저 하고 나서 산출물만 버리는 일이 없어야 한다.
@@ -537,15 +595,15 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── 종료 코드는 여기 한 곳에서만 정해진다 (규칙이 갈리지 않게) ──────────────
     # 1 이 되는 경우는 둘뿐이다.
-    #   ① **측정 3 이 돌 조건이었는데 미실행** — 즉 과금 실행(`--live` + 선검사 통과)이고
-    #      L2 도 켜져 있었는데 판정 수치가 안 나온 경우. 사유가 무엇이든(픽스처 로드 실패·
-    #      중단·측정 2 중단으로 인한 연쇄 미실행) 같다 — 골든셋 30건을 사고 판정 수치는 못
-    #      낸 실행이 종료 코드로는 성공으로 읽히면 안 되기 때문이다.
+    #   ① **측정 3 이 돌 조건이었는데 미실행** — 즉 `--live` 로 판정 선검사를 통과한
+    #      실행(선택 포함 · L2 켜짐 · 판정 키 있음)인데 판정 수치가 안 나온 경우. 사유가
+    #      무엇이든(픽스처 로드 실패·중단·측정 2 중단으로 인한 연쇄 미실행) 같다 — 돈을
+    #      쓰고 판정 수치는 못 낸 실행이 종료 코드로는 성공으로 읽히면 안 되기 때문이다.
     #   ② **사용자 중단(Ctrl-C)** — 과금 여부와 무관하다. 산출물은 남기되(과금분 보존),
     #      중단된 실행이 성공으로 읽히면 안 된다.
     # 반대로 **L2 꺼짐 기준선에서 측정 3 이 안 도는 것은 설계상 정상이라 0** 이다.
-    # `--live` 없이 도는 평범한 실행에서 "`--live` 아님" 사유로 미실행인 것도 마찬가지다.
-    measurement3_was_due = measurement2_is_real and settings.l2_enabled
+    # `--live` 없이 도는 평범한 실행에서 "`--live` 아님" 사유로 미실행인 것도,
+    # `--measurements 2` 로 **측정 3 을 고르지 않은** 실행도 마찬가지다.
     measurement3_missing = measurement3_was_due and isinstance(judge_accuracy, SkippedMeasurement)
     exit_code = 1 if interrupted or measurement3_missing else 0
 
@@ -574,7 +632,7 @@ def main(argv: list[str] | None = None) -> int:
         # 실제 판정 모델로 낸 값이다(대역 판정은 `--stub-llm` 이고 그때는 돌지 않는다).
         measurement3_is_real=measurement3_is_real,
         billed=billed,
-        measurement_scope=_measurement_scope(skip=skip, judge_skip=judge_skip),
+        measurement_scope=_measurement_scope(selected=selected, skip=skip, judge_skip=judge_skip),
         condition_fingerprint=_condition_fingerprint(
             args=args, settings=settings, run_settings=run_settings
         ),
@@ -645,8 +703,15 @@ def _print_summary(report: EvaluationReport) -> None:
         print("  ※ 위 측정 3 수치는 대역으로 낸 값이다 — 판정 모델의 정확도가 아니다.")
 
 
-def _measurement_scope(*, skip: str | None, judge_skip: str | None) -> str:
-    """측정 범위 — 풀셋인지 부분인지. 조건 지문의 한 항목이라 대조 가능성을 가른다."""
+def _measurement_scope(
+    *, selected: frozenset[str], skip: str | None, judge_skip: str | None
+) -> str:
+    """측정 범위 — 풀셋인지 부분인지. 조건 지문의 한 항목이라 대조 가능성을 가른다.
+
+    **고른 것이 아니라 실제로 돌 것**을 적는다 — 골랐지만 선검사에 걸려 못 도는 측정을
+    범위에 넣으면 지문이 실행을 잘못 설명한다.
+    """
+    del selected  # 실제 실행 여부가 이미 두 사유에 반영되어 있다.
     if skip is None and judge_skip is None:
         return "full"
     if skip is not None and judge_skip is None:
@@ -676,10 +741,12 @@ def _condition_fingerprint(
         "abstention_gate_statistic": "미배선",
         "abstention_tau": "미배선",
         "query_rewrite": "on" if run_settings.query_rewrite_enabled else "off",
-        "embedding_model": run_settings.embedding_model,
+        # 대역 실행은 대역이라고 적는다 — 설정값 모델명을 적으면 산출물이 거짓 신고한다.
+        "embedding_model": "결정론 대역" if args.stub_llm else run_settings.embedding_model,
         "embedding_dimensions": str(run_settings.embedding_dimensions),
         "top_k": str(run_settings.vector_top_k),
-        "generation_model": run_settings.generation_model,
+        "generation_model": "결정론 대역" if args.stub_llm else run_settings.generation_model,
+        "generation_effort": run_settings.generation_effort or "기본값",
         "judge_model": run_settings.judge_model,
         "judge_effort": run_settings.judge_effort or "기본값",
         "judge_prompt_version": text_digest(JUDGE_SYSTEM_PROMPT, prefix="judge-"),

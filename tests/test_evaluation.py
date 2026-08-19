@@ -1705,7 +1705,12 @@ def test_판정_키가_없으면_측정2_와_측정3_을_모두_건너뛴다(
     # 양성 대조 — L2 가 꺼져 있으면 판정 키 부재는 사유가 아니고 뒤 검사(DB)로 넘어간다.
     args = evaluate.build_parser().parse_args(["--live"])
     settings = _l2_settings(judge_key=False).model_copy(update={"l2_enabled": False})
-    assert evaluate._skip_reason(args=args, settings=settings) == "DB 사유"
+    assert (
+        evaluate._skip_reason(
+            args=args, settings=settings, selected=evaluate.selected_measurements(args)
+        )
+        == "DB 사유"
+    )
 
 
 def test_stub_llm_실행에서_측정3_은_미실행_사유로_남는다(
@@ -1717,7 +1722,12 @@ def test_stub_llm_실행에서_측정3_은_미실행_사유로_남는다(
     _block_outbound_sockets(monkeypatch)
 
     args = evaluate.build_parser().parse_args(["--stub-llm"])
-    reason = evaluate._judge_skip_reason(args=args, settings=_l2_settings(), skip=None)
+    reason = evaluate._judge_skip_reason(
+        args=args,
+        settings=_l2_settings(),
+        skip=None,
+        selected=evaluate.selected_measurements(args),
+    )
 
     assert reason is not None
     assert "--live" in reason
@@ -2447,3 +2457,77 @@ def test_attach_regression_guard_가_리포트에_두_줄을_붙인다(tmp_path:
     assert payload["binding"]["role"] == "구속"
     assert payload["alert"]["role"] == "경보"
     assert "기준선 미등재" in render_markdown(attached)
+
+
+# ── 측정 3 단독 실측 — 과금된 산출물의 보존 경로 ─────────────────────────────
+
+
+def test_측정3_단독_실측은_DB_도_생성_키도_없이_라이브_이름으로_보존된다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**계산된** 과금 여부를 통과시키는 테스트다 — 손으로 넣은 `billed` 가 아니다.
+
+    측정 3 이 실제로 필요로 하는 것은 판정 키 + L2 켜짐뿐이다. DB 도 `OPENAI_API_KEY` 도
+    없는 실행이 판정 픽스처를 사고, 그 산출물이 `evaluation` 스템으로 떨어지면 gitignore 에
+    걸려 다음 실행에 덮인다 — 그 손실을 막는 것이 이 경로의 존재 이유다.
+    """
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings(live_keys=False))
+    # DB 없음 · 생성 키 없음 — 측정 2 는 어차피 못 돌고, 고르지도 않았다.
+    monkeypatch.setattr(evaluate, "database_unavailable_reason", lambda *, settings: "DB 없음")
+    monkeypatch.setattr(evaluate, "build_judge", lambda settings: OracleJudge(JUDGE_FIXTURES))
+    _block_outbound_sockets(monkeypatch)
+
+    assert evaluate.main(["--live", "--measurements", "3", "--out-dir", str(tmp_path)]) == 0
+
+    # 이름 계열은 늘리지 않는다 — 기존 l2 계열 그대로다.
+    json_path = tmp_path / "evaluation-live-l2-1.json"
+    assert json_path.exists(), sorted(path.name for path in tmp_path.iterdir())
+    assert not (tmp_path / "evaluation.json").exists()
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["conditions"]["billed"] is True
+    # 측정 2 는 "미실행 + 사유"다 — 0 으로 채우지 않는다.
+    assert payload["conditions"]["measurement2_is_real"] is False
+    measurement2 = payload["measurement_2_pipeline_agreement"]
+    assert measurement2["executed"] is False
+    assert "--measurements" in measurement2["skip_reason"]
+    # 측정 3 은 실제로 돌았다.
+    judged = payload["measurement_3_l2_judge_accuracy"]
+    assert judged["executed"] is True
+    assert judged["total"] == len(JUDGE_FIXTURES)
+    # 조건 지문에 측정 범위가 사실대로 실린다.
+    assert payload["conditions"]["measurement_scope"] == "measurement_1_3_only"
+
+
+def test_측정_선택은_측정_2_의_DB_생성_키_전제를_건너뛴다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """양성 대조 — 측정 2 를 고르면 DB 부재가 그대로 측정 2 의 사유가 된다."""
+    settings = _l2_settings()
+    args = evaluate.build_parser().parse_args(["--live", "--measurements", "3"])
+    selected = evaluate.selected_measurements(args)
+    assert "--measurements" in str(
+        evaluate._skip_reason(args=args, settings=settings, selected=selected)
+    )
+    # 측정 3 은 측정 2 의 사유를 물려받지 않는다 — 키와 L2 만 본다.
+    assert (
+        evaluate._judge_skip_reason(args=args, settings=settings, skip="DB 없음", selected=selected)
+        is None
+    )
+
+    both = evaluate.build_parser().parse_args(["--live"])
+    both_selected = evaluate.selected_measurements(both)
+    # 둘 다 고른 실행에서는 여전히 물려받는다 — 요청되지 않은 부분 구매를 막는다.
+    inherited = evaluate._judge_skip_reason(
+        args=both, settings=settings, skip="DB 없음", selected=both_selected
+    )
+    assert inherited is not None and "측정 2 와 같은 사유" in inherited
+
+
+def test_알_수_없는_측정_선택은_측정_시작_전에_거부된다() -> None:
+    args = evaluate.build_parser().parse_args(["--live", "--measurements", "4"])
+    with pytest.raises(SystemExit):
+        evaluate.selected_measurements(args)
+    empty = evaluate.build_parser().parse_args(["--live", "--measurements", " "])
+    with pytest.raises(SystemExit):
+        evaluate.selected_measurements(empty)

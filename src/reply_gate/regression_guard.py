@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -136,6 +137,10 @@ class FieldDifference:
 
     def describe(self) -> str:
         return f"{self.field}: 기준선 `{self.baseline}` → 이번 `{self.candidate}`"
+
+    def describe_as(self, *, left: str, right: str) -> str:
+        """대조 문맥이 "기준선 대 이번"이 아닐 때 쓴다 — 등재 정합성 검사가 그렇다."""
+        return f"{self.field}: {left} `{self.candidate}` / {right} `{self.baseline}`"
 
 
 @dataclass(frozen=True)
@@ -378,8 +383,15 @@ def fingerprint_from_conditions(conditions: Mapping[str, Any]) -> ConditionFinge
         "top_k": conditions.get("top_k"),
         "embedding_dimensions": conditions.get("embedding_dimensions"),
         "query_rewrite": _rewrite_flag(conditions.get("retrieval_strategy")),
-        "generation_model": conditions.get("generation"),
-        "judge_model": conditions.get("judge"),
+        # **모델은 사람이 읽는 설명이 아니라 벌거벗은 id 로 비교한다.** 옛 산출물의 설명
+        # 문자열(예: "OpenAI `gpt-5.6-terra` (effort=기본값)")을 그대로 쓰면 새 실행의 명시
+        # 지문(`gpt-5.6-terra`)과 매번 어긋나, **아무것도 바뀌지 않았는데** 커밋된 기준선마다
+        # "대조 불가"가 뜬다. 지문 규칙이 대조를 죽이면 지문이 스스로를 무력화한 것이다.
+        "generation_model": _bare_model_id(conditions.get("generation")),
+        "generation_effort": _effort(conditions.get("generation")),
+        "embedding_model": _bare_model_id(conditions.get("embedding")),
+        "judge_model": _bare_model_id(conditions.get("judge")),
+        "judge_effort": _effort(conditions.get("judge")),
         "measurement_scope": conditions.get("measurement_scope"),
     }
     derived = {key: value for key, value in derived.items() if value is not None}
@@ -388,6 +400,28 @@ def fingerprint_from_conditions(conditions: Mapping[str, Any]) -> ConditionFinge
         derived.update({str(key): value for key, value in explicit.items()})
     declared = tuple(_str_list(conditions.get("declared_experiment_fields")))
     return ConditionFingerprint.from_values(derived, declared=declared)
+
+
+#: 실행 조건의 모델 설명은 모델 id 를 백틱으로 감싼다 — 그 한 조각만 지문에 쓴다.
+_BACKTICKED: Final = re.compile(r"`([^`]+)`")
+#: `(effort=...)` 꼬리. 판정 호출의 thinking/effort 설정이 여기 실려 있다.
+_EFFORT: Final = re.compile(r"effort=([^)]*)")
+
+
+def _bare_model_id(label: Any) -> str | None:
+    """모델 설명에서 id 만 꺼낸다. 꺼낼 것이 없으면 `None`(미상)이다 — 추측하지 않는다."""
+    if not isinstance(label, str):
+        return None
+    match = _BACKTICKED.search(label)
+    return match.group(1) if match else None
+
+
+def _effort(label: Any) -> str | None:
+    """모델 설명에서 effort 설정만 꺼낸다. 없으면 `None`(미상)."""
+    if not isinstance(label, str):
+        return None
+    match = _EFFORT.search(label)
+    return match.group(1).strip() if match else None
 
 
 def _rewrite_flag(strategy: Any) -> str | None:
@@ -657,11 +691,7 @@ def compare_run_sets(
             "선언된 실험 변인이 있어 대조를 진행한다 — 차이: "
             + " · ".join(item.describe() for item in comparison.declared_differences)
         )
-    notes.append(
-        "측정 3 은 **선언된 실험 변인**이라 무변경 검사 대상이 아니다 — "
-        f"기준선 {_rate(_common(run.measurement3_detection_rate for run in baseline.runs))} / "
-        f"이번 {_rate(_common(run.measurement3_detection_rate for run in candidate.runs))}."
-    )
+    notes.append(_measurement3_note(baseline=baseline, candidate=candidate))
     notes.append("합산 일치율은 하한 경보선이고 사이클 판정은 케이스 단위가 맡는다.")
 
     if not comparison.comparable:
@@ -684,9 +714,12 @@ def compare_run_sets(
     decreases: list[MatchFinding] = []
     losses: list[EvidenceLoss] = []
     unknown: list[str] = []
+    unobserved: list[str] = []
 
     baseline_runs = len(baseline.runs)
     candidate_runs = len(candidate.runs)
+    #: 두 세트에 **공통으로** 실린 케이스 수. 0 이면 케이스 단위 판정이 돌지 않은 것이다.
+    compared_cases = 0
 
     # 근거 부분 손실 검사의 입력은 귀인 절이다. 커밋된 옛 산출물에는 그 절이 없고,
     # 없는 것을 "손실 0건"으로 적으면 이 사이클을 촉발한 회귀가 그대로 통과한다.
@@ -710,6 +743,7 @@ def compare_run_sets(
             unknown.append(f"`{case_id}` 이 이번 실측에 없다 — 대조하지 않는다")
             continue
 
+        compared_cases += 1
         baseline_matched = sum(1 for item in baseline_seen if item.matched)
         candidate_matched = sum(1 for item in candidate_seen if item.matched)
         finding = MatchFinding(
@@ -731,13 +765,22 @@ def compare_run_sets(
             decreases.append(finding)
 
         if baseline_evidence_known and candidate_evidence_known:
-            loss, note = _evidence_loss(
+            check = _evidence_loss(
                 case_id=case_id, baseline=baseline_seen, candidate=candidate_seen
             )
-            if loss is not None:
-                losses.append(loss)
-            if note is not None:
-                unknown.append(note)
+            if check.loss is not None:
+                losses.append(check.loss)
+            if check.note is not None:
+                unknown.append(check.note)
+            if check.unobserved:
+                unobserved.append(case_id)
+
+    if unobserved:
+        unknown.append(
+            "정답 근거 ID 를 어느 실측의 귀인 절에서도 관측하지 못한 케이스 — 양쪽 모두 정답 "
+            "근거를 **전부 채택**한 것으로 읽히지만(귀인 절은 그런 케이스를 싣지 않는다) "
+            "ID 를 이름으로 확인하지는 못했다: " + ", ".join(f"`{case}`" for case in unobserved)
+        )
 
     measurement1_changes = tuple(
         change
@@ -757,20 +800,32 @@ def compare_run_sets(
     )
 
     failed = bool(shortfalls or collapses or losses or measurement1_changes)
+    # **돌지 않은 겹이 있으면 통과가 아니다.** 판정의 정의인 검사가 실행되지 않았는데
+    # 헤드라인이 "통과"라고 적히면, 그것이 바로 하드 게이트가 금지하는 "미실행을 통과로
+    # 채우기"다. 사유가 아래 미판정 줄에만 남아 있는 것으로는 부족하다 — 판정 문면이 말해야 한다.
+    held: list[str] = []
     if candidate_runs < expected_run_count:
-        verdict = VERDICT_HELD
-        reason = (
-            f"실측 {candidate_runs}/{expected_run_count} — 판정은 세트가 찬 뒤다. "
-            "아래 항목은 잠정 관측이다."
-        )
-    elif failed:
+        held.append(f"실측 {candidate_runs}/{expected_run_count} — 세트가 아직 안 찼다")
+    if not baseline_evidence_known:
+        held.append("기준선에 귀인 절이 없어 **근거 부분 손실 검사가 돌지 않았다**")
+    if not candidate_evidence_known:
+        held.append("이번 실측에 귀인 절이 없어 **근거 부분 손실 검사가 돌지 않았다**")
+    if not compared_cases:
+        held.append("두 세트에 공통으로 실린 케이스가 없어 **케이스 단위 판정이 돌지 않았다**")
+
+    if failed:
+        # 관측된 회귀는 보류로 덮지 않는다 — 미달이 더 강한 정보다.
         verdict = VERDICT_FAIL
         reason = "케이스 단위 비악화 판정 미달 — 아래 케이스를 이름으로 찍는다."
+    elif held:
+        verdict = VERDICT_HELD
+        reason = "판정 보류 — " + " · ".join(held) + ". 아래 항목은 잠정 관측이다."
     else:
         verdict = VERDICT_PASS
         reason = (
             f"기준선 {baseline_runs}회 대비 케이스 단위 비악화 통과 "
-            f"(일치 하한 {_majority(candidate_runs)}/{candidate_runs} · 근거 부분 손실 없음)."
+            f"(케이스 {compared_cases}건 · 일치 하한 {_majority(candidate_runs)}/"
+            f"{candidate_runs} · 근거 부분 손실 없음)."
         )
 
     return BaselineLine(
@@ -791,12 +846,68 @@ def compare_run_sets(
     )
 
 
+@dataclass(frozen=True)
+class _EvidenceCheck:
+    """근거 부분 손실 검사 1건의 결과. 셋은 서로 다른 상태다 — 섞으면 무지가 통과가 된다."""
+
+    loss: EvidenceLoss | None = None
+    note: str | None = None
+    #: 정답 근거 ID 를 **양쪽 어디서도 관측하지 못했다.** 손실이 없다는 판정 자체는
+    #: 성립하지만(양쪽 모두 전부 채택) ID 를 이름으로 확인하지는 못했다 — 한 줄로 묶어 적는다.
+    unobserved: bool = False
+
+
+#: 판정 층에 속하는 지문 항목. 측정 3 의 변화를 무엇으로 설명할 수 있는지가 여기서 갈린다.
+JUDGING_FINGERPRINT_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "judge_model",
+        "judge_effort",
+        "judge_prompt_version",
+        "judge_fixture_version",
+        "judge_prompt_caching",
+    }
+)
+
+
+def _measurement3_note(*, baseline: RunSet, candidate: RunSet) -> str:
+    """측정 3 에 대해 **이 실행에서 실제로 성립하는 것**을 적는다.
+
+    규칙 자체는 고정이다 — 측정 3 은 무변경 검사 대상이 아니다. 판정 층 개선의 성공이
+    무관한 축의 원복을 발동시키면 안 되기 때문이다. 하지만 그 뒤에 붙는 문장까지 "선언된
+    실험 변인이라" 로 고정하면, 아무것도 선언하지 않은 실행의 리포트가 거짓을 적는다.
+    """
+    before = _common(run.measurement3_detection_rate for run in baseline.runs)
+    after = _common(run.measurement3_detection_rate for run in candidate.runs)
+    rule = (
+        "측정 3 은 무변경 검사 대상이 아니다 — 판정 층 개선의 성공이 무관한 축의 원복을 "
+        "발동시키면 안 되기 때문이다."
+    )
+    values = f"기준선 {_rate(before)} / 이번 {_rate(after)}"
+    if before is None or after is None:
+        state = "한쪽이 미상이거나 세트 안에서 흔들려 대조하지 않았다"
+    elif before == after:
+        state = "두 세트의 값이 같다"
+    else:
+        declared = tuple(
+            name for name in candidate.fingerprint.declared if name in JUDGING_FINGERPRINT_FIELDS
+        )
+        state = (
+            "값이 달라졌고 이 실행이 판정 층 변경을 선언했다("
+            + ", ".join(f"`{name}`" for name in declared)
+            + ")"
+            if declared
+            else "값이 달라졌는데 이 실행은 판정 층 변경을 선언하지 않았다 — 관측으로만 "
+            "남긴다(가드는 이것으로 미달을 내지 않는다)"
+        )
+    return f"{rule} {values} — {state}."
+
+
 def _evidence_loss(
     *,
     case_id: str,
     baseline: Sequence[CaseObservation],
     candidate: Sequence[CaseObservation],
-) -> tuple[EvidenceLoss | None, str | None]:
+) -> _EvidenceCheck:
     """근거 부분 손실 — **`matched` 가 못 잡는 회귀를 잡는 자리다.**
 
     판정 단위는 케이스별 다수결이다: 기준선 다수결에서 채택됐던 정답 근거 ID 가 새 실측
@@ -804,40 +915,57 @@ def _evidence_loss(
     """
     baseline_reference = _relevant_reference(baseline)
     candidate_reference = _relevant_reference(candidate)
-    if baseline_reference is None or candidate_reference is None:
-        # 정답 라벨을 실은 실측이 한쪽에도 없다 — 관측할 것이 없다(손실도 보존도 아니다).
-        return None, None
-    if baseline_reference != candidate_reference:
-        return None, (
-            f"`{case_id}` 의 정답 라벨이 기준선과 이번 실측에서 다르다 — 근거 손실 검사를 "
-            "건너뛴다(라벨 변경은 회귀가 아니라 조건 변경이다)"
+    observed = [item for item in (baseline_reference, candidate_reference) if item is not None]
+    if not observed:
+        # 어느 실측도 이 케이스를 귀인 절에 싣지 않았다 = 양쪽 모두 정답 근거를 전부
+        # 채택했다는 뜻이지만, **ID 를 하나도 관측하지 못했으므로 이름으로 말할 수 없다.**
+        # 아무 말도 하지 않으면 그 무지가 "손실 없음"으로 읽힌다 — 관측 한계로 남긴다.
+        return _EvidenceCheck(unobserved=True)
+    if len(observed) == 2 and observed[0] != observed[1]:
+        return _EvidenceCheck(
+            note=(
+                f"`{case_id}` 의 정답 라벨이 기준선과 이번 실측에서 다르다 — 근거 손실 검사를 "
+                "건너뛴다(라벨 변경은 회귀가 아니라 조건 변경이다)"
+            )
         )
+    # **한쪽만 없는 것은 무지가 아니라 정보다.** 귀인 절은 "정답 조항을 전부 채택하고 정상
+    # 답변한" 케이스를 싣지 않으므로, 부재는 곧 **전부 채택**이다. 그래서 없는 쪽의 라벨을
+    # 있는 쪽에서 빌려 온다 — 이 보정이 없으면 **기준선이 3회 모두 멀쩡했던 케이스**가
+    # 통째로 감시 밖으로 나간다. 그것이 이 층이 가장 지켜야 할 모집단인데도 그렇다.
+    reference = observed[0]
 
-    baseline_accepted = _accepted_majority(baseline, baseline_reference)
-    candidate_accepted = _accepted_majority(candidate, candidate_reference)
+    baseline_accepted = _accepted_majority(baseline, reference)
+    candidate_accepted = _accepted_majority(candidate, reference)
     if baseline_accepted is None:
-        return None, (
-            f"`{case_id}` 의 채택 근거가 기준선 산출물에 없다 — 근거 부분 손실을 판정하지 "
-            "않는다(0 으로 채우지 않는다)"
+        return _EvidenceCheck(
+            note=(
+                f"`{case_id}` 의 채택 근거가 기준선 산출물에 없다 — 근거 부분 손실을 판정하지 "
+                "않는다(0 으로 채우지 않는다)"
+            )
         )
     if candidate_accepted is None:
-        return None, f"`{case_id}` 의 채택 근거가 이번 실측에 없다 — 근거 부분 손실 미판정"
+        return _EvidenceCheck(
+            note=f"`{case_id}` 의 채택 근거가 이번 실측에 없다 — 근거 부분 손실 미판정"
+        )
     dropped = tuple(sorted(baseline_accepted - candidate_accepted))
     if not dropped:
-        return None, None
-    return (
-        EvidenceLoss(
+        return _EvidenceCheck()
+    return _EvidenceCheck(
+        loss=EvidenceLoss(
             case_id=case_id,
             dropped_evidence_ids=dropped,
             baseline_accepted_ids=tuple(sorted(baseline_accepted)),
             candidate_accepted_ids=tuple(sorted(candidate_accepted)),
-        ),
-        None,
+        )
     )
 
 
 def _relevant_reference(observations: Sequence[CaseObservation]) -> frozenset[str] | None:
-    """이 세트가 관측한 정답 근거 집합. 어느 실측도 싣지 않았으면 `None`."""
+    """이 세트가 **관측한** 정답 근거 집합. 어느 실측도 싣지 않았으면 `None`.
+
+    `None` 은 "정답 근거가 없다"가 아니라 "이 세트의 산출물만으로는 ID 를 알 수 없다"다 —
+    귀인 절이 정상 케이스를 싣지 않기 때문이다. 호출자가 반대편 세트에서 빌려 온다.
+    """
     seen = [
         item.relevant_evidence_ids
         for item in observations
@@ -983,6 +1111,46 @@ def build_regression_guard(
     )
 
 
+def _promotion_drift(*, promotion: PromotedBaseline, runs: Sequence[RunSummary]) -> tuple[str, ...]:
+    """등재된 지문·스템이 실제 산출물과 어긋나는 지점. 어긋나지 않으면 빈 튜플.
+
+    두 가지를 본다: ① 등재된 스템들이 서로 같은 조건인가(한 세트인가), ② 참조 파일에 적힌
+    조건 지문이 그 산출물의 지문과 같은가. 참조에 적지 않은 항목은 미상이라 어긋남이 아니다
+    — 사람이 다 적지 않아도 되지만, **적은 것은 맞아야 한다.**
+    """
+    findings: list[str] = []
+    head = runs[0]
+    for other in runs[1:]:
+        conflicts = _fingerprint_conflicts(other.fingerprint, head.fingerprint)
+        if conflicts:
+            findings.append(
+                "등재된 산출물끼리 조건이 다르다: "
+                + " · ".join(
+                    item.describe_as(left=f"`{other.stem}`", right=f"`{head.stem}`")
+                    for item in conflicts
+                )
+            )
+    registered = _fingerprint_conflicts(promotion.fingerprint, head.fingerprint)
+    if registered:
+        findings.append(
+            "참조 파일의 조건 지문이 산출물과 다르다: "
+            + " · ".join(
+                item.describe_as(left="참조", right=f"산출물 `{head.stem}`") for item in registered
+            )
+        )
+    return tuple(findings)
+
+
+def _fingerprint_conflicts(
+    left: ConditionFingerprint, right: ConditionFingerprint
+) -> tuple[FieldDifference, ...]:
+    """두 지문의 **모든** 값 차이. 선언 여부와 무관하다 — 등재 정합성 검사에는 선언이 없다."""
+    comparison = ConditionFingerprint(values=left.values).compare(
+        ConditionFingerprint(values=right.values)
+    )
+    return comparison.undeclared_differences
+
+
 def _binding_line(
     *,
     promotion: PromotedBaseline | BaselineNotRegistered,
@@ -1018,6 +1186,23 @@ def _binding_line(
             baseline_source=promotion.path,
         )
     runs.sort(key=lambda run: (run.started_at, run.stem))
+    # **등재가 자기가 가리키는 산출물과 어긋나면 그 등재는 기준선을 설명하지 못한다.**
+    # 참조 파일은 "승격 대상 리포트 스템 + 조건 지문"이라 둘이 한 쌍이어야 하고, 등재된
+    # 스템들끼리도 같은 조건이어야 한다. 어긋난 채로 구속 판정을 내면 무엇을 기준으로
+    # 통과·미달을 말한 것인지 산출물만 보고는 되짚을 수 없다.
+    drift = _promotion_drift(promotion=promotion, runs=runs)
+    if drift:
+        return BaselineLine(
+            label="승격 기준선",
+            role=ROLE_BINDING,
+            verdict=VERDICT_INCOMPARABLE,
+            verdict_reason=(
+                "승격 등재가 자기가 가리키는 산출물과 어긋난다 — " + " · ".join(drift) + ". "
+                "**재등재**가 필요하다(승격과 같은 자격 — 사람이 참조 파일을 바꾼다)."
+            ),
+            baseline_stems=promotion.report_stems,
+            baseline_source=promotion.path,
+        )
     return compare_run_sets(
         baseline=RunSet(label="승격 기준선", runs=tuple(runs)),
         candidate=candidate,
