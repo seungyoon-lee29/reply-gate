@@ -81,6 +81,7 @@ LIVE_SERIES_PREFIX: Final = "evaluation-live"
 #: 통계량·τ)을 붙이는 작업은 **값만 추가**하면 되고 이 모듈을 다시 열지 않아도 된다.
 FINGERPRINT_FIELDS: Final[tuple[str, ...]] = (
     "label_version",
+    "retrieval_labels_version",
     "acceptance_cut",
     "abstention_gate_statistic",
     "abstention_tau",
@@ -104,6 +105,11 @@ PAIRED_FINGERPRINT_FIELDS: Final[Mapping[str, str]] = {"abstention_tau": "embedd
 
 #: 미상 표기. 0 이나 "통과"로 채우지 않는다는 규칙의 문자열 형태다.
 UNKNOWN: Final = "미상"
+
+#: **근거 부분 손실 검사의 정답 입력**이 어느 판인가. 검색 정답 라벨이 바뀌면 같은 파이프라인
+#: 동작도 다른 채택 집합으로 읽히므로, 그 변화는 회귀가 아니라 **조건 차이**다. 지문에 없으면
+#: 라벨 한 줄 추가가 "근거가 사라졌다"로 둔갑한다.
+RETRIEVAL_LABELS_FIELD: Final = "retrieval_labels_version"
 
 
 def content_digest(path: Path, *, prefix: str = "") -> str | None:
@@ -134,13 +140,27 @@ class FieldDifference:
     field: str
     baseline: str
     candidate: str
+    #: 값 자체는 같은데 **짝이 달라져** 어긋난 경우의 짝 이름. 이걸 적지 않으면 리포트가
+    #: ``abstention_tau: 기준선 `0.42` → 이번 `0.42``` 처럼 말이 안 되는 줄을 낸다.
+    diverged_by_pair: str | None = None
 
     def describe(self) -> str:
-        return f"{self.field}: 기준선 `{self.baseline}` → 이번 `{self.candidate}`"
+        base = f"{self.field}: 기준선 `{self.baseline}` → 이번 `{self.candidate}`"
+        if self.diverged_by_pair is None:
+            return base
+        if self.baseline == self.candidate:
+            return (
+                f"{self.field}: 값은 `{self.candidate}` 로 같지만 짝인 "
+                f"`{self.diverged_by_pair}` 가 달라 같은 조건이 아니다"
+            )
+        return f"{base} (짝인 `{self.diverged_by_pair}` 도 함께 달라졌다)"
 
     def describe_as(self, *, left: str, right: str) -> str:
         """대조 문맥이 "기준선 대 이번"이 아닐 때 쓴다 — 등재 정합성 검사가 그렇다."""
-        return f"{self.field}: {left} `{self.candidate}` / {right} `{self.baseline}`"
+        base = f"{self.field}: {left} `{self.candidate}` / {right} `{self.baseline}`"
+        if self.diverged_by_pair is None:
+            return base
+        return f"{base} (짝인 `{self.diverged_by_pair}` 기준)"
 
 
 @dataclass(frozen=True)
@@ -215,7 +235,12 @@ class ConditionFingerprint:
                 continue
             if self.effective(name) == baseline.effective(name):
                 continue
-            difference = FieldDifference(field=name, baseline=theirs, candidate=mine)
+            difference = FieldDifference(
+                field=name,
+                baseline=theirs,
+                candidate=mine,
+                diverged_by_pair=partner,
+            )
             is_declared = name in self.declared or (
                 partner is not None and partner in self.declared
             )
@@ -726,6 +751,14 @@ def compare_run_sets(
     # **없다고 적을 뿐 0 으로도 통과로도 채우지 않는다.**
     baseline_evidence_known = any(run.attribution_computed for run in baseline.runs)
     candidate_evidence_known = any(run.attribution_computed for run in candidate.runs)
+    # 정답 라벨 판이 갈렸는가. **갈렸으면 한쪽 라벨을 다른 쪽에 빌려 주지 않는다** — 라벨
+    # 변경은 회귀가 아니라 조건 차이이고, 빌려 오면 그 차이가 거짓 미달로 둔갑한다.
+    labels_comparable = _labels_comparable(baseline=baseline, candidate=candidate)
+    if not labels_comparable:
+        unknown.append(
+            "두 실측의 검색 정답 라벨 판이 다르다 — 한쪽에만 실린 케이스는 라벨을 빌려 오지 "
+            "않고 근거 부분 손실을 판정하지 않는다(라벨 변경은 회귀가 아니라 조건 차이다)."
+        )
     if not baseline_evidence_known:
         unknown.append(
             "기준선 산출물에 귀인 절이 없다(미산출) — 근거 부분 손실을 판정하지 않는다. "
@@ -766,7 +799,10 @@ def compare_run_sets(
 
         if baseline_evidence_known and candidate_evidence_known:
             check = _evidence_loss(
-                case_id=case_id, baseline=baseline_seen, candidate=candidate_seen
+                case_id=case_id,
+                baseline=baseline_seen,
+                candidate=candidate_seen,
+                borrowing_allowed=labels_comparable,
             )
             if check.loss is not None:
                 losses.append(check.loss)
@@ -869,6 +905,21 @@ JUDGING_FINGERPRINT_FIELDS: Final[frozenset[str]] = frozenset(
 )
 
 
+def _labels_comparable(*, baseline: RunSet, candidate: RunSet) -> bool:
+    """두 세트의 검색 정답 라벨 판이 같다고 말할 수 있는가.
+
+    **모르면 빌려 온다**(True). 옛 산출물에는 이 지문 항목이 없고, 그 산출물들은 애초에
+    귀인 절이 없어 이 층이 돌지 않는다 — 여기서 막으면 잃는 것 없이 새 실측만 다친다.
+    다른 값이 **관측됐을 때만** 막는다.
+    """
+    versions = {
+        run.fingerprint.values.get(RETRIEVAL_LABELS_FIELD)
+        for run in (*baseline.runs, *candidate.runs)
+    }
+    observed = {value for value in versions if value is not None}
+    return len(observed) <= 1
+
+
 def _measurement3_note(*, baseline: RunSet, candidate: RunSet) -> str:
     """측정 3 에 대해 **이 실행에서 실제로 성립하는 것**을 적는다.
 
@@ -907,6 +958,7 @@ def _evidence_loss(
     case_id: str,
     baseline: Sequence[CaseObservation],
     candidate: Sequence[CaseObservation],
+    borrowing_allowed: bool = True,
 ) -> _EvidenceCheck:
     """근거 부분 손실 — **`matched` 가 못 잡는 회귀를 잡는 자리다.**
 
@@ -932,6 +984,18 @@ def _evidence_loss(
     # 답변한" 케이스를 싣지 않으므로, 부재는 곧 **전부 채택**이다. 그래서 없는 쪽의 라벨을
     # 있는 쪽에서 빌려 온다 — 이 보정이 없으면 **기준선이 3회 모두 멀쩡했던 케이스**가
     # 통째로 감시 밖으로 나간다. 그것이 이 층이 가장 지켜야 할 모집단인데도 그렇다.
+    #
+    # **단, 두 실측의 정답 라벨 판이 다르면 빌려 오지 않는다.** 빌린 라벨은 기준선이 하지
+    # 않은 채택을 기준선에 돌리는 것이라, 라벨에 조항 하나를 더한 것만으로 "근거가 빠졌다"는
+    # 거짓 미달이 만들어진다 — 파이프라인은 아무것도 달라지지 않았는데도.
+    if len(observed) == 1 and not borrowing_allowed:
+        return _EvidenceCheck(
+            note=(
+                f"`{case_id}` 은 한쪽 실측에만 정답 근거가 실렸는데 두 실측의 검색 정답 라벨 "
+                "판이 다르다 — 라벨을 빌려 오면 기준선이 하지 않은 채택을 기준선에 돌리게 "
+                "되므로 근거 부분 손실을 판정하지 않는다"
+            )
+        )
     reference = observed[0]
 
     baseline_accepted = _accepted_majority(baseline, reference)
@@ -1350,12 +1414,10 @@ def _line_to_json(line: BaselineLine) -> dict[str, Any]:
         "fingerprint": {
             "comparable": comparison.comparable,
             "declared_differences": [
-                {"field": item.field, "baseline": item.baseline, "candidate": item.candidate}
-                for item in comparison.declared_differences
+                _difference_to_json(item) for item in comparison.declared_differences
             ],
             "undeclared_differences": [
-                {"field": item.field, "baseline": item.baseline, "candidate": item.candidate}
-                for item in comparison.undeclared_differences
+                _difference_to_json(item) for item in comparison.undeclared_differences
             ],
             "unknown_fields": list(comparison.unknown_fields),
         },
@@ -1374,6 +1436,16 @@ def _line_to_json(line: BaselineLine) -> dict[str, Any]:
         "measurement1_changes": list(line.measurement1_changes),
         "unknown_notes": list(line.unknown_notes),
         "notes": list(line.notes),
+    }
+
+
+def _difference_to_json(item: FieldDifference) -> dict[str, Any]:
+    return {
+        "field": item.field,
+        "baseline": item.baseline,
+        "candidate": item.candidate,
+        # 값이 같은데 어긋난 이유가 짝이라는 것을 기계도 읽을 수 있어야 한다.
+        "diverged_by_pair": item.diverged_by_pair,
     }
 
 

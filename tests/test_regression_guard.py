@@ -44,6 +44,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 #: 기준선·새 실측이 공유하는 지문. 이 값이 갈리면 대조 가능성부터 달라진다.
 _BASE_FINGERPRINT: Mapping[str, str] = {
     "label_version": "0008-이후",
+    "retrieval_labels_version": "labels-aaaa",
     "acceptance_cut": "0.3",
     "abstention_gate_statistic": "미배선",
     "abstention_tau": "미배선",
@@ -993,3 +994,122 @@ def test_참조에_적지_않은_지문_항목은_어긋남이_아니다(tmp_pat
     )
     assert isinstance(guard, RegressionGuard)
     assert guard.binding.verdict == "통과"
+
+
+def test_검색_정답_라벨이_바뀌면_거짓_근거_손실을_만들지_않는다(tmp_path: Path) -> None:
+    """파이프라인이 **아무것도** 달라지지 않았는데 라벨에 조항 하나를 더한 것만으로
+    "근거가 사라졌다"가 되면, 가드가 잡으라는 회귀 대신 라벨 편집을 고발한다.
+
+    빌려 온 라벨은 기준선이 하지 않은 채택을 기준선에 돌린다 — 그래서 라벨 판이 갈리면
+    빌려 오지 않는다. 그리고 그 변화는 지문에 **조건 차이**로 실려야 한다.
+    """
+    # 기준선: G15 는 완벽해서 귀인 절에 실리지 않는다.
+    baseline: dict[str, CaseSpec] = {"G15": (True, None, None)}
+    # 새 실측: 파이프라인은 그대로인데 라벨에 2-7 이 추가돼 "빠진 정답"으로 잡힌다.
+    after_label_edit: dict[str, CaseSpec] = {
+        "G15": (True, ["policy:refund:2-6", "policy:refund:2-7"], ["policy:refund:2-7"]),
+    }
+    edited = dict(_BASE_FINGERPRINT)
+    edited["retrieval_labels_version"] = "labels-bbbb"
+
+    guard = _run_guard(
+        tmp_path,
+        baseline_cases=baseline,
+        candidate_cases=[after_label_edit] * RUN_SET_SIZE,
+        candidate_fingerprint=edited,
+        declared=["retrieval_labels_version"],
+    )
+    # ① 라벨 변경은 지문이 **조건 차이**로 본다 — 침묵하지 않는다.
+    assert [item.field for item in guard.binding.fingerprint.declared_differences] == [
+        "retrieval_labels_version"
+    ]
+    # ② 그리고 거짓 손실을 만들지 않는다.
+    assert guard.binding.evidence_losses == ()
+    assert guard.binding.verdict != "미달"
+    assert any("라벨 판이 다르다" in note for note in guard.binding.unknown_notes)
+
+
+def test_라벨_변경을_선언하지_않으면_대조_불가로_잡힌다(tmp_path: Path) -> None:
+    """지문에 실렸으니 조용한 라벨 드리프트도 이제 보인다."""
+    edited = dict(_BASE_FINGERPRINT)
+    edited["retrieval_labels_version"] = "labels-bbbb"
+    guard = _run_guard(
+        tmp_path,
+        candidate_cases=[_healthy_cases()] * RUN_SET_SIZE,
+        candidate_fingerprint=edited,
+    )
+    assert guard.binding.verdict == "대조 불가"
+    assert [item.field for item in guard.binding.fingerprint.undeclared_differences] == [
+        "retrieval_labels_version"
+    ]
+
+
+def test_라벨_판이_같으면_빌려오기는_그대로_작동한다(tmp_path: Path) -> None:
+    """음성 대조 — 라벨 방어가 F2 의 감시를 꺼 버리면 안 된다."""
+    baseline: dict[str, CaseSpec] = {"G20": (True, None, None)}
+    degraded: dict[str, CaseSpec] = {
+        "G20": (True, ["policy:support:4-1", "policy:support:4-2"], ["policy:support:4-2"]),
+    }
+    guard = _run_guard(
+        tmp_path,
+        baseline_cases=baseline,
+        candidate_cases=[degraded] * RUN_SET_SIZE,
+    )
+    assert guard.binding.verdict == "미달"
+    assert guard.binding.evidence_losses[0].dropped_evidence_ids == ("policy:support:4-2",)
+
+
+def test_라벨_판이_미상이면_빌려온다() -> None:
+    """옛 산출물에는 이 지문 항목이 없다 — 모른다고 막으면 새 실측만 다친다."""
+    legacy = ConditionFingerprint.from_values({"acceptance_cut": "0.3"})
+    current = ConditionFingerprint.from_values(_BASE_FINGERPRINT)
+    assert legacy.values["retrieval_labels_version"] is None
+    assert current.values["retrieval_labels_version"] == "labels-aaaa"
+    comparison = current.compare(legacy)
+    assert "retrieval_labels_version" in comparison.unknown_fields
+
+
+def test_짝_때문에_어긋난_항목은_그렇게_적는다(tmp_path: Path) -> None:
+    """``abstention_tau: 기준선 `0.42` → 이번 `0.42``` 는 사람이 읽으면 버그로 보인다.
+
+    τ 는 임베딩 모델과 한 쌍이라 값이 같아도 다른 조건일 수 있다 — 그 이유를 문면이 말해야
+    읽는 사람이 리포트를 의심하지 않는다.
+    """
+    base = dict(_BASE_FINGERPRINT)
+    base["abstention_tau"] = "0.42"
+    other = dict(base)
+    other["embedding_model"] = "text-embedding-3-large"
+    guard = _run_guard(
+        tmp_path,
+        candidate_cases=[_healthy_cases()] * RUN_SET_SIZE,
+        baseline_kwargs={"fingerprint": base},
+        candidate_fingerprint=other,
+    )
+    tau = next(
+        item
+        for item in guard.binding.fingerprint.undeclared_differences
+        if item.field == "abstention_tau"
+    )
+    assert tau.baseline == tau.candidate == "0.42"
+    described = tau.describe()
+    assert "짝인 `embedding_model`" in described
+    assert "같은 조건이 아니다" in described
+    assert "0.42` → 이번 `0.42" not in described
+
+    payload = guard_to_json(guard)
+    entry = next(
+        item
+        for item in payload["binding"]["fingerprint"]["undeclared_differences"]
+        if item["field"] == "abstention_tau"
+    )
+    assert entry["diverged_by_pair"] == "embedding_model"
+
+    # 양성 대조 — 짝이 없는 항목의 문면은 그대로다.
+    model = next(
+        item
+        for item in guard.binding.fingerprint.undeclared_differences
+        if item.field == "embedding_model"
+    )
+    assert model.describe() == (
+        "embedding_model: 기준선 `text-embedding-3-small` → 이번 `text-embedding-3-large`"
+    )

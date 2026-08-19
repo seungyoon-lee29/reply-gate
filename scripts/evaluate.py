@@ -114,6 +114,7 @@ from reply_gate.regression_guard import (
     content_digest,
     text_digest,
 )
+from reply_gate.retrieval_labels import DEFAULT_RETRIEVAL_LABELS_PATH
 from reply_gate.testing import LexicalEmbeddingClient, StubJudge, build_stub_pipeline
 
 #: 대역 임베딩은 실제 모델과 유사도 분포가 달라 기본 임계값(0.3)에서 거의 다 걸러진다.
@@ -343,12 +344,18 @@ def _clients(
 
 
 def _judge_label(
-    *, args: argparse.Namespace, settings: Settings, skip: str | None, aborted: bool = False
+    *, args: argparse.Namespace, settings: Settings, judging_ran: bool, aborted: bool = False
 ) -> str:
-    """실행 조건에 남는 판정 모델 설명 — 대역 수치를 실제 수치로 읽지 않게 하는 기록이다."""
+    """실행 조건에 남는 판정 모델 설명 — 대역 수치를 실제 수치로 읽지 않게 하는 기록이다.
+
+    **"판정이 이 실행 어디에서든 돌았는가"를 본다 — 측정 2 의 사유가 아니다.** 판정은 두
+    자리에서 돈다: 측정 2 의 파이프라인 안(L1 통과분 판정)과 측정 3(픽스처 단위 정확도).
+    측정 2 의 사유만 보면 **측정 3 단독 실측**이 늘 "미실행"으로 적히고, 같은 문서의 측정 3
+    절은 "실제 판정 모델(과금)"이라고 적는다 — 리포트가 자기와 모순된다.
+    """
     if not settings.l2_enabled:
         return "L2 꺼짐 (판정 미실행)"
-    if skip is not None:
+    if not judging_ran:
         return "미실행"
     label = (
         "결정론 대역 `testing.StubJudge` (실제 모델 아님)"
@@ -475,9 +482,9 @@ def main(argv: list[str] | None = None) -> int:
     skip = _skip_reason(args=args, settings=settings, selected=selected)
     judge_skip = _judge_skip_reason(args=args, settings=settings, skip=skip, selected=selected)
     # 측정 3 이 **돌 조건이었는가** — 판정 선검사(선택 · `--live` · L2 켜짐 · 판정 키)를
-    # 통과했는가다. 그 **뒤에** 생기는 사유(판정 픽스처 로드 실패·중단)는 "돌 조건이었는데
-    # 못 돌았다"이지 "돌 조건이 아니었다"가 아니다 — 그래서 여기서 잡아 둔다. 종료 코드
-    # 규칙(`scripts/AGENTS.md` 불변식 12 ①)이 이 구분 위에 서 있다.
+    # 통과했는가다. 그 뒤의 중단은 "돌 조건이었는데 못 돌았다"이지 "돌 조건이 아니었다"가
+    # 아니므로 여기서 잡아 둔다. **종료 코드 규칙만** 이 값을 본다
+    # (`scripts/AGENTS.md` 불변식 12 ①).
     measurement3_was_due = bool(args.live) and judge_skip is None
 
     fixtures = load_l1_fixtures(args.l1_fixtures)
@@ -508,12 +515,20 @@ def main(argv: list[str] | None = None) -> int:
     # 이름은 이미 확정됐고(측정 시작 전 결정), 그 이름이 곧 "이 실행은 과금될 수 있었다"는
     # 저장소에 남는 기록이다.
     measurement2_is_real = bool(args.live) and skip is None
+    # 측정 3 이 **실제로 돌 것인가** — 판정 픽스처 로드 실패까지 반영한 값이다. 로드가
+    # 실패하면 판정 호출은 **한 번도** 일어나지 않으므로 그 실행은 과금 실행이 아니다.
+    measurement3_will_run = bool(args.live) and judge_skip is None
     # **과금 실행 여부**가 리포트 이름의 자격을 판정한다 — "측정 2 실측 여부"는 그 목적의
-    # 낡은 대리 변수였다. 둘 중 **하나라도** 실제로 살 조건이면 과금 실행이다: 측정 2 를
+    # 낡은 대리 변수였다. 둘 중 **하나라도 실제로 살 것**이면 과금 실행이다: 측정 2 를
     # 건너뛰고 판정 픽스처만 사는 측정 3 단독 실측이 라이브 이름을 거부당하면, 그 산출물이
     # gitignore 되는 `evaluation` 스템으로 떨어져 다음 실행에 덮인다
     # (`scripts/AGENTS.md` 불변식 7 — 실제로 한 번 그렇게 잃었다).
-    billed = measurement2_is_real or measurement3_was_due
+    #
+    # **"살 조건이었다"가 아니라 "실제로 산다"를 본다.** 판정 픽스처가 깨진 측정 3 단독
+    # 실행은 호출을 0회 하고도 라이브 이름을 가져갔고, 그 빈 산출물이 추적 대상이 되어
+    # 회귀 가드의 직전 라이브 탐색에서 **머리**가 됐다 — 진짜 경보(`미달`)가 빈 세트와의
+    # `대조 불가`로 덮였다. 그래서 알 수 있는 미실행 사유는 이름을 정하기 **전에** 반영한다.
+    billed = measurement2_is_real or measurement3_will_run
 
     # 리포트 이름은 **측정을 시작하기 전에** 확정한다 — 여기서 거부될 실행이 과금(라이브
     # 30건)이나 대역 재적재를 먼저 하고 나서 산출물만 버리는 일이 없어야 한다.
@@ -611,7 +626,14 @@ def main(argv: list[str] | None = None) -> int:
         started_at=started_at,
         generation=generation_label,
         embedding=embedding_label,
-        judge=_judge_label(args=args, settings=settings, skip=skip, aborted=measurement2_aborted),
+        judge=_judge_label(
+            args=args,
+            settings=settings,
+            # 생성·임베딩 설명만 측정 2 의 사유를 따른다. 판정은 측정 2 의 파이프라인 안에서도
+            # 돌고 측정 3 에서도 도니, 둘 중 하나라도 돌았으면 무엇으로 돌았는지 적는다.
+            judging_ran=skip is None or measurement3_will_run,
+            aborted=measurement2_aborted,
+        ),
         embedding_dimensions=run_settings.embedding_dimensions,
         retrieval_strategy=_retrieval_strategy_label(run_settings),
         similarity_threshold=run_settings.vector_similarity_threshold,
@@ -736,6 +758,11 @@ def _condition_fingerprint(
     return {
         # 라벨 버전 = 골든셋 내용 지문. 결정 0008 의 라벨 재정렬 전후가 여기서 갈린다.
         "label_version": content_digest(args.golden_set, prefix="golden-") or "미상",
+        # **검색 정답 라벨은 근거 부분 손실 검사의 정답 입력이다.** 여기 없으면 라벨 한 줄
+        # 추가가 지문에는 아무 차이도 남기지 않은 채 "근거가 사라졌다"로 읽힌다.
+        "retrieval_labels_version": (
+            content_digest(DEFAULT_RETRIEVAL_LABELS_PATH, prefix="labels-") or "미상"
+        ),
         "acceptance_cut": f"{run_settings.vector_similarity_threshold:g}",
         # 기권 게이트는 아직 배선되지 않았다 — 없는 축을 0 으로 적지 않는다.
         "abstention_gate_statistic": "미배선",
