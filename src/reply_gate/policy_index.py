@@ -346,14 +346,20 @@ def search_policy_chunks(
     conn: psycopg.Connection[DictRow],
     query_vector: Sequence[float],
     top_k: int,
-    similarity_threshold: float,
     embedding_model: str,
     embedding_dimensions: int,
 ) -> list[PolicySearchHit]:
-    """문의 임베딩과 코사인 유사도가 높은 조항 상위 k 개.
+    """문의 임베딩과 코사인 유사도가 높은 조항 **상위 `top_k` 후보**.
 
-    **임계값 미만 결과는 버린다** (docs/architecture.md "대표 흐름" 3단계) — 관련 없는 조항을 근거로
-    올리면 초안이 그 위에 문장을 세우고 게이트가 잡아야 할 일이 늘어난다.
+    **여기서 자르는 것은 `LIMIT top_k` 하나뿐이고, 임계값은 걸지 않는다.** 무엇이 근거가
+    되는지를 정하는 것은 호출자(`evidence.adopt_policy_hits`)이고, 순서는
+    docs/architecture.md "대표 흐름" 3단계 그대로다 — 합집합 → 상위 `top_k` → 임계값 미달 폐기.
+
+    임계값을 **여기서** 먼저 걸면 안 되는 이유가 하나 더 생겼다: 질의 단위 기권 게이트의
+    통계량은 **컷 전** 상위 `top_k` 슬라이스를 봐야 오프라인 격자와 런타임이 같은 수를 낸다
+    (`docs/tracking/decisions/0014`). 컷이 먼저 걸린 짧은 슬라이스로 산포를 재면
+    컷 위 후보가 둘뿐인 케이스(G04)가 기권해 케이스 하한을 깬다. 이 절단 순서는 조정
+    가능한 인자가 아니라 **행동 계약**이다.
 
     **질의 임베딩의 출처를 함께 받는다.** 저장된 벡터와 다른 공간이면 유사도를 계산하지
     않고 거부한다(fail-closed) — 이 확인을 호출자에게 맡기면 새 호출자가 생길 때마다 다시
@@ -391,5 +397,4 @@ def search_policy_chunks(
             similarity=float(row["similarity"]),
         )
         for row in rows
-        if float(row["similarity"]) >= similarity_threshold
     ]
