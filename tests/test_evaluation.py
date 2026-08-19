@@ -16,6 +16,7 @@ DB 를 쓰는 테스트는 정책 인덱싱 픽스처(트랜잭션 롤백) 말�
 
 from __future__ import annotations
 
+import ast
 import json
 import socket
 from collections.abc import Sequence
@@ -2541,6 +2542,38 @@ def test_판정_모델은_실행_인자로만_덮이고_설정_기본값은_그�
     assert 덮인_설정.judge_model == "claude-haiku-4-5"
     # 원본 설정은 그대로다 — 기본 판정 모델 교체는 이번 사이클 범위 밖이다.
     assert settings.judge_model != "claude-haiku-4-5"
+
+
+def test_판정_모델_설명은_실행_인자가_덮은_설정을_읽는다() -> None:
+    """한 리포트 안에서 판정 모델 설명과 조건 지문이 갈리면 산출물이 거짓말을 한다.
+
+    지문은 덮인 설정을 읽는데 설명만 기본 설정을 읽으면, 다른 모델로 산 실측이 기본
+    모델로 돈 것처럼 적힌다 — 과금된 산출물의 조건이 조용히 어긋난다. 단위 검사만으로는
+    호출부를 못 잡으므로 호출부도 함께 못박는다.
+    """
+    settings = _l2_settings()
+    args = evaluate.build_parser().parse_args(
+        ["--live", "--measurements", "3", "--judge-model", "판정모델-덮음"]
+    )
+    run_settings = evaluate._run_settings(args=args, settings=settings)
+    assert "판정모델-덮음" in evaluate._judge_label(
+        args=args, settings=run_settings, judging_ran=True
+    )
+
+    tree = ast.parse(Path(evaluate.__file__).read_text(encoding="utf-8"))
+    호출부 = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_judge_label"
+    ]
+    assert 호출부, "_judge_label 호출부를 찾지 못했다"
+    for call in 호출부:
+        넘긴_설정 = {kw.arg: kw.value for kw in call.keywords}.get("settings")
+        assert isinstance(넘긴_설정, ast.Name) and 넘긴_설정.id == "run_settings", (
+            "판정 모델 설명은 실행 인자가 덮은 설정을 읽어야 한다"
+        )
 
 
 def test_알_수_없는_측정_선택은_측정_시작_전에_거부된다() -> None:

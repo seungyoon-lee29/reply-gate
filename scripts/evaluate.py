@@ -646,7 +646,9 @@ def main(argv: list[str] | None = None) -> int:
         embedding=embedding_label,
         judge=_judge_label(
             args=args,
-            settings=settings,
+            # 실행 인자가 덮은 판정 모델까지 반영한 설정이어야 한다 — 여기만 설정 기본값을
+            # 읽으면 한 리포트 안에서 이 줄과 조건 지문의 `judge_model` 이 갈린다.
+            settings=run_settings,
             # 생성·임베딩 설명만 측정 2 의 사유를 따른다. 판정은 측정 2 의 파이프라인 안에서도
             # 돌고 측정 3 에서도 도니, 둘 중 하나라도 돌았으면 무엇으로 돌았는지 적는다.
             judging_ran=skip is None or measurement3_will_run,

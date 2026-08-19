@@ -565,7 +565,9 @@ def assemble_candidate_set(
     for summary in _collect_live_runs(reports_dir, l2_enabled=current.l2_enabled, exclude=skipped):
         if len(runs) >= size:
             break
-        same, reason = summary.fingerprint.same_condition(current.fingerprint)
+        # 방향이 중요하다 — `self` 가 "이번", 인자가 "기준선"으로 문장이 만들어진다.
+        # 뒤집으면 제외 사유가 이번 실행과 제외된 실행을 서로 바꿔 말한다.
+        same, reason = current.fingerprint.same_condition(summary.fingerprint)
         if same:
             runs.append(summary)
         else:
@@ -595,7 +597,7 @@ def discover_recent_live_set(
     for summary in runs[1:]:
         if len(grouped) >= size:
             break
-        same, reason = summary.fingerprint.same_condition(head.fingerprint)
+        same, reason = head.fingerprint.same_condition(summary.fingerprint)
         if same:
             grouped.append(summary)
         else:

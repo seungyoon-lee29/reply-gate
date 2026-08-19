@@ -604,6 +604,51 @@ def test_선언되지_않은_불일치는_대조_불가와_어긋난_항목이�
     assert "top_k" in rendered
 
 
+def test_세트_제외_사유는_이번_실행과_제외된_실행을_바꿔_말하지_않는다(tmp_path: Path) -> None:
+    """제외 사유의 방향이 뒤집히면 회귀를 진단하는 사람이 어느 쪽이 바뀌었는지 오독한다.
+
+    `기준선` 자리에는 **제외된(옛) 실행**의 값이, `이번` 자리에는 **이번 실행**의 값이 와야
+    한다. 양쪽 값이 둘 다 실려 있어서 문장만 훑으면 맞아 보이고, 방향만 조용히 틀린다.
+    """
+    reports_dir = tmp_path / "reports"
+    이번_지문 = dict(_BASE_FINGERPRINT)
+    이번_지문["judge_model"] = "판정모델-이번"
+    옛_지문 = dict(_BASE_FINGERPRINT)
+    옛_지문["judge_model"] = "판정모델-옛것"
+
+    stems = _seed_baseline(reports_dir, fingerprint=이번_지문)
+    reference = tmp_path / "data" / "promoted_baseline.json"
+    _promotion(reference, stems=stems, fingerprint=이번_지문)
+
+    # 승격 세트도 이번 실행도 아닌 옛 실행 — 조건이 달라 세트에서 빠져야 한다.
+    _write(
+        reports_dir,
+        "evaluation-live-l2-4",
+        _payload(
+            started_at="2026-08-04T00:00:00+00:00",
+            cases=_healthy_cases(),
+            fingerprint=옛_지문,
+        ),
+    )
+    현재 = run_summary_from_payload(
+        _payload(
+            started_at="2026-08-05T00:00:00+00:00",
+            cases=_healthy_cases(),
+            fingerprint=이번_지문,
+        ),
+        stem="evaluation-live-l2-5",
+        source="evaluation-live-l2-5",
+    )
+    guard = build_regression_guard(
+        current=현재, reports_dir=reports_dir, promoted_reference_path=reference
+    )
+    assert isinstance(guard, RegressionGuard)
+
+    제외 = " · ".join(guard.candidate_exclusions)
+    assert "evaluation-live-l2-4" in 제외, 제외
+    assert "기준선 `판정모델-옛것` → 이번 `판정모델-이번`" in 제외, 제외
+
+
 def test_선언된_실험_변인은_대조를_진행하고_차이_목록을_병기한다(tmp_path: Path) -> None:
     """이 구분이 없으면 지문 규칙이 이번 사이클의 핵심 비교를 스스로 죽인다."""
     changed = dict(_BASE_FINGERPRINT)
