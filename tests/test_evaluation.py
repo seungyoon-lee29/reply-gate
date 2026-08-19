@@ -2531,3 +2531,95 @@ def test_알_수_없는_측정_선택은_측정_시작_전에_거부된다() -> 
     empty = evaluate.build_parser().parse_args(["--live", "--measurements", " "])
     with pytest.raises(SystemExit):
         evaluate.selected_measurements(empty)
+
+
+def test_측정3_단독_실측의_실행_조건이_판정_모델을_미실행으로_적지_않는다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """한 문서 안에서 모순되면 안 된다 — 실행 조건이 "판정 모델: 미실행"인데 측정 3 절은
+    "실제 판정 모델(과금)"이라고 적는 리포트는 자기를 반박한다."""
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings(live_keys=False))
+    monkeypatch.setattr(evaluate, "database_unavailable_reason", lambda *, settings: "DB 없음")
+    monkeypatch.setattr(evaluate, "build_judge", lambda settings: OracleJudge(JUDGE_FIXTURES))
+    _block_outbound_sockets(monkeypatch)
+
+    assert evaluate.main(["--live", "--measurements", "3", "--out-dir", str(tmp_path)]) == 0
+
+    payload = json.loads((tmp_path / "evaluation-live-l2-1.json").read_text(encoding="utf-8"))
+    judge_label = payload["conditions"]["judge"]
+    assert judge_label != "미실행"
+    assert "claude" in judge_label.lower()
+    assert payload["conditions"]["measurement3_is_real"] is True
+    # 양성 대조 — 대역 판정으로 도는 실행은 여전히 대역이라고 적는다.
+    assert "Anthropic" in judge_label
+
+
+def test_판정_픽스처가_깨진_측정3_단독_실행은_과금_실행이_아니다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """호출을 **0회** 하고도 라이브 이름을 가져가면, 그 빈 산출물이 추적 대상이 되어
+    회귀 가드의 직전 라이브 탐색에서 머리가 된다 — 진짜 경보가 빈 세트로 덮인다.
+
+    알 수 있는 미실행 사유는 이름을 정하기 **전에** 반영한다. 이름 확정 자체는 여전히
+    측정 시작 전이다.
+    """
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings(live_keys=False))
+    monkeypatch.setattr(evaluate, "database_unavailable_reason", lambda *, settings: "DB 없음")
+    judge_builds: list[Any] = []
+
+    def _record_judge(settings: Any) -> Any:
+        judge_builds.append(settings)
+        return None
+
+    monkeypatch.setattr(evaluate, "build_judge", _record_judge)
+    _block_outbound_sockets(monkeypatch)
+
+    exit_code = evaluate.main(
+        [
+            "--live",
+            "--measurements",
+            "3",
+            "--judge-fixtures",
+            str(tmp_path / "없는-픽스처.jsonl"),
+            "--out-dir",
+            str(tmp_path),
+        ]
+    )
+    # 돌 조건이었는데 못 돌았으므로 종료 코드는 1 이다 — 그 규칙은 그대로다.
+    assert exit_code == 1
+    assert not judge_builds, "판정자를 만들지도 않았다 = 과금 0회"
+
+    # 라이브 이름을 가져가지 않는다 — 추적되는 빈 산출물이 생기지 않아야 한다.
+    assert not (tmp_path / "evaluation-live-l2-1.json").exists()
+    payload = json.loads((tmp_path / "evaluation.json").read_text(encoding="utf-8"))
+    assert payload["conditions"]["billed"] is False
+    assert payload["measurement_3_l2_judge_accuracy"]["executed"] is False
+
+
+def test_과금_0회_산출물은_직전_라이브_탐색의_머리가_되지_않는다(tmp_path: Path) -> None:
+    """N2 의 진짜 피해는 이름 낭비가 아니라 **경보가 덮이는 것**이다.
+
+    `_collect_live_runs` 는 `billed` 로 거른다. 빈 산출물이 과금으로 찍히면 그것이 가장
+    최근 세트가 되어, 직전 라이브 줄의 진짜 `미달` 이 빈 세트와의 `대조 불가` 로 바뀐다.
+    """
+    from reply_gate.regression_guard import _collect_live_runs
+
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    for name, billed in (("evaluation-live-l2-1", True), ("evaluation-live-l2-2", False)):
+        (reports_dir / f"{name}.json").write_text(
+            json.dumps(
+                {
+                    "conditions": {
+                        "started_at": f"2026-08-0{1 if billed else 9}T00:00:00+00:00",
+                        "billed": billed,
+                        "l2_enabled": True,
+                    },
+                    "measurement_2_pipeline_agreement": {"executed": False},
+                    "failure_attribution": {"computed": False},
+                }
+            ),
+            encoding="utf-8",
+        )
+    collected = _collect_live_runs(reports_dir, l2_enabled=True)
+    assert [run.stem for run in collected] == ["evaluation-live-l2-1"]
