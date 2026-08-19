@@ -140,7 +140,7 @@ pass 이고 **L2 가 실행됐다면** L2 도 pass. 층별 내역은 두 키로 
 | 키 | 무엇을 세나 | 경계 |
 |---|---|---|
 | `metrics.tokens.input` / `.output` | **생성 LLM 합산** — 의도 해석 + SQL 생성 + 초안 생성 | 임베딩·판정·검색 토큰을 여기 섞지 않는다 |
-| `metrics.tokens.judge_input` / `.judge_output` | **L2 판정 모델 토큰** | 생성 합산과 별도 키 쌍이다. **L2 미실행이면 0** |
+| `metrics.tokens.judge_input` / `.judge_output` | **L2 판정 모델 토큰** | 생성 합산과 별도 키 쌍이다. **판정 모델을 부르지 않았으면 0** — 불러서 실패한 경우는 0 이 아닐 수 있다(아래 "실행됐으나 실패한 호출") |
 | `metrics.tokens.retrieval_input` / `.retrieval_output` | **검색 단계 생성 호출 토큰** — 질의 재작성 | 생성 합산과 별도 키 쌍이다. 재작성을 쓰지 않은 문의는 0 |
 | 임베딩 토큰 | 문의 임베딩·정책 인덱싱 | **응답에 싣지 않는다.** 처리 기록(`inquiries.embedding_tokens`)에만 남는다 |
 

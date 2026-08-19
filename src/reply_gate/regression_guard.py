@@ -32,7 +32,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Final
 
@@ -1231,6 +1231,19 @@ def build_regression_guard(
             baseline_source="reports/ 자동 탐색",
             expected_run_count=run_set_size,
         )
+        if promoted_stems and set(recent.stems) == set(promoted_stems):
+            # 두 줄이 **같은 산출물**을 대조하고 있다. 판정이 서로 같은 것은 독립적인
+            # 두 검사가 합의한 것이 아니라 같은 검사를 두 번 인쇄한 것이다 — 적지 않으면
+            # 사용자가 없는 신호를 읽는다(사이클 4 리뷰 advisory).
+            alert = replace(
+                alert,
+                notes=(
+                    *alert.notes,
+                    "이 경보 줄은 **승격 기준선과 같은 세트**를 대조한다 — 두 줄이 같은 판정인 "
+                    "것은 독립적인 두 검사의 합의가 아니다. 승격 뒤 새 라이브 세트가 쌓이면 "
+                    "갈린다.",
+                ),
+            )
     return RegressionGuard(
         candidate_stems=candidate.stems,
         candidate_run_count=len(candidate.runs),

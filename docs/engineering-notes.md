@@ -269,6 +269,8 @@ pgvector 는 **차원**이 다르면 거부한다 — 1536 컬럼에 3072 질의
 
 손계산 산출물(`uv run python -m scripts.handcalc_adoption_axis` → `reports/adoption-axis-handcalc.md`,
 입력은 커밋된 `reports/retrieval-strategies-live-*.json` 뿐이라 무과금·재현 가능)의 값이다.
+**이 산출물은 gitignore 라 저장소에 없다 — 위 명령을 돌려야 생긴다.** 인용 수치 자체는
+`tests/test_adoption_axis.py` 가 못박는다.
 통계량은 채택된 축(1위 − `top_k`위 산포)이다.
 
 | 조건 | 기권 쪽 최대 | 채택 쪽 최소 | 여유 |
@@ -293,6 +295,13 @@ pgvector 는 **차원**이 다르면 거부한다 — 1536 컬럼에 3072 질의
 - `config.py` 의 `embedding_model` 주석이 재산출이 명시적 작업임을 그 자리에서 말한다.
 - 실행 조건 지문에서 `abstention_tau` 와 `embedding_model` 이 **한 쌍**이다
   (`regression_guard.PAIRED_FINGERPRINT_FIELDS`) — 모델이 다르면 τ 가 같아도 대조 불가다.
+
+**짝을 적을 때는 짝이 실제로 달라졌는지 먼저 보라.** 이 가드가 처음에는 τ 어긋남에 짝 이름을
+**값 비교 없이** 붙였고, 그 결과 커밋된 리포트 18건이 *"짝인 `embedding_model` 도 함께
+달라졌다"* 를 실었다 — 임베딩은 한 번도 바뀌지 않았는데 없던 사실을 적은 것이다. 짝 관계를
+**설명**하는 문장과 짝이 **달라졌다고 보고**하는 문장은 다르고, 후자는 값을 봐야 한다.
+코드는 고쳤고(짝만 다름·값만 다름·둘 다 다름 세 경우를 회귀 테스트가 못박는다) 산출물은
+보존한 채 정정을 문서에 병기했다([findings 23](tracking/findings.md)).
 
 **임베딩을 상향하는 사이클은 τ 재산출을 같은 작업에 넣어라.** 격자를 다시 돌리는 것 자체는
 무과금이지만(커밋된 산출물 재채점) 새 모델의 검색 산출물은 새로 사야 한다.

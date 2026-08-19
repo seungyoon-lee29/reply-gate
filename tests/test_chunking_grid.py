@@ -488,6 +488,47 @@ def test_CLI_는_청킹_축을_다른_축과_섞지_않는다(tmp_path: Path) ->
     assert not list(tmp_path.glob("*.md"))
 
 
+def test_CLI_는_청킹_격자가_읽지_않는_인자를_거부한다(tmp_path: Path) -> None:
+    """조용히 버리면 준 값이 반영됐다고 읽히고 리포트 조건이 실제 실행과 갈린다."""
+    from scripts import compare_retrieval
+
+    exit_code = compare_retrieval.main(
+        [
+            "--stub-embedding",
+            "--chunking-grid",
+            "--sweep-step",
+            "0.01",
+            "--out-dir",
+            str(tmp_path),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+        ]
+    )
+
+    assert exit_code == 2
+    assert not list(tmp_path.glob("*.md"))
+
+
+def test_CLI_는_기본값_그대로인_인자는_통과시킨다(tmp_path: Path) -> None:
+    """거부는 **명시적으로 다른 값을 준** 경우에만이다 — 기본값 동작을 막지 않는다."""
+    from scripts import compare_retrieval
+
+    exit_code = compare_retrieval.main(
+        [
+            "--stub-embedding",
+            "--chunking-grid",
+            "--sweep-step",
+            "0.05",
+            "--out-dir",
+            str(tmp_path),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+        ]
+    )
+
+    assert exit_code == 0
+
+
 def test_CLI_는_잘못된_최소_포함_비율을_실행_전에_거부한다(tmp_path: Path) -> None:
     from scripts import compare_retrieval
 

@@ -13,11 +13,12 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import pathlib
 from collections.abc import Sequence
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Final, cast
 
 import anthropic
 import pytest
@@ -56,6 +57,7 @@ from reply_gate.llm import (
     accumulate_optional_tokens,
 )
 from reply_gate.pipeline import build_judge
+from tests.conftest import declared_settings
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -434,7 +436,7 @@ def test_수집_근거_밖의_모순_쌍은_캐싱_양쪽에서_거부된다(pro
 
 def test_설정_기본값은_캐싱_꺼짐이다() -> None:
     """실측이 정당화하지 않는 기본값을 남기지 않는다 — 채택 전까지 꺼짐이다."""
-    assert Settings().judge_prompt_caching_enabled is False
+    assert declared_settings().judge_prompt_caching_enabled is False
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -609,6 +611,65 @@ def test_판정_실패한_픽스처의_캐시_계열도_버려지지_않는다()
     assert accuracy.cache_read_tokens_total == 0
 
 
+#: 런타임 판정 토큰이 캐시 계열로 갈라졌는지 판정하는 이름.
+_CACHE_TOKEN_FIELDS: Final = frozenset({"cache_read_input_tokens", "cache_creation_input_tokens"})
+
+#: 런타임 판정 토큰이 지나가는 자리. 파이프라인이 만들고 처리 기록이 저장한다.
+_RUNTIME_TOKEN_MODULES: Final = ("pipeline.py", "records.py")
+
+
+def _runtime_identifiers() -> set[str]:
+    """런타임 모듈이 **코드로** 쓰는 이름들.
+
+    문자열 스캔은 주석·docstring 에 이름이 스치기만 해도 "집계가 있다"로 읽고 가드를 통째로
+    꺼 버린다 — 이 검사는 통과 조건이 곧 자기 비활성화라 그 오탐이 특히 비싸다
+    (사이클 4 리뷰 advisory). AST 로 보면 주석은 애초에 없고, docstring 은 여기서 제외한다.
+    """
+    package_dir = pathlib.Path(str(pipeline_module.__file__)).parent
+    names: set[str] = set()
+    for filename in _RUNTIME_TOKEN_MODULES:
+        tree = ast.parse((package_dir / filename).read_text(encoding="utf-8"), filename=filename)
+        docstrings = {
+            node.body[0].value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+            and node.body
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+            and isinstance(node.body[0].value.value, str)
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                names.add(node.attr)
+            elif isinstance(node, ast.Name):
+                names.add(node.id)
+            elif isinstance(node, ast.keyword | ast.arg) and node.arg:
+                names.add(node.arg)
+            elif (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and node not in docstrings
+            ):
+                names.add(node.value)
+    return names
+
+
+def test_캐싱_가드는_주석에_스친_이름으로_꺼지지_않는다() -> None:
+    """음성 대조 — 문자열 스캔이면 통과했을 소스가 AST 에서는 이름을 남기지 않는다."""
+    commented = ast.parse('# cache_read_input_tokens\n"""cache_creation_input_tokens."""\n')
+    literal = {
+        node.value
+        for node in ast.walk(commented)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    # docstring 하나만 남고 주석은 AST 에 없다 — 그 docstring 을 제외하는 것이 이 가드다.
+    assert literal == {"cache_creation_input_tokens."}
+    assert _CACHE_TOKEN_FIELDS & _runtime_identifiers() == set(), (
+        "런타임 집계가 실제로 배선되면 이 음성 대조는 전제를 잃는다 — 그때는 위 가드도 "
+        "함께 조용해진다."
+    )
+
+
 def test_런타임_집계가_없는_채로_캐싱을_기본으로_켤_수_없다() -> None:
     """캐시 계열 집계는 지금 **측정 3 경로에만** 있다.
 
@@ -620,16 +681,13 @@ def test_런타임_집계가_없는_채로_캐싱을_기본으로_켤_수_없다
     한다 — 런타임 집계를 먼저 배선하지 않으면 실패한다. 런타임을 배선하면 이 검사는
     저절로 조용해진다(전제가 사라진다).
     """
-    파이프라인 = pathlib.Path(str(pipeline_module.__file__)).read_text(encoding="utf-8")
-    런타임_집계가_있다 = (
-        "cache_read_input_tokens" in 파이프라인 or "cache_creation_input_tokens" in 파이프라인
-    )
+    런타임_집계가_있다 = bool(_CACHE_TOKEN_FIELDS & _runtime_identifiers())
     if 런타임_집계가_있다:
         return
 
     # `Settings` 를 assert 식 안에 그대로 두면 실패 출력이 설정 객체를 통째로 repr 하고,
     # 거기에 API 키가 평문으로 실린다. **bool 로 먼저 묶는다.**
-    캐싱이_기본으로_켜져_있다 = bool(Settings().judge_prompt_caching_enabled)
+    캐싱이_기본으로_켜져_있다 = bool(declared_settings().judge_prompt_caching_enabled)
     assert not 캐싱이_기본으로_켜져_있다, (
         "런타임 경로에 캐시 계열 토큰 집계가 없는 채로 판정 프롬프트 캐싱을 기본으로 켤 수 "
         "없다 — `judge_input_tokens` 가 캐시 적중분을 제외한 값으로 조용히 바뀐다. "

@@ -89,11 +89,23 @@ _DYNAMIC_IMPORTERS = frozenset({"import_module", "__import__"})
 _UNKNOWN_SEGMENT = "\x00"
 
 
+def _package_module_names() -> set[str]:
+    """패키지의 모든 파이썬 파일. **재귀로 훑는다.**
+
+    비재귀 `glob("*.py")` 은 하위 패키지(`reply_gate/<sub>/*.py`)를 통째로 놓친다 — 지금은
+    하위 패키지가 없지만, 하나 생기는 순간 그 안의 런타임 코드가 **조용히** 이 가드 밖으로
+    나간다. 이름은 패키지 기준 상대 경로라 최상위 모듈은 `evaluation.py` 그대로다.
+    """
+    return {
+        path.relative_to(_PACKAGE_DIR).as_posix()
+        for path in _PACKAGE_DIR.rglob("*.py")
+        if "__pycache__" not in path.parts
+    }
+
+
 def _runtime_module_names() -> tuple[str, ...]:
     """검사 대상을 패키지 디렉터리에서 유도한다 — 새 런타임 모듈이 조용히 빠지지 않게."""
-    return tuple(
-        sorted(path.name for path in _PACKAGE_DIR.glob("*.py") if path.name not in _SCORER_MODULES)
-    )
+    return tuple(sorted(_package_module_names() - _SCORER_MODULES))
 
 
 def _normalized_from_module(node: ast.ImportFrom) -> str:
@@ -218,9 +230,15 @@ def test_런타임과_전략_코드는_라벨_골든셋_심은_주석_어디에�
 
 def test_검사_대상은_패키지에서_유도되고_면제_목록에_구멍이_없다() -> None:
     checked = set(_runtime_module_names())
-    present = {path.name for path in _PACKAGE_DIR.glob("*.py")}
+    present = _package_module_names()
 
     assert checked == present - _SCORER_MODULES
+    # 재귀 확인 — 하위 패키지가 생기면 그 파일도 이름에 `/` 를 달고 검사 안으로 들어온다.
+    assert present == {
+        path.relative_to(_PACKAGE_DIR).as_posix()
+        for path in _PACKAGE_DIR.rglob("*.py")
+        if "__pycache__" not in path.parts
+    }
     # 전략·런타임의 핵심 파일이 실제로 검사 안에 있어야 이 가드가 의미를 갖는다.
     assert {"retrieval_strategies.py", "evidence.py", "pipeline.py", "gate.py"} <= checked
     assert _ANNOTATION_OWNER in checked
@@ -240,23 +258,46 @@ def test_심은_주석은_파서_밖으로_나가지_못한다() -> None:
     assert "planted" not in table
 
 
-def test_채점자_모듈은_런타임_경로에서_import_되지_않는다() -> None:
-    """정답을 아는 채점자가 런타임에 끌려 들어오면 면제가 그대로 구멍이 된다."""
+def _imported_scorers(*, source: str, filename: str) -> list[str]:
+    """이 소스가 끌어들이는 채점자 모듈. 없으면 빈 목록.
+
+    `import a, b` 는 alias 가 **여럿**이다 — 첫 이름만 보면 둘째부터가 가드 밖으로 나간다
+    (사이클 4 리뷰 advisory). 그래서 `node.names` 를 전부 훑는다.
+    """
     offenders: list[str] = []
-    for filename in _runtime_module_names():
-        source = (_PACKAGE_DIR / filename).read_text(encoding="utf-8")
-        for node in ast.walk(ast.parse(source, filename=filename)):
-            if isinstance(node, ast.ImportFrom):
-                module = _normalized_from_module(node)
-            elif isinstance(node, ast.Import):
-                module = node.names[0].name
-            else:
-                continue
+    for node in ast.walk(ast.parse(source, filename=filename)):
+        if isinstance(node, ast.ImportFrom):
+            modules = [_normalized_from_module(node)]
+        elif isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        else:
+            continue
+        for module in modules:
             scorer = module.removeprefix("reply_gate.") + ".py"
             if scorer in _SCORER_MODULES:
                 offenders.append(f"{filename} -> {module}")
+    return offenders
+
+
+def test_채점자_모듈은_런타임_경로에서_import_되지_않는다() -> None:
+    """정답을 아는 채점자가 런타임에 끌려 들어오면 면제가 그대로 구멍이 된다."""
+    offenders = [
+        offender
+        for filename in _runtime_module_names()
+        for offender in _imported_scorers(
+            source=(_PACKAGE_DIR / filename).read_text(encoding="utf-8"), filename=filename
+        )
+    ]
 
     assert not offenders
+
+
+def test_import_가드는_두_번째_alias_도_본다() -> None:
+    """음성 대조 — `import a, b` 의 둘째부터가 조용히 빠지면 가드가 장식이 된다."""
+    assert _imported_scorers(
+        source="import reply_gate.contracts, reply_gate.evaluation\n", filename="mutant.py"
+    ) == ["mutant.py -> reply_gate.evaluation"]
+    assert not _imported_scorers(source="import reply_gate.contracts\n", filename="mutant.py")
 
 
 def test_심은_상충_주석이_짝의_조항_번호를_그대로_들고_있다() -> None:

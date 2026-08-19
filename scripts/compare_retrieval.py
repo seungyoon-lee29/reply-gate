@@ -12,7 +12,7 @@ import argparse
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Final, cast
 
 from reply_gate.config import get_settings
 from reply_gate.evaluation import DEFAULT_GOLDEN_SET_PATH
@@ -178,9 +178,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if args.chunking_grid:
-        return _run_chunking(args)
+        return _run_chunking(args, parser=parser)
     if args.embedding_axis and not args.live:
         print(
             "검색 비교 실행 실패: --embedding-axis 는 실제 모델을 호출하므로 --live 가 필요하다",
@@ -266,7 +267,24 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _run_chunking(args: argparse.Namespace) -> int:
+#: 청킹 격자가 **읽지 않는** 인자. `run_chunking_comparison` 의 시그니처에 대응이 없다.
+#: 기본값과 다르게 주면 거부한다 — 조용히 버리면 준 값이 반영됐다고 읽히고, 리포트의
+#: 조건 지문이 실제 실행과 갈린다(사이클 4 리뷰 advisory).
+_CHUNKING_IGNORED: Final = (
+    ("--sweep-start", "sweep_start"),
+    ("--sweep-end", "sweep_end"),
+    ("--sweep-step", "sweep_step"),
+    ("--rrf-k", "rrf_k"),
+    ("--rrf-cutoff", "rrf_cutoff"),
+    ("--fusion-pool", "fusion_pool"),
+    ("--ngram-size", "ngram_size"),
+    ("--rerank-top-n", "rerank_top_n"),
+    ("--rerank-model", "rerank_model"),
+    ("--no-abstention-grid", "no_abstention_grid"),
+)
+
+
+def _run_chunking(args: argparse.Namespace, *, parser: argparse.ArgumentParser) -> int:
     """청킹 축은 다른 축과 섞이지 않는다 — 변수는 청킹 하나뿐이어야 비교가 성립한다."""
     conflicting = [
         name
@@ -283,6 +301,18 @@ def _run_chunking(args: argparse.Namespace) -> int:
         print(
             "검색 비교 실행 실패: --chunking-grid 는 "
             f"{' · '.join(conflicting)} 와 함께 쓸 수 없다 (청킹만이 변수여야 한다)",
+            file=sys.stderr,
+        )
+        return 2
+
+    ignored = [
+        name for name, dest in _CHUNKING_IGNORED if getattr(args, dest) != parser.get_default(dest)
+    ]
+    if ignored:
+        print(
+            "검색 비교 실행 실패: --chunking-grid 는 "
+            f"{' · '.join(ignored)} 를 읽지 않는다 — 조용히 버리면 리포트 조건이 "
+            "실제 실행과 갈린다",
             file=sys.stderr,
         )
         return 2

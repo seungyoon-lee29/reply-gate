@@ -65,6 +65,7 @@ from reply_gate.retrieval_strategies import (
     truncate_for_gate,
 )
 from reply_gate.testing import LexicalEmbeddingClient
+from tests.conftest import declared_settings
 
 _ROOT = Path(__file__).resolve().parents[1]
 #: 결정 0014 격자의 입력. 커밋된 산출물이라 이 대조는 무과금이다.
@@ -121,8 +122,12 @@ def _gate(*, tau: float = _TAU) -> AbstentionGate:
 
 
 def test_기본_설정이_결정_0014_가_고른_구성을_그대로_들고_있다() -> None:
-    """격자 165 구성 중 채택 규칙 다섯을 순서대로 통과한 것은 이 하나뿐이다."""
-    settings = Settings()
+    """격자 165 구성 중 채택 규칙 다섯을 순서대로 통과한 것은 이 하나뿐이다.
+
+    **선언값을 읽는다** — 인자 없는 `Settings()` 는 개발자의 `.env` 까지 읽어서 이 검사가
+    결정 기록 대신 로컬 환경을 재게 된다.
+    """
+    settings = declared_settings()
 
     assert settings.abstention_gate_enabled is True
     assert settings.abstention_gate_statistic is AbstentionStatistic.SPREAD
@@ -133,19 +138,21 @@ def test_기본_설정이_결정_0014_가_고른_구성을_그대로_들고_있�
 
 
 def test_설정이_조립한_게이트가_통계량과_tau_를_그대로_싣는다() -> None:
-    gate = Settings().abstention_gate()
+    gate = declared_settings().abstention_gate()
 
     assert gate == AbstentionGate(statistic=AbstentionStatistic.SPREAD, tau=0.06)
 
 
 def test_스위치를_끄면_게이트가_아예_조립되지_않는다() -> None:
     """끄기는 설정 한 줄이다 — 원복 범위가 게이트 하나로 남는다(결정 0011)."""
-    assert Settings(abstention_gate_enabled=False).abstention_gate() is None
+    assert declared_settings(abstention_gate_enabled=False).abstention_gate() is None
 
 
 def test_통계량과_tau_는_설정값이라_다른_구성으로도_조립된다() -> None:
     """반증된 축으로 되돌리는 것도 설정 한 줄이어야 한다 — 코드 수정이 아니다."""
-    settings = Settings(abstention_gate_statistic=AbstentionStatistic.STDEV, abstention_tau=0.02)
+    settings = declared_settings(
+        abstention_gate_statistic=AbstentionStatistic.STDEV, abstention_tau=0.02
+    )
 
     assert settings.abstention_gate() == AbstentionGate(
         statistic=AbstentionStatistic.STDEV, tau=0.02
@@ -313,7 +320,7 @@ def _runtime_accepted(hits: Sequence[PolicySearchHit]) -> tuple[str, ...]:
         candidates=candidates,
         top_k=_TOP_K,
         similarity_threshold=_CUT,
-        gate=Settings().abstention_gate(),
+        gate=declared_settings().abstention_gate(),
     )
     return tuple(hit.evidence_id for hit in accepted)
 
@@ -398,8 +405,12 @@ def test_런타임_채택_경로는_게이트_원시연산을_다시_구현하�
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
     assert "pstdev" not in called
+    # `import os, statistics` 처럼 alias 가 여럿이면 첫 이름만 보는 검사는 뚫린다.
     assert "statistics" not in {
-        node.names[0].name for node in ast.walk(tree) if isinstance(node, ast.Import)
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
     }
 
 
@@ -448,7 +459,7 @@ def _fingerprint(settings: Settings) -> dict[str, str]:
 
 
 def test_지문이_기권_게이트의_실제_통계량과_tau_를_싣는다() -> None:
-    values = _fingerprint(Settings())
+    values = _fingerprint(declared_settings())
 
     assert values["abstention_gate_statistic"] == "rank1_minus_rank_k_spread"
     assert values["abstention_tau"] == "0.06"
@@ -457,7 +468,7 @@ def test_지문이_기권_게이트의_실제_통계량과_tau_를_싣는다() -
 
 def test_지문에_미배선_자리표시가_남아_있지_않다() -> None:
     """음성 대조 — 자리표시가 남으면 게이트 변경이 가드에 보이지 않는다."""
-    values = _fingerprint(Settings())
+    values = _fingerprint(declared_settings())
 
     assert "미배선" not in values["abstention_gate_statistic"]
     assert "미배선" not in values["abstention_tau"]
@@ -465,7 +476,7 @@ def test_지문에_미배선_자리표시가_남아_있지_않다() -> None:
 
 def test_tau_나_통계량을_바꾸면_지문_값이_따라_바뀐다() -> None:
     values = _fingerprint(
-        Settings(abstention_gate_statistic=AbstentionStatistic.STDEV, abstention_tau=0.025)
+        declared_settings(abstention_gate_statistic=AbstentionStatistic.STDEV, abstention_tau=0.025)
     )
 
     assert values["abstention_gate_statistic"] == "top_k_stdev"
@@ -474,7 +485,7 @@ def test_tau_나_통계량을_바꾸면_지문_값이_따라_바뀐다() -> None
 
 def test_게이트를_끄면_지문이_0_이_아니라_꺼짐으로_남는다() -> None:
     """끈 실행을 τ=0 으로 적으면 "모든 질의를 통과시킨 실행"과 구분되지 않는다."""
-    values = _fingerprint(Settings(abstention_gate_enabled=False))
+    values = _fingerprint(declared_settings(abstention_gate_enabled=False))
 
     assert values["abstention_gate_statistic"] == "꺼짐"
     assert values["abstention_tau"] == "꺼짐"
@@ -484,13 +495,13 @@ def test_지문_항목_이름이_회귀_가드가_보는_이름과_같다() -> N
     """가드는 이름으로 짝을 찾는다 — 이름이 갈리면 대조가 조용히 빠진다."""
     from reply_gate.regression_guard import FINGERPRINT_FIELDS, PAIRED_FINGERPRINT_FIELDS
 
-    values = _fingerprint(Settings())
+    values = _fingerprint(declared_settings())
 
     assert {"abstention_gate_statistic", "abstention_tau"} <= set(FINGERPRINT_FIELDS)
     assert {"abstention_gate_statistic", "abstention_tau"} <= values.keys()
     # τ 는 임베딩 모델과 짝으로 읽힌다 — 모델이 다르면 τ 가 같아도 대조 불가다.
     assert PAIRED_FINGERPRINT_FIELDS["abstention_tau"] == "embedding_model"
-    assert values["embedding_model"] == Settings().embedding_model
+    assert values["embedding_model"] == declared_settings().embedding_model
 
 
 # ---------------------------------------------------------------------------

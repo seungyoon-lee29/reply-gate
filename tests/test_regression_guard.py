@@ -254,6 +254,25 @@ def test_승격_참조가_없으면_기준선_미등재라고_적는다(tmp_path
     assert "기준선 미등재" in rendered
 
 
+def test_경보_줄이_승격_세트와_같으면_그_사실을_적는다(tmp_path: Path) -> None:
+    """두 줄이 같은 산출물을 대조하면 판정이 같은 것은 **합의가 아니다.**
+
+    승격 직후에는 `reports/` 에 승격 세트 말고 대조할 라이브가 없어 경보 줄이 구속 줄과
+    같은 세트를 집는다. 적지 않으면 사용자가 없는 신호(두 검사가 합의했다)를 읽는다.
+    """
+    guard = _run_guard(tmp_path, candidate_cases=[_healthy_cases()] * RUN_SET_SIZE)
+    assert set(guard.alert.baseline_stems) == set(guard.binding.baseline_stems)
+    assert any("승격 기준선과 같은 세트" in note for note in guard.alert.notes)
+    assert "승격 기준선과 같은 세트" in "\n".join(render_guard_section(guard))
+
+
+def test_경보_줄이_다른_세트면_같은_세트_표기를_붙이지_않는다(tmp_path: Path) -> None:
+    """표기가 항상 붙으면 신호가 아니다 — 실제로 갈릴 때 붙지 않아야 한다."""
+    guard = _run_guard(tmp_path, candidate_cases=[_healthy_cases()] * (RUN_SET_SIZE * 2))
+    assert set(guard.alert.baseline_stems) != set(guard.binding.baseline_stems)
+    assert not any("승격 기준선과 같은 세트" in note for note in guard.alert.notes)
+
+
 def test_승격_참조가_비어_있으면_빠진_항목을_이름으로_적는다(tmp_path: Path) -> None:
     reference = tmp_path / "promoted_baseline.json"
     reference.write_text(
@@ -355,6 +374,29 @@ def test_승격_자동_경로_검사가_실제로_쓰기를_잡는다(tmp_path: 
         encoding="utf-8",
     )
     assert _promotion_writes([guilty])
+
+
+def test_승격_자동_경로_검사가_변수를_거친_쓰기도_잡는다(tmp_path: Path) -> None:
+    """음성 대조 — 경로를 지역 변수에 한 번 담으면 호출 문면에 이름이 안 남는다."""
+    guilty = tmp_path / "guilty_alias.py"
+    guilty.write_text(
+        "from reply_gate.regression_guard import DEFAULT_PROMOTED_BASELINE_PATH\n"
+        "def promote() -> None:\n"
+        "    reference = DEFAULT_PROMOTED_BASELINE_PATH\n"
+        "    reference.write_text('{}')\n",
+        encoding="utf-8",
+    )
+    assert _promotion_writes([guilty])
+
+    innocent = tmp_path / "innocent.py"
+    innocent.write_text(
+        "from reply_gate.regression_guard import DEFAULT_PROMOTED_BASELINE_PATH\n"
+        "def read() -> str:\n"
+        "    reference = DEFAULT_PROMOTED_BASELINE_PATH\n"
+        "    return reference.read_text()\n",
+        encoding="utf-8",
+    )
+    assert _promotion_writes([innocent]) == []
 
 
 def test_재등재된_승격_참조가_새_기준선을_구속한다(tmp_path: Path) -> None:
@@ -799,6 +841,40 @@ def _python_sources() -> list[Path]:
     return files
 
 
+def _promotion_aliases(*, tree: ast.AST, source: str) -> set[str]:
+    """승격 참조 경로를 담은 **지역 이름**.
+
+    호출 문면만 훑는 검사는 `reference = DEFAULT_PROMOTED_BASELINE_PATH` 뒤의
+    `reference.write_text(...)` 를 놓친다 — 변수를 한 번 거치면 이름이 호출에 안 남기
+    때문이다(사이클 4 리뷰 advisory). 두 갈래로 오염을 전파한다: 대입값이 승격 참조를
+    가리키거나, 이름 자체가 `promoted` 를 달고 있거나.
+    """
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.arg) and "promoted" in node.arg.lower():
+            aliases.add(node.arg)
+            continue
+        if isinstance(node, ast.Assign | ast.AnnAssign):
+            if node.value is None:
+                continue
+            segment = (ast.get_source_segment(source, node.value) or "").lower()
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                if "promoted_baseline" in segment or "promoted" in target.id.lower():
+                    aliases.add(target.id)
+    return aliases
+
+
+def _mentions_promotion(*, node: ast.AST, source: str, aliases: set[str]) -> bool:
+    """이 호출이 승격 참조를 건드리는가 — 문면으로든, 오염된 이름으로든."""
+    segment = (ast.get_source_segment(source, node) or "").lower()
+    if "promoted_baseline" in segment:
+        return True
+    return any(isinstance(inner, ast.Name) and inner.id in aliases for inner in ast.walk(node))
+
+
 def _promotion_writes(paths: Sequence[Path]) -> list[str]:
     """승격 참조 파일에 **쓰는** 호출을 찾는다. 읽기는 잡지 않는다."""
     offenders: list[str] = []
@@ -807,6 +883,7 @@ def _promotion_writes(paths: Sequence[Path]) -> list[str]:
         if "promoted_baseline" not in source and "PROMOTED_BASELINE" not in source:
             continue
         tree = ast.parse(source)
+        aliases = _promotion_aliases(tree=tree, source=source)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -814,8 +891,8 @@ def _promotion_writes(paths: Sequence[Path]) -> list[str]:
             name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
             if name not in _WRITE_CALLS and name != "open":
                 continue
-            segment = ast.get_source_segment(source, node) or ""
-            if "promoted_baseline" in segment.lower() or "promoted_baseline_path" in segment:
+            if _mentions_promotion(node=node, source=source, aliases=aliases):
+                segment = ast.get_source_segment(source, node) or ""
                 offenders.append(f"{path.name}:{node.lineno}: {segment.splitlines()[0]}")
     return offenders
 

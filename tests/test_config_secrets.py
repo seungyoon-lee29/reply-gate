@@ -12,9 +12,13 @@
 
 from __future__ import annotations
 
+import os
 import re
 
+import pytest
+
 from reply_gate.config import Settings
+from tests.conftest import declared_settings
 
 #: 자격 증명으로 읽어야 하는 필드 이름. `judge_max_output_tokens` 같은 이름이 걸리지
 #: 않도록 "token" 단독은 넣지 않는다 — 실제 비밀은 키·비밀번호·시크릿 세 갈래다.
@@ -59,3 +63,25 @@ def test_비밀로_읽히는_필드는_전부_repr_에서_빠져_있다() -> Non
         "자격 증명 필드는 `Field(repr=False)` 여야 한다 — repr 에 실리면 설정 객체가 실린 "
         f"자리마다 값이 평문으로 따라간다: {', '.join(새는_필드)}"
     )
+
+
+# ── 선언값 헬퍼 — 테스트가 개발자의 `.env` 를 재지 않게 한다 ─────────────────
+
+
+def test_선언값_헬퍼는_환경도_env_파일도_읽지_않는다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """인자 없는 `Settings()` 는 `.env` 와 환경 변수를 함께 읽는다.
+
+    "기본값이 결정대로인가"를 재는 테스트가 그것을 쓰면 결정 기록 대신 **로컬 환경**을
+    재게 된다 — 개발자가 `ABSTENTION_TAU` 를 잠깐 바꿔 두면 코드와 결정이 갈렸는데도
+    초록이 뜬다(사이클 4 리뷰 advisory). 이 검사는 헬퍼가 실제로 그 둘을 차단하는지 본다.
+    """
+    monkeypatch.setenv("ABSTENTION_TAU", "0.99")
+
+    assert Settings().abstention_tau == 0.99, "인자 없는 생성은 환경을 읽는다(전제 확인)"
+    assert declared_settings().abstention_tau == 0.06
+    assert os.environ["ABSTENTION_TAU"] == "0.99", "헬퍼는 지운 환경을 되돌려 놓는다"
+
+
+def test_선언값_헬퍼도_명시한_덮어쓰기는_받는다() -> None:
+    """차단 대상은 **환경**이지 호출자의 명시적 인자가 아니다."""
+    assert declared_settings(abstention_tau=0.02).abstention_tau == 0.02

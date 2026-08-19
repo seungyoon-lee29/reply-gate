@@ -31,6 +31,8 @@
 │   └── AGENTS.md                  → 파일별 경계·불변식·테스트 지침
 ├── scripts/
 │   └── AGENTS.md                  → 실행 진입점의 범위와 불변식
+├── tests/
+│   └── AGENTS.md                  → 테스트 네 종류·구조 검사 규율·음성 대조 규칙
 ├── db/                            → 스키마 DDL, 컨테이너 초기화, 주문 픽스처
 ├── data/                          → 정책 문서, 골든셋, 검색 정답 라벨·재작성 질의,
 │                                     L1·L2 판정 픽스처, 승격 기준선 참조
@@ -90,6 +92,7 @@
 | 벡터 검색·임베딩 | `docs/engineering-notes.md` 의 pgvector 캐스트 + **"τ 는 임베딩 모델에 묶인다"** + 대역 수치 주의 |
 | 근거 채택 축·기권 게이트(τ) | `docs/architecture.md` 의 "근거 채택은 축이 둘이다" + `docs/tracking/decisions/0009`·`0012`·`0014` |
 | 회귀 가드·승격 기준선 | `scripts/AGENTS.md` 불변식 16~18 + `src/reply_gate/AGENTS.md` 의 `regression_guard.py` 행 |
+| 테스트·구조 검사 | `tests/AGENTS.md` (음성 대조·검사 대상 유도·`declared_settings()` 규칙) |
 | 비용·토큰·달러 | `docs/tracking/pricing.md` (**기준일을 반드시 함께 인용한다**) + `docs/contracts.md` 의 "토큰 집계 경계" |
 
 ## 문제를 발견했을 때
