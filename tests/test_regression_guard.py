@@ -1140,6 +1140,39 @@ def test_라벨_판이_미상이면_빌려온다() -> None:
     assert "retrieval_labels_version" in comparison.unknown_fields
 
 
+def test_짝이_안_달라졌으면_함께_달라졌다고_적지_않는다(tmp_path: Path) -> None:
+    """없던 사실을 적는 것은 값을 틀리게 적는 것과 같은 자격의 결함이다.
+
+    τ 하나만 달라진 실행에서 문면이 "짝인 임베딩 모델도 함께 달라졌다"를 붙이면, 조건
+    대조 실패 사유를 읽는 사람이 임베딩 모델까지 바뀐 줄로 안다. 양쪽 값이 문장에 실려
+    있지 않은 자리라 대조로도 못 잡는다.
+    """
+    base = dict(_BASE_FINGERPRINT)
+    base["abstention_tau"] = "미배선"
+    other = dict(base)
+    other["abstention_tau"] = "0.06"
+    assert base["embedding_model"] == other["embedding_model"], "짝은 같아야 하는 설정이다"
+    guard = _run_guard(
+        tmp_path,
+        candidate_cases=[_healthy_cases()] * RUN_SET_SIZE,
+        baseline_kwargs={"fingerprint": base},
+        candidate_fingerprint=other,
+    )
+    tau = next(
+        item
+        for item in guard.binding.fingerprint.undeclared_differences
+        if item.field == "abstention_tau"
+    )
+    assert tau.diverged_by_pair is None
+    described = tau.describe()
+    assert "함께 달라졌다" not in described, described
+    assert described == "abstention_tau: 기준선 `미배선` → 이번 `0.06`"
+    # 짝이 어긋나지 않았으므로 짝 자신은 어긋난 항목에 없다.
+    assert [item.field for item in guard.binding.fingerprint.undeclared_differences] == [
+        "abstention_tau"
+    ]
+
+
 def test_짝_때문에_어긋난_항목은_그렇게_적는다(tmp_path: Path) -> None:
     """``abstention_tau: 기준선 `0.42` → 이번 `0.42``` 는 사람이 읽으면 버그로 보인다.
 

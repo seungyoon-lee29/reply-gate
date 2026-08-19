@@ -270,11 +270,17 @@ class ConditionFingerprint:
                 continue
             if self.effective(name) == baseline.effective(name):
                 continue
+            # 짝 이름은 **짝이 실제로 달라졌을 때만** 붙인다. 무조건 붙이면 문면이
+            # "짝인 X 도 함께 달라졌다"로 나가면서 **없던 사실을 적는다** — τ 하나만
+            # 달라진 실행에서 임베딩 모델까지 바뀐 것처럼 읽힌다.
+            partner_differs = partner is not None and self.effective(partner) != baseline.effective(
+                partner
+            )
             difference = FieldDifference(
                 field=name,
                 baseline=theirs,
                 candidate=mine,
-                diverged_by_pair=partner,
+                diverged_by_pair=partner if partner_differs else None,
             )
             is_declared = name in self.declared or (
                 partner is not None and partner in self.declared
