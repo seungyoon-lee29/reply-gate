@@ -29,7 +29,12 @@ _카나리아 = {
 
 
 def test_설정을_repr_해도_자격_증명이_평문으로_실리지_않는다() -> None:
-    settings = Settings(**_카나리아)
+    settings = Settings(
+        openai_api_key=_카나리아["openai_api_key"],
+        anthropic_api_key=_카나리아["anthropic_api_key"],
+        postgres_app_password=_카나리아["postgres_app_password"],
+        postgres_ro_password=_카나리아["postgres_ro_password"],
+    )
     찍힌_것 = repr(settings) + str(settings) + f"{settings}"
     샌_것 = sorted(name for name, value in _카나리아.items() if value in 찍힌_것)
     assert not 샌_것, f"자격 증명이 repr 로 샜다: {', '.join(샌_것)}"
