@@ -142,6 +142,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--rerank-top-n", type=int, default=5, help="리랭크 뒤 최종 채택 순위 상한")
     parser.add_argument(
+        "--no-abstention-grid",
+        action="store_true",
+        help=(
+            "질의 단위 기권 게이트 격자를 돌리지 않는다 (기본은 켜짐, 무과금 — 검색을 다시 "
+            "돌리지 않고 채점만 얹는다). 끄면 리포트에 미실행 사유가 남는다"
+        ),
+    )
+    parser.add_argument(
         "--rerank-model",
         default=None,
         help="실제 모드의 OpenAI 리랭크 모델 (기본: 환경 설정값, 대역 모드에서는 호출하지 않음)",
@@ -198,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
             paid_rerank=paid_rerank,
             rewrite_condition=rewrite_condition,
             strategies=strategies,
+            abstention_grid=not args.no_abstention_grid,
         )
 
     try:

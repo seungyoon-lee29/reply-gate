@@ -7,13 +7,14 @@ import json
 import math
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from statistics import fmean
 from typing import Any, Final, cast
 
+from reply_gate.adoption_axis import ABSTENTION_CASE_IDS, CONFLICT_PAIR_CASE_IDS
 from reply_gate.config import get_settings
 from reply_gate.evaluation import DEFAULT_GOLDEN_SET_PATH, GoldenCase, load_golden_set
 from reply_gate.llm import (
@@ -36,20 +37,27 @@ from reply_gate.retrieval_labels import (
     load_retrieval_labels,
 )
 from reply_gate.retrieval_strategies import (
+    AbstentionGate,
+    AbstentionStatistic,
+    AbstentionVerdict,
     FusedHit,
     RetrievalStage,
     StrategyDefinition,
     VectorHit,
+    abstention_statistic,
+    apply_abstention_gate,
     bm25_rank,
     default_strategy_ladder,
     llm_rerank,
     merge_rewritten_bm25,
     merge_rewritten_rankings,
     reciprocal_rank_fusion,
+    truncate_for_gate,
 )
 from reply_gate.testing import LexicalEmbeddingClient
 
 __all__ = [
+    "DEFAULT_ABSTENTION_TAU_AXES",
     "DEFAULT_EMBEDDING_CACHE_DIR",
     "DEFAULT_EMBEDDING_CANDIDATES",
     "DEFAULT_FUSION_POOL_SIZE",
@@ -59,13 +67,20 @@ __all__ = [
     "DEFAULT_REWRITTEN_QUERIES_PATH",
     "DEFAULT_RRF_CUTOFF",
     "DEFAULT_RRF_K",
+    "AbstentionGrid",
+    "AbstentionGridPoint",
+    "AbstentionGridUnmeasured",
+    "AdoptionConstraint",
+    "AdoptionVerdict",
     "AggregateMetrics",
+    "BoundaryCase",
     "CaseScore",
     "CutoffSweepPoint",
     "EmbeddingAxisResult",
     "EmbeddingAxisRow",
     "EmbeddingCandidate",
     "EmbeddingProvider",
+    "GatedCaseRow",
     "RankedHit",
     "ReportPaths",
     "RerankStats",
@@ -76,6 +91,7 @@ __all__ = [
     "RetrievalScore",
     "RetrievedCase",
     "RewriteCondition",
+    "StatisticSeparation",
     "StrategyComparison",
     "StrategyCutoffs",
     "StrategyEvaluation",
@@ -88,6 +104,7 @@ __all__ = [
     "load_rewritten_queries",
     "retrieve_cases",
     "retrieve_strategy_ladder",
+    "run_abstention_grid",
     "run_embedding_model_axis",
     "run_retrieval_comparison",
     "score_retrieval",
@@ -112,6 +129,33 @@ DEFAULT_NGRAM_SIZE: Final = 2
 DEFAULT_REWRITTEN_QUERIES_PATH: Final = _ROOT / "data" / "rewritten_queries.jsonl"
 DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH: Final = _ROOT / "data" / "rewritten_queries_oracle.jsonl"
 _REWRITTEN_QUERY_ROW_KEYS: Final = frozenset({"id", "original", "rewritten", "note"})
+
+
+def _tau_axis(start: float, stop: float, step: float) -> tuple[float, ...]:
+    """부동소수 누적 오차 없이 τ 눈금을 만든다."""
+    count = round((stop - start) / step) + 1
+    return tuple(round(start + index * step, 10) for index in range(count))
+
+
+#: 기권 게이트 격자의 τ 축 — 통계량마다 값의 스케일이 다르므로 축도 통계량마다 따로 잡는다.
+#:
+#: 범위 끝은 **관측 가능 구간**으로 정한다. τ=0 은 어떤 질의도 기권시키지 않는 대조군(게이트
+#: 꺼짐과 같은 구성)이고, 축의 끝은 그 통계량의 관측 최댓값 위라서 그 위로는 전 케이스가
+#: 기권해 새 정보가 없다. 눈금은 손계산이 찍은 경계(예: 1위-`top_k`위 산포의 G23 0.0521과
+#: G15 0.0668) **양쪽에 점이 놓이도록** 잡았다 — 이긴 τ 만이 아니라 경계가 보여야 한다.
+DEFAULT_ABSTENTION_TAU_AXES: Final[Mapping[AbstentionStatistic, tuple[float, ...]]] = {
+    AbstentionStatistic.SPREAD: _tau_axis(0.00, 0.30, 0.01),
+    AbstentionStatistic.STDEV: _tau_axis(0.00, 0.15, 0.005),
+    AbstentionStatistic.RELATIVE_SPREAD: _tau_axis(0.00, 0.60, 0.02),
+    AbstentionStatistic.GAP_1_2: _tau_axis(0.00, 0.30, 0.01),
+    AbstentionStatistic.TAIL_RATIO: _tau_axis(0.00, 1.00, 0.025),
+}
+
+#: 비악화 판정이 보는 지표. **기준선 recall 이 이미 1.0000 이라 "내려가지 않는다"는 실질적으로
+#: "정답 조항을 하나도 빠뜨리지 마라"** 이고, 등호 통과가 정상 결과다.
+_NON_DEGRADATION_METRICS: Final = ("accepted_precision", "accepted_recall", "recall_at_1")
+#: 부동소수 비교 여유. 같은 값이 계산 순서 때문에 악화로 찍히지 않게 한다.
+_DEGRADATION_EPSILON: Final = 1e-9
 
 
 class RetrievalConfigurationError(ValueError):
@@ -417,7 +461,11 @@ class StrategyLadderRetrieval:
 
 @dataclass(frozen=True)
 class StrategyCaseScore:
-    """전략 검색 결과를 독립 라벨로 채점한 케이스."""
+    """전략 검색 결과를 독립 라벨로 채점한 케이스.
+
+    `abstention` 은 질의 단위 기권 게이트의 판정이다. 게이트를 걸지 않은 채점에서는 None 이고
+    (게이트 없음), 걸었으면 통계량 값·τ·발동 여부가 담긴다.
+    """
 
     case_id: str
     relevant_evidence_ids: frozenset[str]
@@ -428,6 +476,7 @@ class StrategyCaseScore:
     recall_at_5: float | None
     accepted_precision: float | None
     accepted_recall: float | None
+    abstention: AbstentionVerdict | None = None
 
 
 @dataclass(frozen=True)
@@ -441,6 +490,155 @@ class StrategyEvaluation:
     aggregate: AggregateMetrics
     sweep: tuple[CutoffSweepPoint, ...]
     best_cutoff: float | None
+
+
+class AdoptionConstraint(StrEnum):
+    """채택 규칙의 제약 — **선언 순서가 곧 우선순위**다(결정 0012).
+
+    케이스 하한을 어긴 구성은 macro 수치와 무관하게 즉시 탈락한다. 그래서 이 enum 의
+    순서를 바꾸면 채택 규칙이 바뀐다.
+    """
+
+    #: 정답 조항이 비어 있지 않은 케이스가 **정답 조항을** 하나도 채택하지 못했다.
+    #: "근거 0건 금지" 가 아니다 — 오답만 채택한 구성도 여기서 걸린다.
+    CASE_FLOOR = "case_floor"
+    #: 상충 조항이 라벨에 있는 케이스에서 상충쌍이 함께 채택되지 못했다(부분 손실).
+    CONFLICT_PAIR = "conflict_pair"
+    #: 기권 표적이 채택 0건으로 끝나지 못했다. **"줄었다" 는 통과가 아니다.**
+    ABSTENTION_TARGET = "abstention_target"
+    #: precision·recall·r@1 중 하나가 기준선 아래로 내려갔다.
+    NON_DEGRADATION = "non_degradation"
+
+
+class AdoptionVerdict(StrEnum):
+    """구성 하나의 채택 판정."""
+
+    ADOPTABLE = "adoptable"
+    ELIMINATED = "eliminated"
+
+
+@dataclass(frozen=True)
+class BoundaryCase:
+    """τ 경계에 가장 가까운 케이스 하나와 그 여유.
+
+    여유가 얼마나 얇은지가 **라이브 이전 가능성의 유일한 사전 신호**다. 라이브 재작성이
+    점수 분포를 조금만 평평하게 만들면 이 케이스가 먼저 뒤집힌다.
+    """
+
+    case_id: str
+    value: float
+    margin: float
+
+
+@dataclass(frozen=True)
+class GatedCaseRow:
+    """구성 하나에서 케이스 1건이 어떻게 끝났는가.
+
+    `correct_clause_accepted` 가 None 이면 정답 라벨이 빈 케이스라 케이스 하한의 대상이
+    아니라는 뜻이다 — False(정답을 놓쳤다)와 다르다.
+    """
+
+    case_id: str
+    labelled: bool
+    accepted_count: int
+    accepted_evidence_ids: tuple[str, ...]
+    correct_clause_accepted: bool | None
+    conflict_pair_kept: bool | None
+    statistic_value: float | None
+    statistic_undefined_reason: str | None
+    margin_to_tau: float | None
+    gate_fired: bool
+
+
+@dataclass(frozen=True)
+class StatisticSeparation:
+    """통계량 하나가 기권 표적과 하한 대상을 가르는 여유.
+
+    `margin` 이 양수여야 **하나의 τ** 로 두 군을 가를 수 있다. 음수면 어떤 τ 도 한쪽을
+    반드시 틀린다 — 반증이고, 반증도 산출물이다.
+    """
+
+    statistic: AbstentionStatistic
+    abstain_case: str
+    abstain_value: float
+    accept_case: str
+    accept_value: float
+    margin: float
+    tau: float
+    accept_headroom: float
+
+    @property
+    def separates(self) -> bool:
+        return self.margin > 0.0
+
+
+@dataclass(frozen=True)
+class AbstentionGridPoint:
+    """격자의 한 점 — 통계량 하나 x τ 하나(또는 게이트 꺼짐 기준선)."""
+
+    configuration_id: str
+    strategy: str
+    cutoff: float
+    gate: AbstentionGate | None
+    aggregate: AggregateMetrics
+    cases: tuple[GatedCaseRow, ...]
+    case_floor_violations: tuple[str, ...]
+    conflict_pair_kept: Mapping[str, bool]
+    abstention_accepted_counts: Mapping[str, int]
+    degraded_metrics: tuple[str, ...]
+    accept_boundary: BoundaryCase | None
+    abstain_boundary: BoundaryCase | None
+
+    @property
+    def failed_constraints(self) -> tuple[AdoptionConstraint, ...]:
+        """어긴 제약을 **우선순위 순서로** 낸다."""
+        failed: list[AdoptionConstraint] = []
+        if self.case_floor_violations:
+            failed.append(AdoptionConstraint.CASE_FLOOR)
+        if not all(self.conflict_pair_kept.values()):
+            failed.append(AdoptionConstraint.CONFLICT_PAIR)
+        if any(count > 0 for count in self.abstention_accepted_counts.values()):
+            failed.append(AdoptionConstraint.ABSTENTION_TARGET)
+        if self.degraded_metrics:
+            failed.append(AdoptionConstraint.NON_DEGRADATION)
+        return tuple(failed)
+
+    @property
+    def eliminated_by(self) -> AdoptionConstraint | None:
+        failed = self.failed_constraints
+        return failed[0] if failed else None
+
+    @property
+    def verdict(self) -> AdoptionVerdict:
+        return AdoptionVerdict.ELIMINATED if self.failed_constraints else AdoptionVerdict.ADOPTABLE
+
+
+@dataclass(frozen=True)
+class AbstentionGrid:
+    """기권 게이트 격자 1회 — 통계량 5종 x τ 스윕과 그 채점."""
+
+    strategy: str
+    strategy_reason: str
+    cutoff: float
+    top_k: int
+    tau_axes: Mapping[AbstentionStatistic, tuple[float, ...]]
+    baseline: AbstentionGridPoint
+    points: tuple[AbstentionGridPoint, ...]
+    separations: tuple[StatisticSeparation, ...]
+    separation_gaps: Mapping[AbstentionStatistic, str]
+    case_floor_case_ids: tuple[str, ...]
+
+    @property
+    def adoptable(self) -> tuple[AbstentionGridPoint, ...]:
+        """제약 넷을 전부 통과한 구성. 그중 하나를 고르는 것은 실측 태스크의 몫이다."""
+        return tuple(point for point in self.points if point.verdict is AdoptionVerdict.ADOPTABLE)
+
+
+@dataclass(frozen=True)
+class AbstentionGridUnmeasured:
+    """격자를 돌릴 수 없었던 실행. 0 이 아니라 사유를 남긴다."""
+
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -457,6 +655,9 @@ class StrategyComparison:
     strategies: tuple[StrategyEvaluation, ...]
     rerank: RerankStats
     unmeasured_stages: tuple[UnmeasuredStage, ...] = ()
+    abstention_grid: AbstentionGrid | AbstentionGridUnmeasured = AbstentionGridUnmeasured(
+        reason="미실행 — 이 비교는 기권 게이트 격자를 요청하지 않았다"
+    )
 
 
 @dataclass(frozen=True)
@@ -1074,12 +1275,20 @@ def score_retrieval(
 
 
 def _accepted_at(
-    case: StrategyRetrievedCase, *, limit: int, cutoff: float
+    case: StrategyRetrievedCase,
+    *,
+    limit: int,
+    cutoff: float,
+    abstention: AbstentionVerdict | None = None,
 ) -> tuple[RankedHit, ...]:
     """전략 후보에 절대 관련성 게이트와 채택 상한을 적용한다.
 
     코사인이 측정되지 않은 후보(어휘 다리에만 있던 조항)는 게이트를 통과하지 못한다.
+    질의 단위 기권 게이트가 발동했으면 **그 질의의 채택 집합 전체**가 빈다 — 항목별 규칙이
+    아니라 질의 단위 판정이라 1위도 지워진다.
     """
+    if abstention is not None and abstention.abstains:
+        return ()
     return tuple(
         hit
         for hit in case.accept_candidates[:limit]
@@ -1087,16 +1296,33 @@ def _accepted_at(
     )
 
 
+def _abstention_verdict(
+    case: StrategyRetrievedCase, *, limit: int, gate: AbstentionGate | None
+) -> AbstentionVerdict | None:
+    """게이트 입력을 런타임과 같은 자리에서 자른다 — `top_k` 선절단 뒤 임계값이다."""
+    if gate is None:
+        return None
+    scores = truncate_for_gate([hit.similarity for hit in case.accept_candidates], top_k=limit)
+    return apply_abstention_gate(gate, scores)
+
+
 def _score_cases(
     strategy_result: StrategyRetrieval,
     label_by_id: Mapping[str, RetrievalLabel],
     *,
     cutoff: float,
+    gate: AbstentionGate | None = None,
 ) -> tuple[StrategyCaseScore, ...]:
     cases: list[StrategyCaseScore] = []
     for result in strategy_result.cases:
         relevant = label_by_id[result.case_id].relevant_evidence_ids
-        accepted = _accepted_at(result, limit=strategy_result.accept_limit, cutoff=cutoff)
+        abstention = _abstention_verdict(result, limit=strategy_result.accept_limit, gate=gate)
+        accepted = _accepted_at(
+            result,
+            limit=strategy_result.accept_limit,
+            cutoff=cutoff,
+            abstention=abstention,
+        )
         accepted_ids = {hit.evidence_id for hit in accepted}
         if accepted:
             precision = len(accepted_ids & relevant) / len(accepted)
@@ -1116,6 +1342,7 @@ def _score_cases(
                 recall_at_5=_recall_at(result.ranked_hits, relevant, 5),
                 accepted_precision=precision,
                 accepted_recall=accepted_recall,
+                abstention=abstention,
             )
         )
     return tuple(cases)
@@ -1217,6 +1444,277 @@ def _best_sweep_cutoff(sweep: Sequence[CutoffSweepPoint]) -> float | None:
     ).cutoff
 
 
+def _configuration_id(strategy: str, cutoff: float, gate: AbstentionGate | None) -> str:
+    """리포트에서 구성을 이름 하나로 특정한다 — 전략·컷·통계량·τ 를 전부 들고 있다.
+
+    구분자가 `|` 가 아닌 이유는 Markdown 표다. 표 칸 안의 `|` 는 백틱 안에 있어도 칸을
+    쪼개서, 구성 이름 하나가 리포트의 표를 통째로 망가뜨린다(실제로 그랬다).
+    """
+    if gate is None:
+        return f"{strategy}/cut={cutoff:.3f}/gate=off"
+    return f"{strategy}/cut={cutoff:.3f}/stat={gate.statistic.value}/tau={gate.tau:.4f}"
+
+
+def _degraded_metrics(
+    aggregate: AggregateMetrics, baseline: AggregateMetrics | None
+) -> tuple[str, ...]:
+    """기준선 대비 악화된 지표. 값을 **잃은 것**도 악화로 센다 — 0 이 아니라 손실이다."""
+    if baseline is None:
+        return ()
+    degraded: list[str] = []
+    for name in _NON_DEGRADATION_METRICS:
+        before = cast(float | None, getattr(baseline, name))
+        after = cast(float | None, getattr(aggregate, name))
+        if before is None:
+            continue
+        if after is None or after < before - _DEGRADATION_EPSILON:
+            degraded.append(name)
+    return tuple(degraded)
+
+
+def _boundary(
+    rows: Sequence[GatedCaseRow], case_ids: Sequence[str], *, tightest: str
+) -> BoundaryCase | None:
+    """τ 경계에 가장 가까운 케이스. `tightest="min"` 은 채택 쪽, `"max"` 는 기권 쪽이다."""
+    candidates = [
+        row
+        for row in rows
+        if row.case_id in set(case_ids) and row.statistic_value is not None
+        if row.margin_to_tau is not None
+    ]
+    if not candidates:
+        return None
+    chooser = min if tightest == "min" else max
+    row = chooser(candidates, key=lambda item: (cast(float, item.margin_to_tau), item.case_id))
+    return BoundaryCase(
+        case_id=row.case_id,
+        value=cast(float, row.statistic_value),
+        margin=cast(float, row.margin_to_tau),
+    )
+
+
+def _grid_point(
+    strategy_result: StrategyRetrieval,
+    label_by_id: Mapping[str, RetrievalLabel],
+    *,
+    cutoff: float,
+    gate: AbstentionGate | None,
+    baseline: AggregateMetrics | None,
+) -> AbstentionGridPoint:
+    """구성 하나를 채점한다 — macro 수치와 케이스별 행, 그리고 제약 판정."""
+    cases = _score_cases(strategy_result, label_by_id, cutoff=cutoff, gate=gate)
+    rows: list[GatedCaseRow] = []
+    for case in cases:
+        accepted_ids = tuple(hit.evidence_id for hit in case.accepted_hits)
+        relevant = case.relevant_evidence_ids
+        verdict = case.abstention
+        rows.append(
+            GatedCaseRow(
+                case_id=case.case_id,
+                labelled=bool(relevant),
+                accepted_count=len(accepted_ids),
+                accepted_evidence_ids=accepted_ids,
+                # 라벨이 빈 케이스는 하한 대상이 아니다 — None 이고 False 가 아니다.
+                correct_clause_accepted=(bool(set(accepted_ids) & relevant) if relevant else None),
+                conflict_pair_kept=(
+                    relevant <= set(accepted_ids)
+                    if case.case_id in CONFLICT_PAIR_CASE_IDS
+                    else None
+                ),
+                statistic_value=None if verdict is None else verdict.value,
+                statistic_undefined_reason=None if verdict is None else verdict.undefined_reason,
+                margin_to_tau=None if verdict is None else verdict.margin,
+                gate_fired=verdict is not None and verdict.abstains,
+            )
+        )
+
+    aggregate = _aggregate_cases(cases)
+    by_id = {row.case_id: row for row in rows}
+    return AbstentionGridPoint(
+        configuration_id=_configuration_id(strategy_result.strategy.name, cutoff, gate),
+        strategy=strategy_result.strategy.name,
+        cutoff=cutoff,
+        gate=gate,
+        aggregate=aggregate,
+        cases=tuple(rows),
+        case_floor_violations=tuple(
+            row.case_id for row in rows if row.correct_clause_accepted is False
+        ),
+        conflict_pair_kept={
+            case_id: bool(by_id[case_id].conflict_pair_kept) for case_id in CONFLICT_PAIR_CASE_IDS
+        },
+        abstention_accepted_counts={
+            case_id: by_id[case_id].accepted_count for case_id in ABSTENTION_CASE_IDS
+        },
+        degraded_metrics=_degraded_metrics(aggregate, baseline),
+        accept_boundary=_boundary(
+            rows, [row.case_id for row in rows if row.labelled], tightest="min"
+        ),
+        abstain_boundary=_boundary(rows, ABSTENTION_CASE_IDS, tightest="max"),
+    )
+
+
+def _separation(
+    strategy_result: StrategyRetrieval,
+    label_by_id: Mapping[str, RetrievalLabel],
+    statistic: AbstentionStatistic,
+) -> StatisticSeparation | str:
+    """기권 쪽 최댓값과 하한 대상 쪽 최솟값의 간격, 그 중간 τ, 채택 쪽 여유.
+
+    분리 여유는 격자의 눈금과 무관하게 "하나의 τ 로 가를 수 있는가"를 답한다. 가를 수 없는
+    통계량은 반증이고, 반증도 산출물이라 격자에서 빼지 않는다.
+    """
+    values: dict[str, float] = {}
+    for case in strategy_result.cases:
+        scores = truncate_for_gate(
+            [hit.similarity for hit in case.accept_candidates],
+            top_k=strategy_result.accept_limit,
+        )
+        try:
+            values[case.case_id] = abstention_statistic(statistic, scores)
+        except ValueError:
+            continue
+    abstain = {
+        case_id: value for case_id, value in values.items() if case_id in ABSTENTION_CASE_IDS
+    }
+    accept = {
+        case_id: value
+        for case_id, value in values.items()
+        if label_by_id[case_id].relevant_evidence_ids
+    }
+    if not abstain or not accept:
+        return "미산출 — 통계량이 정의되는 케이스가 한쪽 군에 없다"
+
+    abstain_case = max(abstain, key=lambda key: (abstain[key], key))
+    accept_case = min(accept, key=lambda key: (accept[key], key))
+    tau = (abstain[abstain_case] + accept[accept_case]) / 2
+    return StatisticSeparation(
+        statistic=statistic,
+        abstain_case=abstain_case,
+        abstain_value=abstain[abstain_case],
+        accept_case=accept_case,
+        accept_value=accept[accept_case],
+        margin=accept[accept_case] - abstain[abstain_case],
+        tau=tau,
+        accept_headroom=accept[accept_case] - tau,
+    )
+
+
+def _grid_precheck(
+    strategy_result: StrategyRetrieval, label_by_id: Mapping[str, RetrievalLabel]
+) -> str | None:
+    """격자를 돌릴 수 있는 입력인지 먼저 본다. 못 돌리면 0 이 아니라 사유다."""
+    case_ids = {case.case_id for case in strategy_result.cases}
+    unlabelled = sorted(case_ids - set(label_by_id))
+    if unlabelled:
+        return f"미실행 — 라벨이 없는 케이스가 있다: {', '.join(unlabelled)}"
+    missing = sorted((set(ABSTENTION_CASE_IDS) | set(CONFLICT_PAIR_CASE_IDS)) - case_ids)
+    if missing:
+        return f"미실행 — 표적 케이스가 이 실행에 없다: {', '.join(missing)}"
+    # 기권이 정답인 케이스에 정답 라벨이 있으면 방향 1 과 2 가 서로를 부순다.
+    contradictory = sorted(
+        case_id for case_id in ABSTENTION_CASE_IDS if label_by_id[case_id].relevant_evidence_ids
+    )
+    if contradictory:
+        return (
+            f"대조 불가 — 기권 표적 {', '.join(contradictory)} 에 정답 라벨이 있다: "
+            "케이스 하한과 기권 요구가 동시에 성립할 수 없다"
+        )
+    thin = sorted(
+        case_id
+        for case_id in CONFLICT_PAIR_CASE_IDS
+        if len(label_by_id[case_id].relevant_evidence_ids) < 2
+    )
+    if thin:
+        return f"대조 불가 — 상충쌍 케이스 {', '.join(thin)} 의 라벨이 쌍을 이루지 않는다"
+    return None
+
+
+def run_abstention_grid(
+    retrieved: StrategyRetrieval,
+    labels: Sequence[RetrievalLabel],
+    *,
+    cutoff: float,
+    tau_axes: Mapping[AbstentionStatistic, Sequence[float]] = DEFAULT_ABSTENTION_TAU_AXES,
+) -> AbstentionGrid | AbstentionGridUnmeasured:
+    """질의 단위 기권 게이트를 통계량 5종 x τ 스윕으로 돌리고 채택 규칙으로 채점한다.
+
+    **채점자는 라벨을 본다 — 전략이 못 볼 뿐이다.** 게이트 자체(`retrieval_strategies`)는
+    점수만 받고, 정답 대조는 검색이 끝난 뒤 여기서만 일어난다.
+
+    절대 하한(`cutoff`)은 그대로 두고 그 위에 질의 단위 판정을 얹는다. 기준선은 **같은
+    실행의 컷 + 게이트 꺼짐**이고, 비악화는 그 기준선과 대조한다.
+    """
+    if not 0.0 <= cutoff <= 1.0:
+        raise ValueError("cutoff는 0.0 이상 1.0 이하여야 한다")
+    label_by_id = {label.id: label for label in labels}
+    reason = _grid_precheck(retrieved, label_by_id)
+    if reason is not None:
+        return AbstentionGridUnmeasured(reason=reason)
+
+    baseline = _grid_point(retrieved, label_by_id, cutoff=cutoff, gate=None, baseline=None)
+    points: list[AbstentionGridPoint] = []
+    for statistic, axis in tau_axes.items():
+        for tau in axis:
+            points.append(
+                _grid_point(
+                    retrieved,
+                    label_by_id,
+                    cutoff=cutoff,
+                    gate=AbstentionGate(statistic=statistic, tau=tau),
+                    baseline=baseline.aggregate,
+                )
+            )
+
+    separations: list[StatisticSeparation] = []
+    gaps: dict[AbstentionStatistic, str] = {}
+    for statistic in tau_axes:
+        outcome = _separation(retrieved, label_by_id, statistic)
+        if isinstance(outcome, StatisticSeparation):
+            separations.append(outcome)
+        else:
+            gaps[statistic] = outcome
+
+    return AbstentionGrid(
+        strategy=retrieved.strategy.name,
+        strategy_reason="호출자가 지정한 전략 행",
+        cutoff=cutoff,
+        top_k=retrieved.accept_limit,
+        tau_axes={statistic: tuple(axis) for statistic, axis in tau_axes.items()},
+        baseline=baseline,
+        points=tuple(points),
+        separations=tuple(separations),
+        separation_gaps=gaps,
+        case_floor_case_ids=tuple(
+            sorted(
+                case.case_id
+                for case in retrieved.cases
+                if label_by_id[case.case_id].relevant_evidence_ids
+            )
+        ),
+    )
+
+
+#: 격자는 **런타임이 실제로 쓰는 조합**에서 돈다. 재작성 켜짐 벡터 검색이 현 기본값이다.
+_GRID_STRATEGY_PREFERENCE: Final = "vector_rewrite"
+
+
+def _grid_target(
+    retrieved: Sequence[StrategyRetrieval],
+) -> tuple[StrategyRetrieval | None, str]:
+    by_name = {result.strategy.name: result for result in retrieved}
+    if _GRID_STRATEGY_PREFERENCE in by_name:
+        return by_name[_GRID_STRATEGY_PREFERENCE], "런타임 기본 조합(벡터 + 재작성)과 같은 행"
+    if len(retrieved) == 1:
+        return retrieved[0], "이 실행의 전략 행이 하나다"
+    if not retrieved:
+        return None, "미실행 — 전략 행이 없다"
+    return (
+        retrieved[0],
+        f"미실행 대신 첫 행 — {_GRID_STRATEGY_PREFERENCE} 행이 이 실행에 없다",
+    )
+
+
 def evaluate_strategy_ladder(
     *,
     documents: Sequence[PolicyDocument],
@@ -1236,8 +1734,16 @@ def evaluate_strategy_ladder(
     ngram_size: int = 2,
     strategies: Sequence[StrategyDefinition] = default_strategy_ladder(),
     unmeasured_stages: Sequence[UnmeasuredStage] = (),
+    abstention_grid: bool = True,
+    abstention_tau_axes: Mapping[
+        AbstentionStatistic, Sequence[float]
+    ] = DEFAULT_ABSTENTION_TAU_AXES,
 ) -> StrategyComparison:
-    """정책·문의에 네 전략을 적용한 뒤에만 라벨로 채점한다."""
+    """정책·문의에 네 전략을 적용한 뒤에만 라벨로 채점한다.
+
+    기권 게이트 격자는 검색을 다시 돌리지 않는다 — 임베딩·리랭크는 이미 끝났고 질의 단위
+    판정만 얹힌다. 그래서 격자는 추가 과금이 없다.
+    """
     queries = tuple(RetrievalQuery(case_id=case.id, text=case.content) for case in cases)
     policy_texts = tuple(
         (chunk.evidence_id, chunk.embedding_text)
@@ -1268,6 +1774,29 @@ def evaluate_strategy_ladder(
     else:
         resolved_condition = RewriteCondition.NOT_USED
         resolved_source = "not_used"
+
+    grid: AbstentionGrid | AbstentionGridUnmeasured
+    if not abstention_grid:
+        grid = AbstentionGridUnmeasured(
+            reason="미실행 — 이 실행이 기권 게이트 격자를 요청하지 않았다"
+        )
+    else:
+        target, target_reason = _grid_target(retrieved.retrievals)
+        if target is None:
+            grid = AbstentionGridUnmeasured(reason=target_reason)
+        else:
+            outcome = run_abstention_grid(
+                target,
+                labels,
+                cutoff=cutoffs.cosine_similarity,
+                tau_axes=abstention_tau_axes,
+            )
+            grid = (
+                outcome
+                if isinstance(outcome, AbstentionGridUnmeasured)
+                else replace(outcome, strategy_reason=target_reason)
+            )
+
     return StrategyComparison(
         embedding_config=embedding_config,
         cutoffs=cutoffs,
@@ -1284,6 +1813,7 @@ def evaluate_strategy_ladder(
         ),
         rerank=retrieved.rerank,
         unmeasured_stages=tuple(unmeasured_stages),
+        abstention_grid=grid,
     )
 
 
@@ -1591,6 +2121,93 @@ def _strategy_hit_json(hit: RankedHit) -> dict[str, object]:
     }
 
 
+def _boundary_json(boundary: BoundaryCase | None) -> dict[str, object] | None:
+    if boundary is None:
+        return None
+    return {"case": boundary.case_id, "value": boundary.value, "margin": boundary.margin}
+
+
+def _grid_point_json(point: AbstentionGridPoint) -> dict[str, object]:
+    return {
+        "configuration_id": point.configuration_id,
+        "strategy": point.strategy,
+        "cutoff": point.cutoff,
+        "statistic": None if point.gate is None else point.gate.statistic.value,
+        "tau": None if point.gate is None else point.gate.tau,
+        "aggregate": _metrics_json(point.aggregate),
+        "verdict": point.verdict.value,
+        "failed_constraints": [item.value for item in point.failed_constraints],
+        "eliminated_by": None if point.eliminated_by is None else point.eliminated_by.value,
+        "case_floor_violations": list(point.case_floor_violations),
+        "conflict_pair_kept": dict(point.conflict_pair_kept),
+        "abstention_accepted_counts": dict(point.abstention_accepted_counts),
+        "degraded_metrics": list(point.degraded_metrics),
+        "accept_boundary": _boundary_json(point.accept_boundary),
+        "abstain_boundary": _boundary_json(point.abstain_boundary),
+        "cases": [
+            {
+                "id": row.case_id,
+                "labelled": row.labelled,
+                "accepted_count": row.accepted_count,
+                "correct_clause_accepted": row.correct_clause_accepted,
+                "conflict_pair_kept": row.conflict_pair_kept,
+                "statistic_value": row.statistic_value,
+                "statistic_undefined_reason": row.statistic_undefined_reason,
+                "margin_to_tau": row.margin_to_tau,
+                "gate_fired": row.gate_fired,
+            }
+            for row in point.cases
+        ],
+    }
+
+
+def _abstention_grid_json(
+    grid: AbstentionGrid | AbstentionGridUnmeasured,
+) -> dict[str, object]:
+    if isinstance(grid, AbstentionGridUnmeasured):
+        return {"measured": False, "reason": grid.reason}
+    return {
+        "measured": True,
+        "strategy": grid.strategy,
+        "strategy_reason": grid.strategy_reason,
+        "cutoff": grid.cutoff,
+        "top_k": grid.top_k,
+        "truncate_before_threshold": True,
+        "labels_used_for": "scoring_only",
+        "constraint_order": [item.value for item in AdoptionConstraint],
+        "baseline_note": "같은 컷 · 게이트 꺼짐. 비악화는 이 기준선과 대조한다",
+        "accepted_ids_note": (
+            "케이스 행은 채택 건수만 싣는다 — 게이트는 채택 집합을 **통째로** 비우므로 "
+            "어느 구성의 채택 집합이든 `strategies[].cases[].accepted_hits` 이거나 빈 집합이고, "
+            "둘 중 어느 쪽인지는 `gate_fired` 가 말한다"
+        ),
+        "case_floor_case_ids": list(grid.case_floor_case_ids),
+        "abstention_target_case_ids": list(ABSTENTION_CASE_IDS),
+        "conflict_pair_case_ids": list(CONFLICT_PAIR_CASE_IDS),
+        "tau_axes": {statistic.value: list(axis) for statistic, axis in grid.tau_axes.items()},
+        "separations": [
+            {
+                "statistic": item.statistic.value,
+                "abstain_case": item.abstain_case,
+                "abstain_value": item.abstain_value,
+                "accept_case": item.accept_case,
+                "accept_value": item.accept_value,
+                "margin": item.margin,
+                "tau": item.tau,
+                "accept_headroom": item.accept_headroom,
+                "separates": item.separates,
+            }
+            for item in grid.separations
+        ],
+        "separation_gaps": {
+            statistic.value: reason for statistic, reason in grid.separation_gaps.items()
+        },
+        "adoptable": [point.configuration_id for point in grid.adoptable],
+        "baseline": _grid_point_json(grid.baseline),
+        "configurations": [_grid_point_json(point) for point in grid.points],
+    }
+
+
 def _strategy_json_report(comparison: StrategyComparison) -> dict[str, object]:
     config = comparison.embedding_config
     warning = (
@@ -1638,6 +2255,7 @@ def _strategy_json_report(comparison: StrategyComparison) -> dict[str, object]:
         "unmeasured_stages": [
             {"stage": item.stage, "reason": item.reason} for item in comparison.unmeasured_stages
         ],
+        "abstention_grid": _abstention_grid_json(comparison.abstention_grid),
         "best_cutoff_selection": "macro F1 최대, 동률이면 precision, recall, 높은 cutoff 순",
         "strategies": [
             {
@@ -1684,6 +2302,128 @@ def _strategy_json_report(comparison: StrategyComparison) -> dict[str, object]:
             for result in comparison.strategies
         ],
     }
+
+
+def _boundary_text(boundary: BoundaryCase | None, *, gated: bool) -> str:
+    """경계 표기. 게이트가 없으면 τ 도 없으므로 "미산출"이 아니라 해당 없음이다."""
+    if not gated:
+        return "—"
+    if boundary is None:
+        return "미산출 — 통계량이 정의된 케이스가 없다"
+    return f"{boundary.case_id} {boundary.value:.4f} ({boundary.margin:+.4f})"
+
+
+def _abstention_grid_markdown(grid: AbstentionGrid | AbstentionGridUnmeasured) -> list[str]:
+    """사람이 읽는 격자 절. 구성별 macro 와 케이스 단위 판정, 그리고 경계 여유를 함께 싣는다."""
+    lines = ["## 기권 게이트 격자", ""]
+    if isinstance(grid, AbstentionGridUnmeasured):
+        return [*lines, f"**{grid.reason}**", ""]
+
+    lines.extend(
+        [
+            f"대상 전략 `{grid.strategy}` — {grid.strategy_reason}. "
+            f"절대 하한 {grid.cutoff:.2f} 는 그대로 두고 그 위에 **질의 단위** 판정을 얹는다.",
+            f"통계량은 런타임과 같은 자리에서 자른 **상위 {grid.top_k}건**만 본다 "
+            "(SQL `LIMIT top_k` → 임계값 순서). 판정 방향은 다섯 모두 같다: "
+            "**통계량 < τ 이면 그 질의는 채택 0건.**",
+            "",
+            "채점 순서는 "
+            "① 케이스 하한(정답 조항 채택) → ② 상충쌍 보존 → ③ 기권(채택 0건) → ④ 비악화다. "
+            "①을 어기면 macro 수치와 무관하게 즉시 탈락한다.",
+            f"케이스 하한 대상 {len(grid.case_floor_case_ids)}건 · "
+            f"기권 표적 {', '.join(ABSTENTION_CASE_IDS)} · "
+            f"상충쌍 {', '.join(CONFLICT_PAIR_CASE_IDS)}.",
+            "",
+            "### 통계량별 분리 여유",
+            "",
+            "기권 표적 쪽 최댓값과 하한 대상 쪽 최솟값의 간격이 여유다. 음수 여유는 **어떤 τ 도**"
+            " 한쪽을 반드시 틀린다는 뜻이고, 그 통계량은 반증된 것이다 — 격자에서 빼지 않는다.",
+            "",
+            "| 통계량 | 기권 쪽 최대 | 하한 쪽 최소 | 여유 | τ(중간) | 채택 여유 | 분리 |",
+            "|---|---|---|---:|---:|---:|---|",
+        ]
+    )
+    for item in grid.separations:
+        lines.append(
+            f"| `{item.statistic.value}` | {item.abstain_case} {item.abstain_value:.4f} "
+            f"| {item.accept_case} {item.accept_value:.4f} | {item.margin:+.4f} "
+            f"| {item.tau:.4f} | {item.accept_headroom:+.4f} "
+            f"| {'분리' if item.separates else '**반증**'} |"
+        )
+    for statistic, reason in grid.separation_gaps.items():
+        lines.append(f"| `{statistic.value}` | — | — | — | — | — | {reason} |")
+
+    adoptable = grid.adoptable
+    lines.extend(
+        [
+            "",
+            "### 채택 후보",
+            "",
+            (
+                "**없음 — 제약 넷을 동시에 만족하는 구성이 이 격자에 없다.**"
+                if not adoptable
+                else "제약 넷을 전부 통과한 구성이다. 최종 선택(동률 규칙)은 실측 태스크의 몫이다."
+            ),
+            "",
+        ]
+    )
+    if adoptable:
+        lines.extend(
+            [
+                "| 구성 | 통계량 | τ | precision | recall | r@1 | 채택 쪽 경계 | 기권 쪽 경계 |",
+                "|---|---|---:|---:|---:|---:|---|---|",
+            ]
+        )
+        for point in adoptable:
+            gate = point.gate
+            assert gate is not None
+            lines.append(
+                f"| `{point.configuration_id}` | `{gate.statistic.value}` | {gate.tau:.4f} "
+                f"| {_number(point.aggregate.accepted_precision)} "
+                f"| {_number(point.aggregate.accepted_recall)} "
+                f"| {_number(point.aggregate.recall_at_1)} "
+                f"| {_boundary_text(point.accept_boundary, gated=True)} "
+                f"| {_boundary_text(point.abstain_boundary, gated=True)} |"
+            )
+        lines.append("")
+
+    lines.extend(
+        [
+            "### 구성별 결과",
+            "",
+            "`하한 위반`은 정답 조항을 하나도 채택하지 못한 케이스다. `기권 채택`은 기권 표적 "
+            "넷이 채택한 조항 수의 합이고 **0 이어야 통과**다(줄어든 것은 통과가 아니다). "
+            "`채택 쪽 경계`가 τ 에 가장 아슬아슬한 하한 대상 케이스이며, 그 여유가 라이브 이전 "
+            "가능성의 유일한 사전 신호다.",
+            "",
+            "| 구성 | 통계량 | τ | precision | recall | r@1 | 하한 위반 | 상충쌍 | 기권 채택 "
+            "| 악화 | 채택 쪽 경계 | 기권 쪽 경계 | 판정 |",
+            "|---|---|---:|---:|---:|---:|---|---|---:|---|---|---|---|",
+        ]
+    )
+    for point in (grid.baseline, *grid.points):
+        gate = point.gate
+        pairs = ", ".join(
+            f"{case_id}{'○' if kept else '✗'}" for case_id, kept in point.conflict_pair_kept.items()
+        )
+        lines.append(
+            f"| `{point.configuration_id}` "
+            f"| {'게이트 꺼짐' if gate is None else f'`{gate.statistic.value}`'} "
+            f"| {'—' if gate is None else f'{gate.tau:.4f}'} "
+            f"| {_number(point.aggregate.accepted_precision)} "
+            f"| {_number(point.aggregate.accepted_recall)} "
+            f"| {_number(point.aggregate.recall_at_1)} "
+            f"| {', '.join(point.case_floor_violations) or '없음'} "
+            f"| {pairs} "
+            f"| {sum(point.abstention_accepted_counts.values())} "
+            f"| {', '.join(point.degraded_metrics) or '없음'} "
+            f"| {_boundary_text(point.accept_boundary, gated=gate is not None)} "
+            f"| {_boundary_text(point.abstain_boundary, gated=gate is not None)} "
+            f"| {point.verdict.value}"
+            f"{'' if point.eliminated_by is None else f'({point.eliminated_by.value})'} |"
+        )
+    lines.append("")
+    return lines
 
 
 def _strategy_markdown_report(comparison: StrategyComparison) -> str:
@@ -1823,6 +2563,7 @@ def _strategy_markdown_report(comparison: StrategyComparison) -> str:
                 f"{point.precision_case_count} | {point.recall_case_count} |"
             )
         lines.append("")
+    lines.extend(_abstention_grid_markdown(comparison.abstention_grid))
     lines.extend(["## 케이스별 결과", ""])
     for result in comparison.strategies:
         lines.extend(
@@ -2059,6 +2800,7 @@ def run_retrieval_comparison(
     rerank_model: str | None = None,
     paid_rerank: bool | None = None,
     strategies: Sequence[StrategyDefinition] = default_strategy_ladder(),
+    abstention_grid: bool = True,
 ) -> ReportPaths:
     """CLI가 호출하는 전체 오프라인 사다리. 실제 모드만 외부 호출을 과금한다.
 
@@ -2215,5 +2957,6 @@ def run_retrieval_comparison(
         ngram_size=ngram_size,
         strategies=strategy_tuple,
         unmeasured_stages=unmeasured,
+        abstention_grid=abstention_grid,
     )
     return write_strategy_report(comparison, output_dir=output_dir)

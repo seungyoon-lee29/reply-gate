@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import re
+import statistics
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -20,18 +21,24 @@ from typing import Final, cast
 from reply_gate.llm import GenerationClient
 
 __all__ = [
+    "AbstentionGate",
+    "AbstentionStatistic",
+    "AbstentionVerdict",
     "Bm25Hit",
     "FusedHit",
     "RerankOutcome",
     "RetrievalStage",
     "StrategyDefinition",
     "VectorHit",
+    "abstention_statistic",
+    "apply_abstention_gate",
     "bm25_rank",
     "default_strategy_ladder",
     "llm_rerank",
     "merge_rewritten_bm25",
     "merge_rewritten_rankings",
     "reciprocal_rank_fusion",
+    "truncate_for_gate",
 ]
 
 _BM25_K1 = 1.2
@@ -77,6 +84,127 @@ def default_strategy_ladder() -> tuple[StrategyDefinition, ...]:
         StrategyDefinition("vector_rewrite", _STAGE_ORDER[:2]),
         StrategyDefinition("vector_rewrite_hybrid", _STAGE_ORDER[:3]),
         StrategyDefinition("vector_rewrite_hybrid_rerank", _STAGE_ORDER),
+    )
+
+
+class AbstentionStatistic(StrEnum):
+    """질의 단위 기권 게이트가 보는 상위 `top_k` 점수 분포 통계량 5종.
+
+    **판정 방향은 다섯 모두 같다 — 값이 τ 미만이면 그 질의는 채택 0건으로 끝낸다.**
+    통계량마다 방향을 뒤집으면 "분리했다"가 사후 선택이 되므로 한 방향으로 고정한다.
+    다섯 중 셋만 기권군과 채택군을 갈랐지만(결정 0012) 나머지 둘도 남긴다 — 반증도
+    산출물이다.
+    """
+
+    #: 1위 - `top_k` 위 산포.
+    SPREAD = "rank1_minus_rank_k_spread"
+    #: 상위 `top_k` 점수의 모표준편차.
+    STDEV = "top_k_stdev"
+    #: 1위 대비 산포 비 — (1위 - `top_k` 위) / 1위.
+    RELATIVE_SPREAD = "spread_over_rank1"
+    #: 1위 - 2위 gap.
+    GAP_1_2 = "rank1_minus_rank2_gap"
+    #: `top_k` 위 / 1위 비.
+    TAIL_RATIO = "rank_k_over_rank1_ratio"
+
+
+@dataclass(frozen=True)
+class AbstentionGate:
+    """기권 게이트 한 구성 — 통계량 하나와 임계값 τ 하나.
+
+    **설정값이지 데이터가 아니다.** 적재물도 캐시도 만들지 않으며, 코퍼스나 임베딩 모델이
+    바뀌면 τ 는 자동으로 따라가지 않는다(재산출은 명시적 작업이다).
+    """
+
+    statistic: AbstentionStatistic
+    tau: float
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.tau):
+            raise ValueError("기권 게이트 τ 는 유한한 실수여야 한다")
+
+
+@dataclass(frozen=True)
+class AbstentionVerdict:
+    """게이트 판정 1건. 통계량이 정의되지 않으면 값 대신 **사유**를 들고 온다.
+
+    미정의를 0 으로 채우면 모든 양수 τ 에서 기권이 되어 리포트가 거짓말을 한다. 그래서
+    미정의는 "발동하지 않음 + 사유"이고, 그 자리에 절대 하한만 남는다(폴백이지 인계가
+    아니다).
+    """
+
+    statistic: AbstentionStatistic
+    tau: float
+    value: float | None
+    undefined_reason: str | None
+    abstains: bool
+
+    @property
+    def margin(self) -> float | None:
+        """τ 까지의 여유. 양수면 채택 쪽, 음수면 기권 쪽으로 그만큼 떨어져 있다."""
+        return None if self.value is None else self.value - self.tau
+
+
+def truncate_for_gate(similarities: Sequence[float | None], *, top_k: int) -> tuple[float, ...]:
+    """임계값 **전에** `top_k` 로 자르고, 측정된 코사인만 남긴다.
+
+    런타임은 SQL `LIMIT top_k` 로 후보를 자른 뒤 파이썬이 임계값을 건다. 통계량을 전체
+    코퍼스 랭킹으로 계산하면 오프라인 격자와 라이브가 다른 수를 낸다 — 이 절단은 조정
+    가능한 인자가 아니라 **행동 계약**이다.
+
+    코사인이 측정되지 않은 후보(어휘 다리에만 있던 조항)는 빠진다. 0.0 으로 바꾸면
+    "유사도 0"과 구분되지 않는다.
+    """
+    if top_k <= 0:
+        raise ValueError("top_k는 1 이상이어야 한다")
+    return tuple(score for score in similarities[:top_k] if score is not None)
+
+
+def abstention_statistic(statistic: AbstentionStatistic, scores: Sequence[float]) -> float:
+    """`top_k` 로 자른 점수열에서 통계량 하나를 계산한다.
+
+    입력은 점수뿐이다 — 정답도 케이스 정체성도 받지 않는다.
+    """
+    if len(scores) < 2:
+        raise ValueError("통계량은 측정된 상위 2건 이상이 있어야 정의된다")
+    if scores[0] <= 0.0:
+        raise ValueError("1위 코사인이 0 이하면 비 기반 통계량이 정의되지 않는다")
+    first, last = scores[0], scores[-1]
+    match statistic:
+        case AbstentionStatistic.SPREAD:
+            return first - last
+        case AbstentionStatistic.STDEV:
+            return statistics.pstdev(scores)
+        case AbstentionStatistic.RELATIVE_SPREAD:
+            return (first - last) / first
+        case AbstentionStatistic.GAP_1_2:
+            return first - scores[1]
+        case AbstentionStatistic.TAIL_RATIO:
+            return last / first
+
+
+def apply_abstention_gate(gate: AbstentionGate, scores: Sequence[float]) -> AbstentionVerdict:
+    """상위 `top_k` 점수열 하나에 게이트를 건다 — 결정론이고 LLM 호출이 없다.
+
+    점수는 건드리지 않는다. 게이트가 발동하면 **그 질의의 채택 집합 전체**가 비고, 항목별
+    채택은 여전히 절대 하한이 자른다(결정 0009 의 절대 축 원칙 그대로).
+    """
+    try:
+        value = abstention_statistic(gate.statistic, scores)
+    except ValueError as exc:
+        return AbstentionVerdict(
+            statistic=gate.statistic,
+            tau=gate.tau,
+            value=None,
+            undefined_reason=str(exc),
+            abstains=False,
+        )
+    return AbstentionVerdict(
+        statistic=gate.statistic,
+        tau=gate.tau,
+        value=value,
+        undefined_reason=None,
+        abstains=value < gate.tau,
     )
 
 
