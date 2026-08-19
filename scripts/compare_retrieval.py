@@ -19,6 +19,7 @@ from reply_gate.evaluation import DEFAULT_GOLDEN_SET_PATH
 from reply_gate.llm import BgeM3EmbeddingClient, OptionalEmbeddingDependencyError
 from reply_gate.policy_index import DEFAULT_POLICY_DIR
 from reply_gate.retrieval_eval import (
+    DEFAULT_CHUNK_MIN_CONTAINMENT,
     DEFAULT_EMBEDDING_CACHE_DIR,
     DEFAULT_FUSION_POOL_SIZE,
     DEFAULT_NGRAM_SIZE,
@@ -30,6 +31,7 @@ from reply_gate.retrieval_eval import (
     ReportPaths,
     RetrievalConfigurationError,
     RewriteCondition,
+    run_chunking_comparison,
     run_embedding_model_axis,
     run_retrieval_comparison,
 )
@@ -150,6 +152,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--chunking-grid",
+        action="store_true",
+        help=(
+            "조항 단위 vs 고정 크기 청킹 비교 격자를 돌린다 (**측정 전용** — 제품에 아무것도 "
+            "반영하지 않는다). 다른 전략 축과 함께 쓸 수 없다. --live 면 고정 크기 청크는 "
+            "캐시에 없는 새 텍스트라 **과금**된다"
+        ),
+    )
+    parser.add_argument(
+        "--min-containment",
+        type=float,
+        default=DEFAULT_CHUNK_MIN_CONTAINMENT,
+        help=(
+            "청크가 조항을 적중했다고 셀 최소 본문 포함 비율 (0 초과 1 이하). "
+            "리포트가 선언값과 민감도를 함께 인쇄한다"
+        ),
+    )
+    parser.add_argument(
         "--rerank-model",
         default=None,
         help="실제 모드의 OpenAI 리랭크 모델 (기본: 환경 설정값, 대역 모드에서는 호출하지 않음)",
@@ -159,6 +179,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.chunking_grid:
+        return _run_chunking(args)
     if args.embedding_axis and not args.live:
         print(
             "검색 비교 실행 실패: --embedding-axis 는 실제 모델을 호출하므로 --live 가 필요하다",
@@ -241,6 +263,48 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     print(f"검색 비교 완료: {paths.markdown}")
     print(f"검색 비교 JSON: {paths.json}")
+    return 0
+
+
+def _run_chunking(args: argparse.Namespace) -> int:
+    """청킹 축은 다른 축과 섞이지 않는다 — 변수는 청킹 하나뿐이어야 비교가 성립한다."""
+    conflicting = [
+        name
+        for name, chosen in (
+            ("--bge-m3", args.bge_m3),
+            ("--embedding-axis", args.embedding_axis),
+            ("--vector-only", args.vector_only),
+            ("--oracle-rewrite", args.oracle_rewrite),
+            ("--rerank-with-openai", args.rerank_with_openai),
+        )
+        if chosen
+    ]
+    if conflicting:
+        print(
+            "검색 비교 실행 실패: --chunking-grid 는 "
+            f"{' · '.join(conflicting)} 와 함께 쓸 수 없다 (청킹만이 변수여야 한다)",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        paths = run_chunking_comparison(
+            live=bool(args.live),
+            embedding_model=args.embedding_model if args.live else None,
+            dimensions=args.dimensions,
+            top_k=args.top_k,
+            cutoff=args.cutoff,
+            min_containment=args.min_containment,
+            policy_dir=args.policy_dir,
+            golden_set_path=args.golden_set,
+            labels_path=args.labels,
+            output_dir=args.out_dir,
+            cache_dir=args.cache_dir,
+        )
+    except (RetrievalConfigurationError, FileNotFoundError, ValueError) as exc:
+        print(f"청킹 비교 실행 실패: {exc}", file=sys.stderr)
+        return 2
+    print(f"청킹 비교 완료: {paths.markdown}")
+    print(f"청킹 비교 JSON: {paths.json}")
     return 0
 
 

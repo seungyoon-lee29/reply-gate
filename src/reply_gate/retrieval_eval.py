@@ -10,6 +10,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import StrEnum
+from itertools import pairwise
 from pathlib import Path
 from statistics import fmean
 from typing import Any, Final, cast
@@ -57,7 +58,13 @@ from reply_gate.retrieval_strategies import (
 from reply_gate.testing import LexicalEmbeddingClient
 
 __all__ = [
+    "CHUNKING_DISPOSITION",
+    "CHUNKING_QUERY_BLIND_REWRITE",
+    "CHUNKING_QUERY_ORIGINAL",
     "DEFAULT_ABSTENTION_TAU_AXES",
+    "DEFAULT_CHUNKING_STRATEGIES",
+    "DEFAULT_CHUNK_MIN_CONTAINMENT",
+    "DEFAULT_CONTAINMENT_SWEEP",
     "DEFAULT_EMBEDDING_CACHE_DIR",
     "DEFAULT_EMBEDDING_CANDIDATES",
     "DEFAULT_FUSION_POOL_SIZE",
@@ -70,17 +77,33 @@ __all__ = [
     "AbstentionGrid",
     "AbstentionGridPoint",
     "AbstentionGridUnmeasured",
+    "AdjacencyCoverage",
     "AdoptionConstraint",
     "AdoptionVerdict",
     "AggregateMetrics",
     "BoundaryCase",
     "CaseScore",
+    "ChunkingAggregate",
+    "ChunkingCaseScore",
+    "ChunkingCorpusStat",
+    "ChunkingEmbeddingCost",
+    "ChunkingGrid",
+    "ChunkingKind",
+    "ChunkingRow",
+    "ChunkingScore",
+    "ChunkingStrategy",
+    "ChunkingSweepPoint",
+    "ClauseSpan",
+    "CorpusUnit",
     "CutoffSweepPoint",
     "EmbeddingAxisResult",
     "EmbeddingAxisRow",
+    "EmbeddingCacheStats",
     "EmbeddingCandidate",
     "EmbeddingProvider",
     "GatedCaseRow",
+    "MultiClauseCase",
+    "PolicySource",
     "RankedHit",
     "ReportPaths",
     "RerankStats",
@@ -99,16 +122,23 @@ __all__ = [
     "StrategyRetrieval",
     "StrategyRetrievedCase",
     "UnmeasuredStage",
+    "build_policy_sources",
+    "chunk_policy_sources",
     "evaluate_retrieval",
     "evaluate_strategy_ladder",
     "load_rewritten_queries",
+    "map_units_to_clauses",
     "retrieve_cases",
     "retrieve_strategy_ladder",
     "run_abstention_grid",
+    "run_chunking_comparison",
+    "run_chunking_grid",
     "run_embedding_model_axis",
     "run_retrieval_comparison",
+    "score_chunking",
     "score_retrieval",
     "score_strategy_ladder",
+    "write_chunking_report",
     "write_report",
     "write_strategy_report",
 ]
@@ -798,6 +828,16 @@ def _write_cached_vector(
     temporary.replace(path)
 
 
+@dataclass
+class EmbeddingCacheStats:
+    """임베딩 캐시 적중·구매 집계. 과금 보고가 추정이 아니라 관측이 되게 한다."""
+
+    cache_hits: int = 0
+    cache_misses: int = 0
+    embedded_texts: int = 0
+    total_tokens: int = 0
+
+
 def _embed_with_cache(
     *,
     texts: Sequence[str],
@@ -805,6 +845,7 @@ def _embed_with_cache(
     embedder: EmbeddingClient,
     config: RetrievalEvalConfig,
     cache_dir: Path,
+    stats: EmbeddingCacheStats | None = None,
 ) -> list[list[float]]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     vectors: list[list[float] | None] = [None] * len(texts)
@@ -826,13 +867,20 @@ def _embed_with_cache(
         )
         if cached is not None:
             vectors[index] = cached
+            if stats is not None:
+                stats.cache_hits += 1
             continue
+        if stats is not None and target_text not in misses:
+            stats.cache_misses += 1
         misses.setdefault(target_text, []).append(index)
         paths[target_text] = path
 
     if misses:
         missing_texts = list(misses)
         embedded = embedder.embed(stage=stage, texts=missing_texts)
+        if stats is not None:
+            stats.embedded_texts += len(missing_texts)
+            stats.total_tokens += embedded.total_tokens
         if len(embedded.vectors) != len(missing_texts):
             raise ValueError(
                 "임베딩 개수가 대상 텍스트 수와 다르다: "
@@ -874,8 +922,13 @@ def retrieve_cases(
     embedder: EmbeddingClient,
     config: RetrievalEvalConfig,
     cache_dir: Path,
+    stats: EmbeddingCacheStats | None = None,
 ) -> tuple[RetrievedCase, ...]:
-    """정답 라벨 없이 모든 조항을 메모리 코사인 유사도로 순위화한다."""
+    """정답 라벨 없이 모든 코퍼스 단위를 메모리 코사인 유사도로 순위화한다.
+
+    `stats` 를 주면 캐시 적중·구매를 그 객체에 누적한다 — 과금 보고가 추정이 아니라
+    관측이 되게 하는 계량기이고, 채점에는 영향을 주지 않는다.
+    """
     if embedder.dimensions != config.dimensions:
         raise ValueError(
             f"임베더 차원이 구성과 다르다: {embedder.dimensions} != {config.dimensions}"
@@ -890,6 +943,7 @@ def retrieve_cases(
         embedder=embedder,
         config=config,
         cache_dir=cache_dir,
+        stats=stats,
     )
     query_vectors = _embed_with_cache(
         texts=[query.text for query in queries],
@@ -897,6 +951,7 @@ def retrieve_cases(
         embedder=embedder,
         config=config,
         cache_dir=cache_dir,
+        stats=stats,
     )
 
     retrieved: list[RetrievedCase] = []
@@ -2960,3 +3015,1405 @@ def run_retrieval_comparison(
         abstention_grid=abstention_grid,
     )
     return write_strategy_report(comparison, output_dir=output_dir)
+
+
+# =====================================================================================
+# 청킹 전략 비교 격자 — **측정 전용, 제품에 반영하지 않는다**
+#
+# 이 절이 하는 일은 하나다: 현행 **조항 단위** 청킹과 **고정 크기** 청킹을 같은 임베딩·같은
+# 문의·같은 라벨로 채점해 비교표를 만든다. DB 도 제품 경로도 근거 ID 체계도 건드리지 않는다.
+#
+# **두 쪽의 경계**를 이름과 서명이 들고 있다.
+#   - 코퍼스 쪽(라벨을 보지 않는다): `build_policy_sources` · `chunk_policy_sources` ·
+#     `retrieve_cases`. 정답이 들어올 인자가 없다.
+#   - 채점자 쪽(라벨을 본다): `map_units_to_clauses`(단위→조항 투영) · `score_chunking` ·
+#     `run_chunking_grid`. 투영 자체는 라벨을 읽지 않지만 **채점의 일부**다 — 검색 결과를
+#     라벨의 어휘(근거 ID)로 옮기는 단계이므로 채점자 쪽에 둔다.
+# =====================================================================================
+
+#: 청크가 조항을 적중했다고 셀 최소 본문 포함 비율. **조정 가능 인자이고 리포트가 인쇄한다.**
+DEFAULT_CHUNK_MIN_CONTAINMENT: Final = 0.50
+#: 민감도 스윕 — 결론이 이 인자 하나로 뒤집히는지 확인하는 축.
+DEFAULT_CONTAINMENT_SWEEP: Final = (0.10, 0.25, 0.50, 0.75, 1.00)
+#: 질의 조건 이름. 청킹이 변수이고 질의는 통제 변인이다.
+CHUNKING_QUERY_ORIGINAL: Final = "original"
+CHUNKING_QUERY_BLIND_REWRITE: Final = "blind_rewrite"
+#: 처분 — 비교 결과가 어떻게 나오든 제품으로 넘어가지 않는다
+#: (결정 0015, `docs/tracking/decisions/`).
+CHUNKING_DISPOSITION: Final = (
+    "**비교만 한다.** 고정 크기가 이겨도 반영은 근거 ID 체계(`policy:<slug>:<조항>`) 변경이라 "
+    "답변 계약(`citation_ids`)·DB CHECK·L1 검증이 전부 걸린다. 이번 사이클은 제품에 아무것도 "
+    "반영하지 않고 결정 기록으로만 남긴다."
+)
+
+
+class ChunkingKind(StrEnum):
+    """청킹 전략의 종류."""
+
+    #: 현행. 조항 1개 = 청크 1개 = 근거 1개.
+    CLAUSE = "clause"
+    #: 문자 수 고정 창. 조항 경계를 무시하고 원문 스트림을 자른다.
+    FIXED = "fixed"
+
+
+@dataclass(frozen=True)
+class ChunkingStrategy:
+    """비교 격자의 한 열. **크기·오버랩은 선언값이고 리포트가 그대로 인쇄한다.**"""
+
+    key: str
+    kind: ChunkingKind
+    #: 고정 크기 창의 문자 수. 조항 단위에서는 None.
+    chunk_size: int | None = None
+    #: 인접 창이 겹치는 문자 수. 보폭 = chunk_size - overlap.
+    overlap: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.key.strip():
+            raise RetrievalConfigurationError("청킹 전략 key는 비어 있을 수 없다")
+        if self.kind is ChunkingKind.CLAUSE:
+            if self.chunk_size is not None or self.overlap:
+                raise RetrievalConfigurationError("조항 단위 전략에는 크기·오버랩이 없다")
+            return
+        if self.chunk_size is None or self.chunk_size <= 0:
+            raise RetrievalConfigurationError("고정 크기 청킹의 chunk_size는 1 이상이어야 한다")
+        if self.overlap < 0:
+            raise RetrievalConfigurationError("오버랩은 0 이상이어야 한다")
+        if self.overlap >= self.chunk_size:
+            raise RetrievalConfigurationError(
+                "오버랩이 크기 이상이면 보폭이 0 이하가 되어 창이 전진하지 않는다"
+            )
+
+    @property
+    def stride(self) -> int:
+        """창의 전진 폭. 조항 단위에서는 의미가 없어 0."""
+        if self.kind is ChunkingKind.CLAUSE or self.chunk_size is None:
+            return 0
+        return self.chunk_size - self.overlap
+
+    @property
+    def label(self) -> str:
+        if self.kind is ChunkingKind.CLAUSE:
+            return "조항 단위 (현행)"
+        overlap = "오버랩 없음" if self.overlap == 0 else f"오버랩 {self.overlap}자"
+        return f"고정 {self.chunk_size}자 · {overlap}"
+
+
+#: 기본 격자 — 조항 단위 1 + 고정 크기 2종 각각 오버랩 유무 2가지.
+#: 크기는 이 코퍼스의 조항 본문 길이(66~118자, 평균 94자)에 맞춰 골랐다. 120자는 조항 하나
+#: 남짓, 240자는 조항 두 개 남짓이다. 오버랩은 크기의 25%다.
+DEFAULT_CHUNKING_STRATEGIES: Final = (
+    ChunkingStrategy(key="clause", kind=ChunkingKind.CLAUSE),
+    ChunkingStrategy(key="fixed120-o0", kind=ChunkingKind.FIXED, chunk_size=120, overlap=0),
+    ChunkingStrategy(key="fixed120-o30", kind=ChunkingKind.FIXED, chunk_size=120, overlap=30),
+    ChunkingStrategy(key="fixed240-o0", kind=ChunkingKind.FIXED, chunk_size=240, overlap=0),
+    ChunkingStrategy(key="fixed240-o60", kind=ChunkingKind.FIXED, chunk_size=240, overlap=60),
+)
+
+
+@dataclass(frozen=True)
+class ClauseSpan:
+    """조항 본문이 문서 원문 스트림에서 차지하는 구간.
+
+    **제목줄은 span 밖이다.** 그래서 조항 번호만 스치는 청크는 그 조항을 적중시키지 못한다 —
+    "조항 본문(의 일부)을 포함하면 적중" 이라는 채점 규칙을 문자열 검색이 아니라
+    구간 겹침으로 강제한다(결정 0015).
+    """
+
+    evidence_id: str
+    document_slug: str
+    article: str
+    article_title: str
+    start: int
+    end: int
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start
+
+
+@dataclass(frozen=True)
+class PolicySource:
+    """문서 1개의 재구성 원문 스트림 + 조항 본문 span.
+
+    고정 크기 청킹은 조항 단위 청킹과 **같은 원문**을 자른 것이어야 비교가 성립한다.
+    그래서 두 전략이 같은 스트림을 입력으로 받는다.
+    """
+
+    slug: str
+    title: str
+    text: str
+    clauses: tuple[ClauseSpan, ...]
+
+
+@dataclass(frozen=True)
+class CorpusUnit:
+    """청킹 전략이 만든 검색 단위 1개."""
+
+    unit_id: str
+    document_slug: str
+    embedding_text: str
+    start: int
+    end: int
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start
+
+
+def build_policy_sources(documents: Sequence[PolicyDocument]) -> tuple[PolicySource, ...]:
+    """문서를 `## <조항> <제목>` + 본문 블록의 스트림으로 재구성하고 본문 span 을 기록한다.
+
+    **라벨을 보지 않는다.** 정책 원문만으로 결정되는 변형이다.
+    """
+    sources: list[PolicySource] = []
+    for document in documents:
+        parts: list[str] = []
+        clauses: list[ClauseSpan] = []
+        cursor = 0
+        for index, chunk in enumerate(document.chunks):
+            if index:
+                parts.append("\n\n")
+                cursor += 2
+            heading = f"## {chunk.article} {chunk.article_title}\n"
+            parts.append(heading)
+            cursor += len(heading)
+            clauses.append(
+                ClauseSpan(
+                    evidence_id=chunk.evidence_id,
+                    document_slug=document.slug,
+                    article=chunk.article,
+                    article_title=chunk.article_title,
+                    start=cursor,
+                    end=cursor + len(chunk.content),
+                )
+            )
+            parts.append(chunk.content)
+            cursor += len(chunk.content)
+        sources.append(
+            PolicySource(
+                slug=document.slug,
+                title=document.title,
+                text="".join(parts),
+                clauses=tuple(clauses),
+            )
+        )
+    return tuple(sources)
+
+
+def _clause_embedding_text(source: PolicySource, clause: ClauseSpan) -> str:
+    """현행 인덱싱(`PolicyChunk.embedding_text`)과 **글자 단위로 같은** 텍스트.
+
+    같아야 조항 단위 열이 기존 임베딩 캐시를 그대로 쓰고, 비교의 기준 열이 실제 제품이
+    색인하는 것과 같은 것이 된다.
+    """
+    return f"{source.title} / {clause.article_title}\n{source.text[clause.start : clause.end]}"
+
+
+def chunk_policy_sources(
+    sources: Sequence[PolicySource], strategy: ChunkingStrategy
+) -> tuple[CorpusUnit, ...]:
+    """원문 스트림을 전략대로 자른다. **라벨을 보지 않는다.**"""
+    units: list[CorpusUnit] = []
+    for source in sources:
+        if strategy.kind is ChunkingKind.CLAUSE:
+            units.extend(
+                CorpusUnit(
+                    unit_id=clause.evidence_id,
+                    document_slug=source.slug,
+                    embedding_text=_clause_embedding_text(source, clause),
+                    start=clause.start,
+                    end=clause.end,
+                )
+                for clause in source.clauses
+            )
+            continue
+        size = cast(int, strategy.chunk_size)
+        stride = strategy.stride
+        length = len(source.text)
+        index = 0
+        start = 0
+        while True:
+            end = min(start + size, length)
+            units.append(
+                CorpusUnit(
+                    unit_id=f"{strategy.key}:{source.slug}:{index:03d}",
+                    document_slug=source.slug,
+                    # 문서 제목을 붙이는 것은 조항 단위 열과 같은 대우다(조항 열도 제목을
+                    # 담는다). 창 하나만 보고는 어느 문서인지 알 수 없어 검색이 죽는다.
+                    embedding_text=f"{source.title}\n{source.text[start:end]}",
+                    start=start,
+                    end=end,
+                )
+            )
+            if end >= length:
+                break
+            start += stride
+            index += 1
+    return tuple(units)
+
+
+def map_units_to_clauses(
+    units: Sequence[CorpusUnit],
+    sources: Sequence[PolicySource],
+    *,
+    min_containment: float,
+) -> dict[str, tuple[str, ...]]:
+    """청크→조항 투영. **채점자 쪽이다.**
+
+    채점 규칙(결정 0015): *청크가 정답 조항 본문 텍스트(의 일부)를 포함하면 그 조항을 적중한
+    것으로 센다.* 고정 크기 청크는 같은 원문을 자른 것이라 span 대응이 계산 가능하므로,
+    "포함"을 문자열 검색이 아니라 **본문 구간과의 겹침 비율**로 판정한다.
+
+    `min_containment` 는 부분 포함으로 인정할 최소 비율이다 — **조정 가능 인자이고
+    리포트가 값을 인쇄한다.** 라벨 자체는 어디서도 바뀌지 않는다.
+
+    번호만 언급하는 청크는 적중이 아니다: 제목줄(`## 2-1 …`)은 본문 span 밖이라 겹침이
+    0 이고, 어떤 비율에서도 통과하지 못한다.
+    """
+    if not 0.0 < min_containment <= 1.0:
+        raise RetrievalConfigurationError("최소 포함 비율은 0 초과 1 이하여야 한다")
+    clauses_by_slug: dict[str, tuple[ClauseSpan, ...]] = {
+        source.slug: source.clauses for source in sources
+    }
+    mapping: dict[str, tuple[str, ...]] = {}
+    for unit in units:
+        hits: list[str] = []
+        for clause in clauses_by_slug.get(unit.document_slug, ()):
+            overlap = min(unit.end, clause.end) - max(unit.start, clause.start)
+            if overlap <= 0 or clause.length <= 0:
+                continue
+            if overlap / clause.length >= min_containment - 1e-9:
+                hits.append(clause.evidence_id)
+        mapping[unit.unit_id] = tuple(hits)
+    return mapping
+
+
+@dataclass(frozen=True)
+class ChunkingCaseScore:
+    """청킹 전략의 검색 결과를 조항 라벨로 채점한 문의 한 건."""
+
+    case_id: str
+    relevant_evidence_ids: frozenset[str]
+    ranked_unit_ids: tuple[str, ...]
+    accepted_unit_ids: tuple[str, ...]
+    #: 채택된 단위가 실어 나른 조항 집합 — 이것이 실제 "근거"가 된다.
+    accepted_clause_ids: tuple[str, ...]
+    recall_at_1: float | None
+    recall_at_3: float | None
+    recall_at_5: float | None
+    #: 조항 예산을 맞춘 recall — 상위 단위를 조항 순서로 펼쳐 top_k **조항**까지만 본다.
+    recall_at_clause_budget: float | None
+    accepted_precision: float | None
+    accepted_recall: float | None
+
+
+@dataclass(frozen=True)
+class ChunkingAggregate:
+    """문의 단위 macro 평균 + 근거 팽창 관측."""
+
+    recall_at_1: float | None
+    recall_at_3: float | None
+    recall_at_5: float | None
+    recall_at_clause_budget: float | None
+    accepted_precision: float | None
+    accepted_recall: float | None
+    macro_f1: float | None
+    precision_case_count: int
+    recall_case_count: int
+    case_count: int
+    mean_accepted_units: float | None
+    mean_accepted_clauses: float | None
+
+
+@dataclass(frozen=True)
+class ChunkingScore:
+    """한 컷에서의 케이스별 결과와 집계."""
+
+    cutoff: float
+    top_k: int
+    cases: tuple[ChunkingCaseScore, ...]
+    aggregate: ChunkingAggregate
+
+
+@dataclass(frozen=True)
+class ChunkingSweepPoint:
+    """한 코사인 컷에서의 채택분 macro 품질."""
+
+    cutoff: float
+    accepted_precision: float | None
+    accepted_recall: float | None
+    macro_f1: float | None
+    precision_case_count: int
+    recall_case_count: int
+    mean_accepted_clauses: float | None
+
+
+def _ordered_clauses(
+    unit_ids: Sequence[str], mapping: Mapping[str, tuple[str, ...]]
+) -> tuple[str, ...]:
+    """단위 순서를 유지한 채 조항을 펼치고 중복을 지운다(문서 순서는 매핑이 이미 보장한다)."""
+    seen: dict[str, None] = {}
+    for unit_id in unit_ids:
+        for evidence_id in mapping.get(unit_id, ()):
+            seen.setdefault(evidence_id, None)
+    return tuple(seen)
+
+
+def _clause_recall_at(
+    unit_ids: Sequence[str],
+    mapping: Mapping[str, tuple[str, ...]],
+    relevant: frozenset[str],
+    k: int,
+) -> float | None:
+    """상위 k **단위** 가 실어 나른 조항으로 계산한 recall. 정답이 비면 분모에서 뺀다."""
+    if not relevant:
+        return None
+    found = set(_ordered_clauses(unit_ids[:k], mapping))
+    return len(found & relevant) / len(relevant)
+
+
+def score_chunking(
+    retrieved: Sequence[RetrievedCase],
+    labels: Sequence[RetrievalLabel],
+    *,
+    mapping: Mapping[str, tuple[str, ...]],
+    top_k: int,
+    cutoff: float,
+    exclude_case_ids: frozenset[str] = frozenset(),
+) -> ChunkingScore:
+    """단위 순위를 조항으로 투영해 독립 라벨로 채점한다.
+
+    분모 규칙은 `score_retrieval` 과 **같다** — 정답이 빈 문의는 recall 분모에서 빠지고
+    precision 에는 들어간다. 조항 단위 전략에서는 투영이 항등이므로 두 함수의 수치가
+    한 자리도 다르지 않아야 한다(테스트가 확인한다).
+
+    `top_k` 는 **단위** 예산이다. 고정 크기 청크는 단위 하나가 조항 여럿을 실어 나르므로,
+    같은 단위 예산에서 근거 조항 수가 늘어난다 — 그 팽창을 `mean_accepted_clauses` 로
+    함께 보고한다.
+    """
+    if top_k <= 0:
+        raise ValueError("top_k는 1 이상이어야 한다")
+    if not 0.0 <= cutoff <= 1.0:
+        raise ValueError("cutoff는 0.0 이상 1.0 이하여야 한다")
+
+    label_by_id = {label.id: label for label in labels}
+    retrieved_ids = {case.case_id for case in retrieved}
+    label_ids = set(label_by_id)
+    if retrieved_ids != label_ids:
+        missing = ", ".join(sorted(label_ids - retrieved_ids)) or "없음"
+        extra = ", ".join(sorted(retrieved_ids - label_ids)) or "없음"
+        raise ValueError(f"검색 결과와 라벨 ID가 다르다(누락={missing}, 추가={extra})")
+
+    cases: list[ChunkingCaseScore] = []
+    for result in retrieved:
+        if result.case_id in exclude_case_ids:
+            continue
+        relevant = label_by_id[result.case_id].relevant_evidence_ids
+        ranked_unit_ids = tuple(hit.evidence_id for hit in result.ranked_hits)
+        accepted_units = tuple(
+            hit.evidence_id
+            for hit in result.ranked_hits[:top_k]
+            if hit.similarity is not None and hit.similarity >= cutoff
+        )
+        accepted_clauses = _ordered_clauses(accepted_units, mapping)
+        accepted_set = set(accepted_clauses)
+
+        if accepted_clauses:
+            precision = len(accepted_set & relevant) / len(accepted_clauses)
+        elif not relevant:
+            precision = 1.0
+        else:
+            precision = None
+        accepted_recall = len(accepted_set & relevant) / len(relevant) if relevant else None
+
+        budget = _ordered_clauses(ranked_unit_ids, mapping)[:top_k]
+        cases.append(
+            ChunkingCaseScore(
+                case_id=result.case_id,
+                relevant_evidence_ids=relevant,
+                ranked_unit_ids=ranked_unit_ids,
+                accepted_unit_ids=accepted_units,
+                accepted_clause_ids=accepted_clauses,
+                recall_at_1=_clause_recall_at(ranked_unit_ids, mapping, relevant, 1),
+                recall_at_3=_clause_recall_at(ranked_unit_ids, mapping, relevant, 3),
+                recall_at_5=_clause_recall_at(ranked_unit_ids, mapping, relevant, 5),
+                recall_at_clause_budget=(
+                    None if not relevant else len(set(budget) & relevant) / len(relevant)
+                ),
+                accepted_precision=precision,
+                accepted_recall=accepted_recall,
+            )
+        )
+
+    precision_mean = _mean(
+        [case.accepted_precision for case in cases if case.accepted_precision is not None]
+    )
+    recall_mean = _mean(
+        [case.accepted_recall for case in cases if case.accepted_recall is not None]
+    )
+    aggregate = ChunkingAggregate(
+        recall_at_1=_mean([c.recall_at_1 for c in cases if c.recall_at_1 is not None]),
+        recall_at_3=_mean([c.recall_at_3 for c in cases if c.recall_at_3 is not None]),
+        recall_at_5=_mean([c.recall_at_5 for c in cases if c.recall_at_5 is not None]),
+        recall_at_clause_budget=_mean(
+            [c.recall_at_clause_budget for c in cases if c.recall_at_clause_budget is not None]
+        ),
+        accepted_precision=precision_mean,
+        accepted_recall=recall_mean,
+        macro_f1=_macro_f1(precision_mean, recall_mean),
+        precision_case_count=sum(case.accepted_precision is not None for case in cases),
+        recall_case_count=sum(case.accepted_recall is not None for case in cases),
+        case_count=len(cases),
+        mean_accepted_units=_mean([float(len(case.accepted_unit_ids)) for case in cases]),
+        mean_accepted_clauses=_mean([float(len(case.accepted_clause_ids)) for case in cases]),
+    )
+    return ChunkingScore(cutoff=cutoff, top_k=top_k, cases=tuple(cases), aggregate=aggregate)
+
+
+def _chunking_sweep(
+    retrieved: Sequence[RetrievedCase],
+    labels: Sequence[RetrievalLabel],
+    *,
+    mapping: Mapping[str, tuple[str, ...]],
+    top_k: int,
+    cutoffs: Sequence[float],
+    exclude_case_ids: frozenset[str] = frozenset(),
+) -> tuple[tuple[ChunkingSweepPoint, ...], ChunkingSweepPoint | None]:
+    """컷만 바꿔 재채점한다 — 검색을 다시 돌리지 않으므로 추가 임베딩이 없다."""
+    points: list[ChunkingSweepPoint] = []
+    for cutoff in cutoffs:
+        aggregate = score_chunking(
+            retrieved,
+            labels,
+            mapping=mapping,
+            top_k=top_k,
+            cutoff=cutoff,
+            exclude_case_ids=exclude_case_ids,
+        ).aggregate
+        points.append(
+            ChunkingSweepPoint(
+                cutoff=cutoff,
+                accepted_precision=aggregate.accepted_precision,
+                accepted_recall=aggregate.accepted_recall,
+                macro_f1=aggregate.macro_f1,
+                precision_case_count=aggregate.precision_case_count,
+                recall_case_count=aggregate.recall_case_count,
+                mean_accepted_clauses=aggregate.mean_accepted_clauses,
+            )
+        )
+    eligible = [point for point in points if point.macro_f1 is not None]
+    best = (
+        max(
+            eligible,
+            key=lambda point: (
+                cast(float, point.macro_f1),
+                cast(float, point.accepted_precision),
+                cast(float, point.accepted_recall),
+                point.cutoff,
+            ),
+        )
+        if eligible
+        else None
+    )
+    return tuple(points), best
+
+
+@dataclass(frozen=True)
+class ChunkingCorpusStat:
+    """한 전략이 만든 코퍼스의 모양. 비교표의 분모를 읽는 데 필요하다."""
+
+    strategy_key: str
+    unit_count: int
+    total_chars: int
+    mean_unit_chars: float | None
+    mean_clauses_per_unit: float | None
+    max_clauses_per_unit: int
+    #: 어느 단위에도 잡히지 않는 조항 — 있으면 그 조항은 구조적으로 검색 불가다.
+    unreachable_clause_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MultiClauseCase:
+    """정답 조항이 둘 이상인 케이스와 그 조항들의 **원문 인접 여부**.
+
+    인접하면 고정 크기 청크 하나가 둘을 함께 덮을 수 있다 — 고정 크기에 구조적으로 유리한
+    지점이라 수치 옆에 적는다(결정 0015).
+    """
+
+    case_id: str
+    evidence_ids: tuple[str, ...]
+    adjacent: bool
+    note: str
+
+
+@dataclass(frozen=True)
+class AdjacencyCoverage:
+    """전략과 다중 라벨 케이스의 조합 — 청크 하나가 정답을 통째로 덮는가."""
+
+    strategy_key: str
+    case_id: str
+    single_unit_covers_all: bool
+    #: 그 청크가 함께 끌고 오는 정답 밖 조항 수 (0 이면 공짜로 둘을 얻는다).
+    extra_clauses: int
+
+
+@dataclass(frozen=True)
+class ChunkingRow:
+    """격자의 한 칸 — 질의 조건 · 청킹 전략 · 최소 포함 비율의 조합 하나."""
+
+    query_condition: str
+    strategy_key: str
+    min_containment: float
+    score: ChunkingScore
+    sweep: tuple[ChunkingSweepPoint, ...]
+    best: ChunkingSweepPoint | None
+    #: 인접 편향 케이스(G01·G02)를 뺀 같은 채점.
+    bias_excluded_score: ChunkingScore
+    bias_excluded_best: ChunkingSweepPoint | None
+
+
+@dataclass(frozen=True)
+class ChunkingEmbeddingCost:
+    """관측된 캐시 적중·구매. 달러 환산은 단가표가 있을 때만 한다."""
+
+    model: str
+    dimensions: int
+    cache_hits: int
+    cache_misses: int
+    embedded_texts: int
+    total_tokens: int
+    dollar_note: str
+
+
+@dataclass(frozen=True)
+class ChunkingGrid:
+    """청킹 비교 격자 전체 — 리포트의 유일한 입력."""
+
+    model: str
+    dimensions: int
+    is_stub: bool
+    top_k: int
+    cutoff: float
+    cutoff_sweep: tuple[float, ...]
+    containment_sweep: tuple[float, ...]
+    default_containment: float
+    strategies: tuple[ChunkingStrategy, ...]
+    query_conditions: tuple[str, ...]
+    query_condition_note: str
+    corpus: tuple[ChunkingCorpusStat, ...]
+    rows: tuple[ChunkingRow, ...]
+    multi_clause_cases: tuple[MultiClauseCase, ...]
+    bias_case_ids: tuple[str, ...]
+    adjacency_coverage: tuple[AdjacencyCoverage, ...]
+    embedding_cost: ChunkingEmbeddingCost
+    disposition: str = CHUNKING_DISPOSITION
+
+
+def _multi_clause_cases(
+    labels: Sequence[RetrievalLabel], sources: Sequence[PolicySource]
+) -> tuple[MultiClauseCase, ...]:
+    """정답이 둘 이상인 케이스를 찾고 원문 인접 여부를 **span 순서에서** 계산한다.
+
+    인접을 상수표로 박지 않는 이유: 정책 원문이 바뀌면 편향의 위치도 바뀌는데 상수는
+    그것을 모른다. 원문에서 유도하면 편향 서술이 조용히 낡지 않는다.
+    """
+    order: dict[str, tuple[str, int]] = {}
+    for source in sources:
+        for index, clause in enumerate(source.clauses):
+            order[clause.evidence_id] = (source.slug, index)
+
+    rows: list[MultiClauseCase] = []
+    for label in sorted(labels, key=lambda item: item.id):
+        if len(label.relevant_evidence_ids) < 2:
+            continue
+        positions = sorted(
+            order[evidence_id]
+            for evidence_id in label.relevant_evidence_ids
+            if evidence_id in order
+        )
+        adjacent = (
+            len(positions) == len(label.relevant_evidence_ids)
+            and len({slug for slug, _ in positions}) == 1
+            and all(second - first == 1 for (_, first), (_, second) in pairwise(positions))
+        )
+        rows.append(
+            MultiClauseCase(
+                case_id=label.id,
+                evidence_ids=tuple(sorted(label.relevant_evidence_ids)),
+                adjacent=adjacent,
+                note=(
+                    "원문에서 연속한 조항이라 고정 크기 청크 하나가 둘을 함께 덮을 수 있다"
+                    if adjacent
+                    else "원문에서 떨어져 있어 한 청크로 함께 덮기 어렵다"
+                ),
+            )
+        )
+    return tuple(rows)
+
+
+def _adjacency_coverage(
+    *,
+    strategy: ChunkingStrategy,
+    units: Sequence[CorpusUnit],
+    mapping: Mapping[str, tuple[str, ...]],
+    multi_clause: Sequence[MultiClauseCase],
+) -> tuple[AdjacencyCoverage, ...]:
+    rows: list[AdjacencyCoverage] = []
+    for case in multi_clause:
+        wanted = set(case.evidence_ids)
+        covering = [unit for unit in units if wanted <= set(mapping.get(unit.unit_id, ()))]
+        extra = (
+            min(len(set(mapping[unit.unit_id]) - wanted) for unit in covering) if covering else 0
+        )
+        rows.append(
+            AdjacencyCoverage(
+                strategy_key=strategy.key,
+                case_id=case.case_id,
+                single_unit_covers_all=bool(covering),
+                extra_clauses=extra,
+            )
+        )
+    return tuple(rows)
+
+
+def _corpus_stat(
+    *,
+    strategy: ChunkingStrategy,
+    units: Sequence[CorpusUnit],
+    mapping: Mapping[str, tuple[str, ...]],
+    sources: Sequence[PolicySource],
+) -> ChunkingCorpusStat:
+    reachable = {evidence_id for unit in units for evidence_id in mapping.get(unit.unit_id, ())}
+    all_clauses = tuple(clause.evidence_id for source in sources for clause in source.clauses)
+    counts = [len(mapping.get(unit.unit_id, ())) for unit in units]
+    return ChunkingCorpusStat(
+        strategy_key=strategy.key,
+        unit_count=len(units),
+        total_chars=sum(unit.length for unit in units),
+        mean_unit_chars=_mean([float(unit.length) for unit in units]),
+        mean_clauses_per_unit=_mean([float(count) for count in counts]),
+        max_clauses_per_unit=max(counts, default=0),
+        unreachable_clause_ids=tuple(
+            evidence_id for evidence_id in all_clauses if evidence_id not in reachable
+        ),
+    )
+
+
+def run_chunking_grid(
+    *,
+    documents: Sequence[PolicyDocument],
+    cases: Sequence[GoldenCase],
+    labels: Sequence[RetrievalLabel],
+    embedder: EmbeddingClient,
+    model: str,
+    dimensions: int,
+    is_stub: bool,
+    cache_dir: Path,
+    top_k: int = 5,
+    cutoff: float | None = None,
+    cutoff_sweep: Sequence[float] = DEFAULT_CUTOFF_SWEEP,
+    containment_sweep: Sequence[float] = DEFAULT_CONTAINMENT_SWEEP,
+    default_containment: float = DEFAULT_CHUNK_MIN_CONTAINMENT,
+    strategies: Sequence[ChunkingStrategy] = DEFAULT_CHUNKING_STRATEGIES,
+    rewritten_queries: Mapping[str, str] | None = None,
+) -> ChunkingGrid:
+    """청킹 축 격자를 돌린다. DB 도 제품 경로도 거치지 않는 인메모리 비교다.
+
+    질의는 통제 변인이다 — 원문 질의와 blind 재작성 질의 두 조건에서 같은 결론이 나오는지
+    본다. 재작성 조건은 **치환**이고 제품 사다리의 원문·재작성 합집합이 아니다(리포트가
+    그렇게 적는다). 청킹이 변수이므로 다른 단은 전부 끈다.
+    """
+    strategy_tuple = tuple(strategies)
+    if not strategy_tuple:
+        raise RetrievalConfigurationError("청킹 전략은 하나 이상이어야 한다")
+    keys = [strategy.key for strategy in strategy_tuple]
+    if len(keys) != len(set(keys)):
+        raise RetrievalConfigurationError("청킹 전략 key가 중복된다")
+    if not 0.0 < default_containment <= 1.0:
+        raise RetrievalConfigurationError("최소 포함 비율은 0 초과 1 이하여야 한다")
+    # 선언된 기본값은 반드시 민감도 표에 들어간다 — 비교표가 쓴 값이 표에 없으면 민감도를
+    # 읽을 기준점이 사라진다.
+    resolved_containment = tuple(sorted({*containment_sweep, default_containment}))
+    resolved_cutoff = (STUB_DEFAULT_CUTOFF if is_stub else 0.30) if cutoff is None else cutoff
+    config = RetrievalEvalConfig(
+        model=model,
+        dimensions=dimensions,
+        top_k=top_k,
+        cutoff=resolved_cutoff,
+        cutoff_sweep=tuple(cutoff_sweep),
+        is_stub=is_stub,
+    )
+
+    sources = build_policy_sources(documents)
+    multi_clause = _multi_clause_cases(labels, sources)
+    bias_case_ids = tuple(case.case_id for case in multi_clause if case.adjacent)
+
+    query_sets: dict[str, tuple[RetrievalQuery, ...]] = {
+        CHUNKING_QUERY_ORIGINAL: tuple(
+            RetrievalQuery(case_id=case.id, text=case.content) for case in cases
+        )
+    }
+    if rewritten_queries is not None:
+        missing = sorted({case.id for case in cases} - set(rewritten_queries))
+        if missing:
+            raise RetrievalConfigurationError(
+                f"재작성 질의가 없는 문의가 있다: {', '.join(missing)}"
+            )
+        query_sets[CHUNKING_QUERY_BLIND_REWRITE] = tuple(
+            RetrievalQuery(case_id=case.id, text=rewritten_queries[case.id]) for case in cases
+        )
+
+    stats = EmbeddingCacheStats()
+    corpus: list[ChunkingCorpusStat] = []
+    coverage: list[AdjacencyCoverage] = []
+    rows: list[ChunkingRow] = []
+    labels_tuple = tuple(labels)
+    bias_exclusion = frozenset(bias_case_ids)
+
+    for strategy in strategy_tuple:
+        units = chunk_policy_sources(sources, strategy)
+        mappings = {
+            containment: map_units_to_clauses(units, sources, min_containment=containment)
+            for containment in resolved_containment
+        }
+        corpus.append(
+            _corpus_stat(
+                strategy=strategy,
+                units=units,
+                mapping=mappings[default_containment],
+                sources=sources,
+            )
+        )
+        coverage.extend(
+            _adjacency_coverage(
+                strategy=strategy,
+                units=units,
+                mapping=mappings[default_containment],
+                multi_clause=multi_clause,
+            )
+        )
+        policy_texts = tuple((unit.unit_id, unit.embedding_text) for unit in units)
+        for condition, queries in query_sets.items():
+            # 이 호출은 라벨을 받지 않는다. 검색과 채점의 경계다.
+            retrieved = retrieve_cases(
+                queries=queries,
+                policy_texts=policy_texts,
+                embedder=embedder,
+                config=config,
+                cache_dir=cache_dir,
+                stats=stats,
+            )
+            for containment in resolved_containment:
+                mapping = mappings[containment]
+                sweep, best = _chunking_sweep(
+                    retrieved,
+                    labels_tuple,
+                    mapping=mapping,
+                    top_k=top_k,
+                    cutoffs=config.cutoff_sweep,
+                )
+                _, bias_best = _chunking_sweep(
+                    retrieved,
+                    labels_tuple,
+                    mapping=mapping,
+                    top_k=top_k,
+                    cutoffs=config.cutoff_sweep,
+                    exclude_case_ids=bias_exclusion,
+                )
+                rows.append(
+                    ChunkingRow(
+                        query_condition=condition,
+                        strategy_key=strategy.key,
+                        min_containment=containment,
+                        score=score_chunking(
+                            retrieved,
+                            labels_tuple,
+                            mapping=mapping,
+                            top_k=top_k,
+                            cutoff=resolved_cutoff,
+                        ),
+                        sweep=sweep,
+                        best=best,
+                        bias_excluded_score=score_chunking(
+                            retrieved,
+                            labels_tuple,
+                            mapping=mapping,
+                            top_k=top_k,
+                            cutoff=resolved_cutoff,
+                            exclude_case_ids=bias_exclusion,
+                        ),
+                        bias_excluded_best=bias_best,
+                    )
+                )
+
+    return ChunkingGrid(
+        model=model,
+        dimensions=dimensions,
+        is_stub=is_stub,
+        top_k=top_k,
+        cutoff=resolved_cutoff,
+        cutoff_sweep=tuple(config.cutoff_sweep),
+        containment_sweep=resolved_containment,
+        default_containment=default_containment,
+        strategies=strategy_tuple,
+        query_conditions=tuple(query_sets),
+        query_condition_note=(
+            "재작성 조건은 원문을 blind 재작성문으로 **치환**한 것이다. 제품 사다리의 "
+            "원문·재작성 합집합(`merge_rewritten_rankings`)이 아니므로 이 열의 절대값을 "
+            "전략 사다리 리포트의 `vector_rewrite` 행과 같은 것으로 읽으면 안 된다 — "
+            "여기서 읽을 것은 조건이 바뀌어도 청킹 열 사이의 **순서**가 유지되는지다."
+        ),
+        corpus=tuple(corpus),
+        rows=tuple(rows),
+        multi_clause_cases=multi_clause,
+        bias_case_ids=bias_case_ids,
+        adjacency_coverage=tuple(coverage),
+        embedding_cost=ChunkingEmbeddingCost(
+            model=model,
+            dimensions=dimensions,
+            cache_hits=stats.cache_hits,
+            cache_misses=stats.cache_misses,
+            embedded_texts=stats.embedded_texts,
+            total_tokens=stats.total_tokens,
+            dollar_note=(
+                "저장소에 단가표가 없다 — 달러 환산은 미실행(사유: 근거 단가 부재)이고 "
+                "토큰만 보고한다. 환산이 필요하면 단가와 기준일을 함께 적어야 한다."
+            ),
+        ),
+    )
+
+
+def _chunking_row(
+    grid: ChunkingGrid, *, condition: str, strategy_key: str, containment: float
+) -> ChunkingRow:
+    for row in grid.rows:
+        if (
+            row.query_condition == condition
+            and row.strategy_key == strategy_key
+            and abs(row.min_containment - containment) < 1e-9
+        ):
+            return row
+    raise KeyError(f"격자에 없는 칸이다: {condition}/{strategy_key}/{containment}")
+
+
+def _chunking_strategy(grid: ChunkingGrid, key: str) -> ChunkingStrategy:
+    for strategy in grid.strategies:
+        if strategy.key == key:
+            return strategy
+    raise KeyError(f"격자에 없는 전략이다: {key}")
+
+
+_CHUNKING_CONDITION_LABEL: Final = {
+    CHUNKING_QUERY_ORIGINAL: "원문 질의",
+    CHUNKING_QUERY_BLIND_REWRITE: "blind 재작성 질의(치환)",
+}
+
+
+def _chunking_condition_label(condition: str) -> str:
+    return _CHUNKING_CONDITION_LABEL.get(condition, condition)
+
+
+def _chunking_comparison_table(
+    grid: ChunkingGrid, *, condition: str, bias_excluded: bool
+) -> list[str]:
+    lines = [
+        "| 청킹 | 단위 수 | 평균 단위 길이 | r@1 | r@3 | r@5 | r@5(조항 예산) "
+        f"| P@{grid.cutoff:.2f} | R@{grid.cutoff:.2f} | F1@{grid.cutoff:.2f} "
+        "| 최적 컷 | F1@최적 | 케이스당 채택 조항 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    stats = {stat.strategy_key: stat for stat in grid.corpus}
+    for strategy in grid.strategies:
+        row = _chunking_row(
+            grid,
+            condition=condition,
+            strategy_key=strategy.key,
+            containment=grid.default_containment,
+        )
+        score = row.bias_excluded_score if bias_excluded else row.score
+        best = row.bias_excluded_best if bias_excluded else row.best
+        aggregate = score.aggregate
+        stat = stats[strategy.key]
+        lines.append(
+            f"| {strategy.label} | {stat.unit_count} | {_number(stat.mean_unit_chars)} "
+            f"| {_number(aggregate.recall_at_1)} | {_number(aggregate.recall_at_3)} "
+            f"| {_number(aggregate.recall_at_5)} | {_number(aggregate.recall_at_clause_budget)} "
+            f"| {_number(aggregate.accepted_precision)} | {_number(aggregate.accepted_recall)} "
+            f"| {_number(aggregate.macro_f1)} "
+            f"| {'미산출' if best is None else f'{best.cutoff:.2f}'} "
+            f"| {_number(None if best is None else best.macro_f1)} "
+            f"| {_number(aggregate.mean_accepted_clauses)} |"
+        )
+    return lines
+
+
+def _chunking_markdown_report(grid: ChunkingGrid) -> str:
+    lines: list[str] = ["# 청킹 전략 비교 — 조항 단위 vs 고정 크기", ""]
+    lines.append("## 처분")
+    lines.append("")
+    lines.append(grid.disposition)
+    lines.append("")
+    lines.append(
+        "비교 결과의 해석(무엇을 뒷받침하고 무엇을 뒷받침하지 않는가)과 처분의 전문은 "
+        "`docs/tracking/decisions/0015-청킹은-조항-단위를-유지하고-고정-크기는-비교까지만-한다.md` "
+        "에 있다. 이 문서는 그 결정의 수치 근거다."
+    )
+    lines.append("")
+    lines.append("## 실행 조건")
+    lines.append("")
+    if grid.is_stub:
+        lines.append(
+            "- **대역 실행이다 — 이 문서의 수치는 실제 수치가 아니다.** 어휘 기반 임베딩 "
+            "대역의 유사도는 실제 임베딩과 스케일이 다르므로 배관 검증 용도로만 읽는다."
+        )
+    lines.append(f"- 임베딩: `{grid.model}` ({grid.dimensions}차원)")
+    lines.append(
+        "- 코퍼스: 정책 문서를 `## <조항> <제목>` + 본문 블록 스트림으로 재구성한 뒤 전략별로 "
+        "자른다. 두 전략이 **같은 원문**을 자르므로 span 대응이 계산 가능하다"
+    )
+    lines.append(f"- top_k(단위 예산): {grid.top_k}")
+    lines.append(f"- 채택 코사인 컷(기본): {grid.cutoff:.6f}")
+    lines.append(
+        f"- 컷 스윕: {min(grid.cutoff_sweep):.2f} ~ {max(grid.cutoff_sweep):.2f} "
+        f"({len(grid.cutoff_sweep)}점)"
+    )
+    lines.append(
+        f"- **최소 포함 비율(조정 가능 인자): {grid.default_containment:.2f}** — 청크가 조항 "
+        "본문의 이 비율 이상을 담으면 그 조항을 적중한 것으로 센다. 민감도는 아래 절에 있다"
+    )
+    lines.append("- 민감도 스윕: " + " · ".join(f"{value:.2f}" for value in grid.containment_sweep))
+    lines.append(
+        "- 질의 조건: "
+        + " · ".join(_chunking_condition_label(condition) for condition in grid.query_conditions)
+    )
+    lines.append(f"- {grid.query_condition_note}")
+    lines.append(
+        "- 라벨 사용 경계: 코퍼스 변형·청킹·검색은 라벨을 받지 않는다. 라벨은 채점 단계에서만 "
+        "쓰이고 **라벨 자체는 이 비교에서 한 글자도 바뀌지 않는다**"
+    )
+    lines.append("")
+    lines.append("### 청크→조항 매핑 규칙")
+    lines.append("")
+    lines.append(
+        "청크가 정답 조항 **본문 텍스트(의 일부)** 를 포함하면 그 조항을 적중한 것으로 센다. "
+        "판정은 문자열 검색이 아니라 본문 구간과의 겹침 비율이다: "
+        "`겹친 문자 수 / 조항 본문 길이 ≥ 최소 포함 비율`. "
+        "제목줄(`## 2-1 …`)은 본문 span 밖이므로 **조항 번호만 스치는 청크는 어떤 비율에서도 "
+        "적중이 아니다**(음성 대조: `tests/test_chunking_grid.py`)."
+    )
+    lines.append("")
+
+    lines.append("## 코퍼스")
+    lines.append("")
+    lines.append(
+        "| 청킹 | 단위 수 | 총 문자 | 평균 단위 길이 | 단위당 조항 수(평균) | 최대 "
+        "| 도달 불가 조항 |"
+    )
+    lines.append("|---|---:|---:|---:|---:|---:|---|")
+    for stat in grid.corpus:
+        strategy = _chunking_strategy(grid, stat.strategy_key)
+        unreachable = ", ".join(stat.unreachable_clause_ids) or "없음"
+        lines.append(
+            f"| {strategy.label} | {stat.unit_count} | {stat.total_chars} "
+            f"| {_number(stat.mean_unit_chars)} | {_number(stat.mean_clauses_per_unit)} "
+            f"| {stat.max_clauses_per_unit} | {unreachable} |"
+        )
+    lines.append("")
+    lines.append(
+        "`도달 불가 조항`은 어느 단위도 최소 포함 비율을 넘게 담지 못한 조항이다 — 있으면 그 "
+        "조항은 그 청킹에서 **구조적으로 근거가 될 수 없다**. 0 이 아니라 목록으로 적는다."
+    )
+    lines.append("")
+
+    lines.append("## 비교표")
+    lines.append("")
+    lines.append(
+        f"최소 포함 비율 {grid.default_containment:.2f} 기준. `r@k` 는 **단위** 예산 k 에서 "
+        "그 단위들이 실어 나른 조항의 recall 이고, `r@5(조항 예산)` 은 상위 단위를 조항으로 "
+        "펼쳐 5**조항**까지만 본 recall 이다 — 고정 크기가 단위 하나로 조항 여럿을 가져오는 "
+        "이득을 예산으로 상쇄한 열이다. `케이스당 채택 조항` 은 근거 팽창이다."
+    )
+    lines.append("")
+    for condition in grid.query_conditions:
+        lines.append(f"### {_chunking_condition_label(condition)}")
+        lines.append("")
+        lines.extend(_chunking_comparison_table(grid, condition=condition, bias_excluded=False))
+        lines.append("")
+
+    lines.append("## 편향 — 인접 조항이 고정 크기에 주는 이득")
+    lines.append("")
+    lines.append(
+        "정답 조항이 둘인 케이스 중 **원문에서 연속한** 것은 고정 크기 청크 하나가 둘을 함께 "
+        "덮을 수 있다. 조항 단위 청킹은 정의상 그럴 수 없다. 구조적 이득이므로 수치 옆에 적는다."
+    )
+    lines.append("")
+    lines.append("| 케이스 | 정답 조항 | 원문 인접 | 비고 |")
+    lines.append("|---|---|---|---|")
+    for case in grid.multi_clause_cases:
+        lines.append(
+            f"| {case.case_id} | {', '.join(case.evidence_ids)} "
+            f"| {'예' if case.adjacent else '아니오'} | {case.note} |"
+        )
+    lines.append("")
+    lines.append(
+        "편향 케이스(원문 인접 + 정답 2건): "
+        + (", ".join(grid.bias_case_ids) if grid.bias_case_ids else "없음")
+    )
+    lines.append("")
+    lines.append(
+        "| 청킹 | 케이스 | 청크 하나가 정답을 통째로 덮는가 | 함께 딸려오는 정답 밖 조항 |"
+    )
+    lines.append("|---|---|---|---:|")
+    for coverage_row in grid.adjacency_coverage:
+        strategy = _chunking_strategy(grid, coverage_row.strategy_key)
+        lines.append(
+            f"| {strategy.label} | {coverage_row.case_id} "
+            f"| {'예' if coverage_row.single_unit_covers_all else '아니오'} "
+            f"| {coverage_row.extra_clauses} |"
+        )
+    lines.append("")
+    lines.append(f"### 편향 케이스({', '.join(grid.bias_case_ids) or '없음'})를 뺀 같은 비교표")
+    lines.append("")
+    for condition in grid.query_conditions:
+        lines.append(f"#### {_chunking_condition_label(condition)} — 편향 제외")
+        lines.append("")
+        lines.extend(_chunking_comparison_table(grid, condition=condition, bias_excluded=True))
+        lines.append("")
+
+    lines.append("## 최소 포함 비율 민감도")
+    lines.append("")
+    lines.append(
+        "결론이 이 조정 인자 하나에 업혀 있는지 본다. 값을 바꾸면 매핑이 바뀌고 채점이 다시 "
+        "돌지만 **검색은 다시 돌지 않는다**(추가 임베딩 없음)."
+    )
+    lines.append("")
+    for condition in grid.query_conditions:
+        lines.append(f"### {_chunking_condition_label(condition)}")
+        lines.append("")
+        header = "| 최소 포함 비율 | " + " | ".join(strategy.label for strategy in grid.strategies)
+        lines.append(header + " |")
+        lines.append("|---" * (len(grid.strategies) + 1) + "|")
+        for metric, title in (("recall_at_5", "r@5"), ("best_f1", "F1@최적")):
+            lines.append(f"| **{title}** | " + " | ".join("" for _ in grid.strategies) + " |")
+            for containment in grid.containment_sweep:
+                cells: list[str] = []
+                for strategy in grid.strategies:
+                    row = _chunking_row(
+                        grid,
+                        condition=condition,
+                        strategy_key=strategy.key,
+                        containment=containment,
+                    )
+                    if metric == "recall_at_5":
+                        cells.append(_number(row.score.aggregate.recall_at_5))
+                    else:
+                        cells.append(_number(None if row.best is None else row.best.macro_f1))
+                lines.append(f"| {containment:.2f} | " + " | ".join(cells) + " |")
+        lines.append("")
+
+    lines.append("## 컷 스윕 (최소 포함 비율 기본값)")
+    lines.append("")
+    for condition in grid.query_conditions:
+        for strategy in grid.strategies:
+            row = _chunking_row(
+                grid,
+                condition=condition,
+                strategy_key=strategy.key,
+                containment=grid.default_containment,
+            )
+            lines.append(f"### {_chunking_condition_label(condition)} · {strategy.label}")
+            lines.append("")
+            lines.append(
+                "| cutoff | precision | recall | macro F1 | precision n | recall n "
+                "| 케이스당 채택 조항 |"
+            )
+            lines.append("|---:|---:|---:|---:|---:|---:|---:|")
+            for point in row.sweep:
+                lines.append(
+                    f"| {point.cutoff:.2f} | {_number(point.accepted_precision)} "
+                    f"| {_number(point.accepted_recall)} | {_number(point.macro_f1)} "
+                    f"| {point.precision_case_count} | {point.recall_case_count} "
+                    f"| {_number(point.mean_accepted_clauses)} |"
+                )
+            lines.append("")
+
+    cost = grid.embedding_cost
+    lines.append("## 임베딩 비용 관측")
+    lines.append("")
+    lines.append(f"- 모델: `{cost.model}` ({cost.dimensions}차원)")
+    lines.append(f"- 캐시 적중: {cost.cache_hits}건")
+    lines.append(f"- 캐시 미적중(신규 구매 대상): {cost.cache_misses}건")
+    lines.append(f"- 실제 임베딩 호출 텍스트: {cost.embedded_texts}건")
+    lines.append(f"- 임베딩 토큰: {cost.total_tokens}")
+    if cost.cache_misses == 0:
+        lines.append(
+            "- **미적중 0 은 '이 격자가 공짜'라는 뜻이 아니다** — 같은 코퍼스를 앞선 실행이 "
+            "이미 샀고 이 실행은 캐시만 읽었다는 뜻이다. 최초 구매량은 결정 기록에 있다"
+        )
+    lines.append(f"- {cost.dollar_note}")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def _chunking_score_json(score: ChunkingScore) -> dict[str, object]:
+    aggregate = score.aggregate
+    return {
+        "cutoff": score.cutoff,
+        "top_k": score.top_k,
+        "aggregate": {
+            "recall_at_1": aggregate.recall_at_1,
+            "recall_at_3": aggregate.recall_at_3,
+            "recall_at_5": aggregate.recall_at_5,
+            "recall_at_clause_budget": aggregate.recall_at_clause_budget,
+            "accepted_precision": aggregate.accepted_precision,
+            "accepted_recall": aggregate.accepted_recall,
+            "macro_f1": aggregate.macro_f1,
+            "precision_case_count": aggregate.precision_case_count,
+            "recall_case_count": aggregate.recall_case_count,
+            "case_count": aggregate.case_count,
+            "mean_accepted_units": aggregate.mean_accepted_units,
+            "mean_accepted_clauses": aggregate.mean_accepted_clauses,
+        },
+        "cases": [
+            {
+                "case_id": case.case_id,
+                "relevant_evidence_ids": sorted(case.relevant_evidence_ids),
+                "accepted_unit_ids": list(case.accepted_unit_ids),
+                "accepted_clause_ids": list(case.accepted_clause_ids),
+                "recall_at_1": case.recall_at_1,
+                "recall_at_3": case.recall_at_3,
+                "recall_at_5": case.recall_at_5,
+                "recall_at_clause_budget": case.recall_at_clause_budget,
+                "accepted_precision": case.accepted_precision,
+                "accepted_recall": case.accepted_recall,
+            }
+            for case in score.cases
+        ],
+    }
+
+
+def _chunking_sweep_json(points: Sequence[ChunkingSweepPoint]) -> list[dict[str, object]]:
+    return [
+        {
+            "cutoff": point.cutoff,
+            "accepted_precision": point.accepted_precision,
+            "accepted_recall": point.accepted_recall,
+            "macro_f1": point.macro_f1,
+            "precision_case_count": point.precision_case_count,
+            "recall_case_count": point.recall_case_count,
+            "mean_accepted_clauses": point.mean_accepted_clauses,
+        }
+        for point in points
+    ]
+
+
+def _chunking_json_report(grid: ChunkingGrid) -> dict[str, object]:
+    return {
+        "report": "chunking_comparison",
+        "disposition": grid.disposition,
+        "configuration": {
+            "embedding_model": grid.model,
+            "embedding_dimensions": grid.dimensions,
+            "is_stub": grid.is_stub,
+            "top_k": grid.top_k,
+            "cutoff": grid.cutoff,
+            "cutoff_sweep": list(grid.cutoff_sweep),
+            "min_containment": grid.default_containment,
+            "containment_sweep": list(grid.containment_sweep),
+            "query_conditions": list(grid.query_conditions),
+            "query_condition_note": grid.query_condition_note,
+            "strategies": [
+                {
+                    "key": strategy.key,
+                    "kind": strategy.kind.value,
+                    "label": strategy.label,
+                    "chunk_size": strategy.chunk_size,
+                    "overlap": strategy.overlap,
+                    "stride": strategy.stride,
+                }
+                for strategy in grid.strategies
+            ],
+        },
+        "corpus": [
+            {
+                "strategy": stat.strategy_key,
+                "unit_count": stat.unit_count,
+                "total_chars": stat.total_chars,
+                "mean_unit_chars": stat.mean_unit_chars,
+                "mean_clauses_per_unit": stat.mean_clauses_per_unit,
+                "max_clauses_per_unit": stat.max_clauses_per_unit,
+                "unreachable_clause_ids": list(stat.unreachable_clause_ids),
+            }
+            for stat in grid.corpus
+        ],
+        "bias": {
+            "case_ids": list(grid.bias_case_ids),
+            "multi_clause_cases": [
+                {
+                    "case_id": case.case_id,
+                    "evidence_ids": list(case.evidence_ids),
+                    "adjacent": case.adjacent,
+                    "note": case.note,
+                }
+                for case in grid.multi_clause_cases
+            ],
+            "single_unit_coverage": [
+                {
+                    "strategy": row.strategy_key,
+                    "case_id": row.case_id,
+                    "single_unit_covers_all": row.single_unit_covers_all,
+                    "extra_clauses": row.extra_clauses,
+                }
+                for row in grid.adjacency_coverage
+            ],
+        },
+        "rows": [
+            {
+                "query_condition": row.query_condition,
+                "strategy": row.strategy_key,
+                "min_containment": row.min_containment,
+                "score": _chunking_score_json(row.score),
+                "sweep": _chunking_sweep_json(row.sweep),
+                "best_cutoff": None if row.best is None else row.best.cutoff,
+                "best_macro_f1": None if row.best is None else row.best.macro_f1,
+                "bias_excluded": {
+                    "score": _chunking_score_json(row.bias_excluded_score),
+                    "best_cutoff": (
+                        None if row.bias_excluded_best is None else row.bias_excluded_best.cutoff
+                    ),
+                    "best_macro_f1": (
+                        None if row.bias_excluded_best is None else row.bias_excluded_best.macro_f1
+                    ),
+                },
+            }
+            for row in grid.rows
+        ],
+        "embedding_cost": {
+            "model": grid.embedding_cost.model,
+            "dimensions": grid.embedding_cost.dimensions,
+            "cache_hits": grid.embedding_cost.cache_hits,
+            "cache_misses": grid.embedding_cost.cache_misses,
+            "embedded_texts": grid.embedding_cost.embedded_texts,
+            "total_tokens": grid.embedding_cost.total_tokens,
+            "dollar_note": grid.embedding_cost.dollar_note,
+        },
+    }
+
+
+def _next_chunking_report_paths(output_dir: Path, grid: ChunkingGrid) -> ReportPaths:
+    mode = "stub" if grid.is_stub else "live"
+    model = re.sub(r"[^a-z0-9]+", "-", grid.model.lower()).strip("-") or "model"
+    containment = f"{round(grid.default_containment * 100):03d}"
+    stem = (
+        f"retrieval-chunking-{mode}-{model}-d{grid.dimensions}"
+        f"-k{grid.top_k}-c{round(grid.cutoff * 100):03d}-m{containment}"
+    )
+    suffix: int | None = None
+    while True:
+        ending = "" if suffix is None else f"-{suffix}"
+        paths = ReportPaths(
+            markdown=output_dir / f"{stem}{ending}.md",
+            json=output_dir / f"{stem}{ending}.json",
+        )
+        if not paths.markdown.exists() and not paths.json.exists():
+            return paths
+        suffix = 2 if suffix is None else suffix + 1
+
+
+def write_chunking_report(grid: ChunkingGrid, *, output_dir: Path) -> ReportPaths:
+    """청킹 비교를 기존 산출물과 충돌하지 않는 두 형식으로 쓴다."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths = _next_chunking_report_paths(output_dir, grid)
+    markdown = _chunking_markdown_report(grid)
+    json_text = json.dumps(_chunking_json_report(grid), ensure_ascii=False, indent=2) + "\n"
+    created_markdown = False
+    try:
+        with paths.markdown.open("x", encoding="utf-8") as handle:
+            handle.write(markdown)
+        created_markdown = True
+        with paths.json.open("x", encoding="utf-8") as handle:
+            handle.write(json_text)
+    except FileExistsError:
+        if created_markdown:
+            paths.markdown.unlink(missing_ok=True)
+        return write_chunking_report(grid, output_dir=output_dir)
+    return paths
+
+
+def run_chunking_comparison(
+    *,
+    live: bool,
+    embedding_model: str | None = None,
+    embedding_client: EmbeddingClient | None = None,
+    dimensions: int | None = None,
+    top_k: int = 5,
+    cutoff: float | None = None,
+    min_containment: float = DEFAULT_CHUNK_MIN_CONTAINMENT,
+    containment_sweep: Sequence[float] = DEFAULT_CONTAINMENT_SWEEP,
+    strategies: Sequence[ChunkingStrategy] = DEFAULT_CHUNKING_STRATEGIES,
+    policy_dir: Path = DEFAULT_POLICY_DIR,
+    golden_set_path: Path = DEFAULT_GOLDEN_SET_PATH,
+    labels_path: Path = DEFAULT_RETRIEVAL_LABELS_PATH,
+    rewritten_queries_path: Path | None = DEFAULT_REWRITTEN_QUERIES_PATH,
+    output_dir: Path = DEFAULT_RETRIEVAL_REPORT_DIR,
+    cache_dir: Path = DEFAULT_EMBEDDING_CACHE_DIR,
+) -> ReportPaths:
+    """CLI 가 부르는 청킹 비교 진입점. **측정까지만이고 제품에 아무것도 반영하지 않는다.**
+
+    `--live` 는 고정 크기 청크를 새로 임베딩하므로 과금된다. 조항 단위 열은 현행 인덱싱과
+    같은 텍스트라 캐시가 그대로 산다.
+    """
+    settings = get_settings()
+    resolved_dimensions = (
+        embedding_client.dimensions
+        if embedding_client is not None and dimensions is None
+        else settings.embedding_dimensions
+        if dimensions is None
+        else dimensions
+    )
+    if live:
+        if embedding_client is None and not settings.openai_api_key:
+            raise RetrievalConfigurationError(
+                "OPENAI_API_KEY가 없다 — 실제 임베딩 비교는 과금되므로 키를 선검사한다"
+            )
+        model = embedding_model or settings.embedding_model
+        resolved_cutoff = settings.vector_similarity_threshold if cutoff is None else cutoff
+        embedder: EmbeddingClient = embedding_client or OpenAIEmbeddingClient(
+            api_key=settings.openai_api_key, model=model, dimensions=resolved_dimensions
+        )
+    else:
+        if embedding_client is not None or embedding_model is not None:
+            raise RetrievalConfigurationError(
+                "대역 모드에는 실제 embedding_client/embedding_model을 주입할 수 없다"
+            )
+        model = STUB_EMBEDDING_MODEL
+        resolved_cutoff = STUB_DEFAULT_CUTOFF if cutoff is None else cutoff
+        embedder = LexicalEmbeddingClient(dimensions=resolved_dimensions)
+
+    documents = load_policy_documents(policy_dir)
+    cases = load_golden_set(golden_set_path)
+    labels = load_retrieval_labels(
+        labels_path, golden_set_path=golden_set_path, policy_dir=policy_dir
+    )
+    rewritten = (
+        load_rewritten_queries(rewritten_queries_path, golden_set_path=golden_set_path)
+        if rewritten_queries_path is not None
+        else None
+    )
+    grid = run_chunking_grid(
+        documents=documents,
+        cases=cases,
+        labels=labels,
+        embedder=embedder,
+        model=model,
+        dimensions=resolved_dimensions,
+        is_stub=not live,
+        cache_dir=cache_dir,
+        top_k=top_k,
+        cutoff=resolved_cutoff,
+        containment_sweep=containment_sweep,
+        default_containment=min_containment,
+        strategies=strategies,
+        rewritten_queries=rewritten,
+    )
+    return write_chunking_report(grid, output_dir=output_dir)
