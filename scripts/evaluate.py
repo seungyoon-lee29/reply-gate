@@ -190,6 +190,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--top-k", type=int, default=None, help="정책 검색 상위 k (기본: 설정값)")
     parser.add_argument(
+        "--judge-model",
+        default=None,
+        metavar="모델",
+        help=(
+            "L2 판정 모델 (기본: 설정값). 판정 모델 계열 비교를 **실행 인자로만** 하기 "
+            "위한 것이라 설정 기본값은 바뀌지 않는다 — 고른 값은 실행 조건 지문의 "
+            "`judge_model` 에 그대로 실린다"
+        ),
+    )
+    parser.add_argument(
         "--measurements",
         default=",".join(sorted(BILLED_MEASUREMENTS)),
         metavar="번호목록",
@@ -281,7 +291,12 @@ def _judge_skip_reason(
     return None
 
 
-def _measurement_two_settings(*, args: argparse.Namespace, settings: Settings) -> Settings:
+def _run_settings(*, args: argparse.Namespace, settings: Settings) -> Settings:
+    """이번 실행의 설정 — 실행 인자가 덮은 값까지 반영한 것.
+
+    **설정 기본값은 바뀌지 않는다.** 여기서 만든 값이 실행 조건 지문에 그대로 실리므로,
+    인자로 덮은 조건은 산출물에서 그대로 읽힌다.
+    """
     threshold = args.similarity_threshold
     if threshold is None:
         threshold = (
@@ -291,6 +306,9 @@ def _measurement_two_settings(*, args: argparse.Namespace, settings: Settings) -
         update={
             "vector_similarity_threshold": float(threshold),
             "vector_top_k": int(args.top_k) if args.top_k is not None else settings.vector_top_k,
+            "judge_model": (
+                str(args.judge_model) if args.judge_model is not None else settings.judge_model
+            ),
         }
     )
 
@@ -510,7 +528,7 @@ def main(argv: list[str] | None = None) -> int:
             judge_fixture_error if judge_skip is None else f"{judge_skip} / {judge_fixture_error}"
         )
 
-    run_settings = _measurement_two_settings(args=args, settings=settings)
+    run_settings = _run_settings(args=args, settings=settings)
     # 측정 2 가 **실측으로 돌 조건이었는가**. 도중에 중단돼도 이 값은 True 로 남는다:
     # 이름은 이미 확정됐고(측정 시작 전 결정), 그 이름이 곧 "이 실행은 과금될 수 있었다"는
     # 저장소에 남는 기록이다.

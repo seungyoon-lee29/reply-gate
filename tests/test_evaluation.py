@@ -2524,6 +2524,25 @@ def test_측정_선택은_측정_2_의_DB_생성_키_전제를_건너뛴다(
     assert inherited is not None and "측정 2 와 같은 사유" in inherited
 
 
+def test_판정_모델은_실행_인자로만_덮이고_설정_기본값은_그대로다() -> None:
+    """판정 모델 비교는 설정 기본값을 바꾸지 않고 실행 인자로만 한다.
+
+    덮은 값이 실행 조건 지문에 실려야 어느 모델에 돈을 썼는지가 산출물에서 읽힌다.
+    """
+    settings = _l2_settings()
+    기본 = evaluate.build_parser().parse_args(["--live", "--measurements", "3"])
+    assert 기본.judge_model is None
+    assert evaluate._run_settings(args=기본, settings=settings).judge_model == settings.judge_model
+
+    덮음 = evaluate.build_parser().parse_args(
+        ["--live", "--measurements", "3", "--judge-model", "claude-haiku-4-5"]
+    )
+    덮인_설정 = evaluate._run_settings(args=덮음, settings=settings)
+    assert 덮인_설정.judge_model == "claude-haiku-4-5"
+    # 원본 설정은 그대로다 — 기본 판정 모델 교체는 이번 사이클 범위 밖이다.
+    assert settings.judge_model != "claude-haiku-4-5"
+
+
 def test_알_수_없는_측정_선택은_측정_시작_전에_거부된다() -> None:
     args = evaluate.build_parser().parse_args(["--live", "--measurements", "4"])
     with pytest.raises(SystemExit):
