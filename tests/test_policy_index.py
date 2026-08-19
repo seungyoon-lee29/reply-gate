@@ -13,6 +13,7 @@ import psycopg
 import pytest
 from psycopg.rows import DictRow
 
+from reply_gate.evidence import adopt_policy_hits
 from reply_gate.policy_index import (
     DEFAULT_POLICY_DIR,
     PlantedKind,
@@ -181,7 +182,6 @@ def test_유사도_검색이_관련_조항을_돌려준다(app_conn: psycopg.Con
         conn=app_conn,
         query_vector=query,
         top_k=5,
-        similarity_threshold=0.0,
         embedding_model=embedder.model,
         embedding_dimensions=embedder.dimensions,
     )
@@ -192,31 +192,38 @@ def test_유사도_검색이_관련_조항을_돌려준다(app_conn: psycopg.Con
 
 
 @pytest.mark.db
-def test_임계값_미만_결과는_버린다(app_conn: psycopg.Connection[DictRow]) -> None:
+def test_검색은_컷_전_상위_top_k_후보를_그대로_돌려준다(
+    app_conn: psycopg.Connection[DictRow],
+) -> None:
+    """자르는 것은 `LIMIT top_k` 하나다 — 컷은 `evidence.adopt_policy_hits` 가 건다.
+
+    검색이 컷을 먼저 걸면 질의 단위 기권 게이트가 **짧아진 슬라이스**로 산포를 재게 되어
+    오프라인 격자와 런타임이 다른 수를 낸다(`docs/tracking/decisions/0014`). 그래서 컷
+    미만 후보가 여기서 살아 있는 것이 계약이다.
+    """
     documents = load_policy_documents(DEFAULT_POLICY_DIR)
     embedder = LexicalEmbeddingClient(dimensions=1536)
     index_policy_documents(conn=app_conn, documents=documents, embedder=embedder)
     query = embedder.embed(stage="inquiry", texts=["환불 신청 기간"]).vectors[0]
 
-    loose = search_policy_chunks(
+    hits = search_policy_chunks(
         conn=app_conn,
         query_vector=query,
         top_k=10,
-        similarity_threshold=0.0,
-        embedding_model=embedder.model,
-        embedding_dimensions=embedder.dimensions,
-    )
-    strict = search_policy_chunks(
-        conn=app_conn,
-        query_vector=query,
-        top_k=10,
-        similarity_threshold=0.99,
         embedding_model=embedder.model,
         embedding_dimensions=embedder.dimensions,
     )
 
-    assert len(loose) > len(strict)
-    assert all(hit.similarity >= 0.99 for hit in strict)
+    assert len(hits) == 10
+    # 양성 대조 — 대역 임베딩의 상위 10건에는 제품 컷(0.30) 미만이 실제로 섞여 있다.
+    assert [hit for hit in hits if hit.similarity < 0.30]
+    # 그리고 그 후보를 버리는 것은 채택 단계다.
+    assert all(
+        hit.similarity >= 0.30
+        for hit in adopt_policy_hits(
+            candidates=hits, top_k=10, similarity_threshold=0.30, gate=None
+        )
+    )
 
 
 # ── 임베딩 provenance (불변식: 저장된 벡터와 질의는 같은 공간에서 나와야 한다) ──
@@ -268,7 +275,6 @@ def test_다른_모델의_질의는_유사도를_내지_않고_거부된다(
             conn=app_conn,
             query_vector=query,
             top_k=5,
-            similarity_threshold=0.0,
             embedding_model="model-b",
             embedding_dimensions=1536,
         )
@@ -291,7 +297,6 @@ def test_차원만_다른_질의도_거부된다(app_conn: psycopg.Connection[Di
             conn=app_conn,
             query_vector=query,
             top_k=5,
-            similarity_threshold=0.0,
             embedding_model="model-a",
             embedding_dimensions=3072,
         )
@@ -316,7 +321,6 @@ def test_두_공간이_섞인_인덱스는_어느_질의로도_거부된다(
             conn=app_conn,
             query_vector=query,
             top_k=5,
-            similarity_threshold=0.0,
             embedding_model="model-a",
             embedding_dimensions=1536,
         )
@@ -331,7 +335,6 @@ def test_적재_전_빈_인덱스는_불일치가_아니다(app_conn: psycopg.Co
         conn=app_conn,
         query_vector=[0.0] * 1536,
         top_k=5,
-        similarity_threshold=0.0,
         embedding_model="model-a",
         embedding_dimensions=1536,
     )

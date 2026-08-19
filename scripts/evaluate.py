@@ -749,12 +749,15 @@ def _condition_fingerprint(
     """대조 가능성을 결정하는 지문 값들.
 
     **새 축을 붙이는 작업은 여기 한 줄을 더하면 된다** — 지문 스키마는 열린 맵이라
-    `evaluation.py` 도 `regression_guard.py` 도 다시 열지 않는다. 예: 기권 게이트를
-    배선하면 `abstention_gate_statistic`·`abstention_tau` 에 설정값을 실으면 된다.
+    `evaluation.py` 도 `regression_guard.py` 도 다시 열지 않는다. 기권 게이트가 그 예이고,
+    지금은 설정값을 그대로 싣는다.
 
     프롬프트·픽스처·라벨 버전은 **손으로 적지 않고 내용에서 끌어낸다** — 손으로 적는
-    버전 문자열은 갱신을 잊는 순간 조용한 드리프트가 된다.
+    버전 문자열은 갱신을 잊는 순간 조용한 드리프트가 된다. 같은 이유로 기권 게이트도
+    상수를 다시 적지 않고 `Settings.abstention_gate()` 가 조립한 것을 읽는다 — 설정과
+    지문이 갈리면 바뀐 축이 가드에 보이지 않는다.
     """
+    gate = run_settings.abstention_gate()
     return {
         # 라벨 버전 = 골든셋 내용 지문. 결정 0008 의 라벨 재정렬 전후가 여기서 갈린다.
         "label_version": content_digest(args.golden_set, prefix="golden-") or "미상",
@@ -764,9 +767,11 @@ def _condition_fingerprint(
             content_digest(DEFAULT_RETRIEVAL_LABELS_PATH, prefix="labels-") or "미상"
         ),
         "acceptance_cut": f"{run_settings.vector_similarity_threshold:g}",
-        # 기권 게이트는 아직 배선되지 않았다 — 없는 축을 0 으로 적지 않는다.
-        "abstention_gate_statistic": "미배선",
-        "abstention_tau": "미배선",
+        # 기권 게이트. **끈 실행은 τ=0 이 아니라 "꺼짐"이다** — 0 으로 적으면 "모든 질의를
+        # 통과시킨 게이트"와 구분되지 않고, 그 둘은 다른 조건이다.
+        # τ 는 `embedding_model` 과 짝으로 읽힌다(`regression_guard.PAIRED_FINGERPRINT_FIELDS`).
+        "abstention_gate_statistic": gate.statistic.value if gate is not None else "꺼짐",
+        "abstention_tau": f"{gate.tau:g}" if gate is not None else "꺼짐",
         "query_rewrite": "on" if run_settings.query_rewrite_enabled else "off",
         # 대역 실행은 대역이라고 적는다 — 설정값 모델명을 적으면 산출물이 거짓 신고한다.
         "embedding_model": "결정론 대역" if args.stub_llm else run_settings.embedding_model,
