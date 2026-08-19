@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     #: 판정 max_tokens — thinking+응답 합산 상한이므로 여유 있게 둔다
     #: (thinking 설정 미전송 = adaptive thinking 켜짐이 모델 기본).
     judge_max_output_tokens: int = 16000
+    #: 판정 **고정 프리픽스**(판정 지침) 프롬프트 캐싱 스위치. 캐싱은 호출 구성이지 지침
+    #: 변경이 아니므로 프롬프트 문면·판(`judge_prompt_version`)은 따라 움직이지 않는다.
+    #: **기본값은 꺼짐** — 실측이 정당화하지 않는 기본값을 남기지 않는다(사이클 4 T8).
+    #: 이 값은 실행 조건 지문의 `judge_prompt_caching` 으로 그대로 실린다.
+    judge_prompt_caching_enabled: bool = False
 
     # ── 검색 전략 ───────────────────────────────────────────────────────────
     #: 검색용 질의 재작성 스위치 — 기본 켜짐. **켜짐 + 재작성 클라이언트 미배선은 조립 시점

@@ -29,6 +29,9 @@
 
 판정 호출의 토큰(입력/출력)은 `JudgeOutcome` 에 그대로 노출한다 — 파이프라인이 생성
 토큰과 **분리 집계**해야 하므로(docs/contracts.md "토큰 집계 경계") 생성 합산에 섞지 않는다.
+**캐시 계열(write/read)도 같은 자격으로 분리해 노출한다** — 단가가 다르고(write 는 비싸고
+read 는 싸다), 켜짐 조건의 `input_tokens` 는 적중분을 뺀 값이라 합치면 적중이 "입력 토큰
+감소"로 위장한다. 재지 않은 실행에서는 0 이 아니라 `None`(미측정)이다.
 
 해석하지 못한 산출은 통과가 아니라 거부다(fail-closed): 사유 2종 밖 값, 판정값 밖 값,
 수집 근거에 없는 ID 의 모순 쌍, verdict·사유·세부 배열이 서로 어긋나는 산출은 전부
@@ -52,7 +55,13 @@ from reply_gate.contracts import (
     RejectReason,
     Verdict,
 )
-from reply_gate.llm import GenerationClient, JsonCompletion, LLMCallError, LLMFormatError
+from reply_gate.llm import (
+    GenerationClient,
+    JsonCompletion,
+    LLMCallError,
+    LLMFormatError,
+    accumulate_optional_tokens,
+)
 
 __all__ = [
     "JUDGE_JSON_SCHEMA",
@@ -401,6 +410,10 @@ class JudgeOutcome:
     input_tokens: int
     output_tokens: int
     attempts: int
+    #: 캐시에 **쓴**/캐시에서 **읽은** 토큰. 단가가 다르므로 뭉뚱그리지 않는다.
+    #: 캐싱을 쓰지 않는 경로에서는 0 이 아니라 `None`(해당 없음/미측정)이다.
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
 
 
 class Judge:
@@ -452,6 +465,9 @@ class Judge:
         """
         input_tokens = 0
         output_tokens = 0
+        # 캐시 계열은 **0 에서 시작하지 않는다** — 한 번도 보고되지 않으면 미측정이다.
+        cache_creation: int | None = None
+        cache_read: int | None = None
         # 실제로 나간 전송 수. **토큰과 같은 이유로 버리지 않는다** — 앞선 형식 실패의
         # 비용을 세면서 그 시도가 있었다는 사실을 세지 않으면 기록과 실제가 갈린다.
         sent = 0
@@ -470,6 +486,10 @@ class Judge:
             except LLMFormatError as exc:
                 input_tokens += exc.input_tokens
                 output_tokens += exc.output_tokens
+                cache_creation = accumulate_optional_tokens(
+                    cache_creation, exc.cache_creation_input_tokens
+                )
+                cache_read = accumulate_optional_tokens(cache_read, exc.cache_read_input_tokens)
                 sent += exc.transport_attempts
                 error = exc.detail
                 previous_output = exc.raw_text or None
@@ -485,10 +505,20 @@ class Judge:
                     cause=exc.cause,
                     input_tokens=input_tokens + exc.input_tokens,
                     output_tokens=output_tokens + exc.output_tokens,
+                    cache_creation_input_tokens=accumulate_optional_tokens(
+                        cache_creation, exc.cache_creation_input_tokens
+                    ),
+                    cache_read_input_tokens=accumulate_optional_tokens(
+                        cache_read, exc.cache_read_input_tokens
+                    ),
                 ) from exc
 
             input_tokens += completion.input_tokens
             output_tokens += completion.output_tokens
+            cache_creation = accumulate_optional_tokens(
+                cache_creation, completion.cache_creation_input_tokens
+            )
+            cache_read = accumulate_optional_tokens(cache_read, completion.cache_read_input_tokens)
             # `_ParseError` 로 continue 하는 경로에서도 이 전송은 이미 나갔다.
             sent += completion.transport_attempts
             try:
@@ -502,6 +532,8 @@ class Judge:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 attempts=attempt,
+                cache_creation_input_tokens=cache_creation,
+                cache_read_input_tokens=cache_read,
             )
 
         raise LLMFormatError(
@@ -511,4 +543,6 @@ class Judge:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             transport_attempts=sent,
+            cache_creation_input_tokens=cache_creation,
+            cache_read_input_tokens=cache_read,
         )

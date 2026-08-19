@@ -653,7 +653,9 @@ class _LazyJudgeClient:
                     "L2_ENABLED=false 로 판정을 끄고 다시 실행한다."
                 )
             self._client = AnthropicGenerationClient(
-                api_key=api_key, model=self._settings.judge_model
+                api_key=api_key,
+                model=self._settings.judge_model,
+                prompt_caching=self._settings.judge_prompt_caching_enabled,
             )
         return self._client
 
