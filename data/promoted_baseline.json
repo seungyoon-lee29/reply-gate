@@ -6,7 +6,35 @@
     "재등재도 같은 자격이다 — 판정 층(판정 프롬프트·판정 픽스처·캐싱)이 바뀌면 그 변경 뒤에 다시 등재한다. supersedes 에 직전 승격의 리포트 스템을 적는다.",
     "등재되지 않은 상태는 0 이나 '통과'가 아니라 '기준선 미등재'로 리포트에 적힌다."
   ],
-  "promotion": null,
-  "report_stems": [],
-  "fingerprint": {}
+  "promotion": {
+    "promoted_at": "2026-08-19",
+    "promoted_by": "사용자 (사이클 4 · 관측 요약 보고 뒤 확인)",
+    "reason": "현 기본값 조합(재작성 켜짐 · 컷 0.30 · 캐싱 없음 · T6 이전 판정 프롬프트)의 첫 풀셋 라이브 3회. 관측 넷을 모두 충족했다 — G17 재작성 유지 3/3 · G18·G01·G02 상충쌍 동시 채택 각 3/3 · G21-G24 판정 층 인계 3/3 · G04 정답 조항 채택 + 정상 답변 3/3. 측정 1 은 앞선 여섯 세트와 동일하고 측정 3 은 3회 중 2회가 동일(1회는 오탐 1건 — 9세트 만의 첫 관측). 새 회귀 가드가 붙은 코드로 산출돼 근거 부분 손실 검사가 온전히 작동하는 첫 세트다.",
+    "supersedes": []
+  },
+  "report_stems": [
+    "evaluation-live-l2-7",
+    "evaluation-live-l2-8",
+    "evaluation-live-l2-9"
+  ],
+  "fingerprint": {
+    "label_version": "golden-79e0da454f3a",
+    "retrieval_labels_version": "labels-7fb4ceef7aa6",
+    "acceptance_cut": "0.3",
+    "abstention_gate_statistic": "미배선",
+    "abstention_tau": "미배선",
+    "query_rewrite": "on",
+    "embedding_model": "text-embedding-3-small",
+    "embedding_dimensions": "1536",
+    "top_k": "5",
+    "generation_model": "gpt-5.6-terra",
+    "judge_model": "claude-sonnet-5",
+    "judge_effort": "기본값",
+    "judge_prompt_version": "judge-e26f6c8e0b84",
+    "judge_fixture_version": "fixture-836322e97320",
+    "judge_prompt_caching": "off",
+    "measurement_scope": "full",
+    "generation_effort": "기본값",
+    "l2_enabled": "on"
+  }
 }
