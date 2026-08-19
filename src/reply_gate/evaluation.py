@@ -33,8 +33,9 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from functools import reduce
 from pathlib import Path
-from typing import Any, Final, Protocol
+from typing import Any, Final, Protocol, cast
 
 import psycopg
 from psycopg.rows import DictRow
@@ -53,7 +54,7 @@ from reply_gate.contracts import (
 )
 from reply_gate.gate import DEFAULT_PII_PATTERNS, REASON_ORDER, evaluate_draft
 from reply_gate.judge import L2_REJECT_REASONS
-from reply_gate.llm import LLMCallError, LLMFormatError
+from reply_gate.llm import LLMCallError, LLMFormatError, accumulate_optional_tokens
 from reply_gate.pipeline import (
     L2_JUDGE_STAGE,
     Judging,
@@ -983,6 +984,11 @@ class L2Outcome:
     input_tokens: int
     output_tokens: int
     error: str | None
+    #: 캐시 계열 토큰 — **판정 입력 토큰과 뭉뚱그리지 않는다.** 캐싱 켜짐 조건에서
+    #: `input_tokens` 는 캐시 적중분을 뺀 비캐시 입력이고, write 와 read 는 단가가 다르다.
+    #: 캐시를 재지 않은 실행에서는 0 이 아니라 `None`(해당 없음/미측정)이다.
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
 
     @property
     def judged(self) -> bool:
@@ -1018,6 +1024,10 @@ class JudgeAccuracy:
     output_tokens_total: int
     breakdown: tuple[ReasonBreakdown, ...]
     outcomes: tuple[L2Outcome, ...]
+    #: 캐시 write/read 합계. **한 건도 보고되지 않았으면 0 이 아니라 `None`(미측정)** 이다 —
+    #: "캐시가 0 토큰 적중했다"와 "캐시를 잰 적이 없다"는 다른 상태다.
+    cache_creation_tokens_total: int | None = None
+    cache_read_tokens_total: int | None = None
 
     @property
     def judged_total(self) -> int:
@@ -1062,6 +1072,13 @@ class JudgeAccuracy:
         if self.total == 0:
             return None
         return (self.input_tokens_total + self.output_tokens_total) / self.total
+
+    @property
+    def cache_measured(self) -> bool:
+        """캐시 계열을 **잰** 실행인가. 안 잰 실행의 표기는 0 이 아니라 "미측정" 이다."""
+        return (
+            self.cache_creation_tokens_total is not None or self.cache_read_tokens_total is not None
+        )
 
 
 def _claims_from_json(rows: Sequence[Any], *, fixture_id: str) -> tuple[Claim, ...]:
@@ -1197,6 +1214,9 @@ def evaluate_judge_fixture(*, fixture: JudgeFixture, judge: Judging) -> L2Outcom
             input_tokens=exc.input_tokens,
             output_tokens=exc.output_tokens,
             error=f"{type(exc).__name__}: {exc}",
+            # 실행됐으나 실패한 호출의 캐시 write 도 실비용이다 — 0 으로 접지 않는다.
+            cache_creation_input_tokens=exc.cache_creation_input_tokens,
+            cache_read_input_tokens=exc.cache_read_input_tokens,
         )
 
     result = outcome.result
@@ -1226,6 +1246,8 @@ def evaluate_judge_fixture(*, fixture: JudgeFixture, judge: Judging) -> L2Outcom
         input_tokens=outcome.input_tokens,
         output_tokens=outcome.output_tokens,
         error=None,
+        cache_creation_input_tokens=outcome.cache_creation_input_tokens,
+        cache_read_input_tokens=outcome.cache_read_input_tokens,
     )
 
 
@@ -1277,6 +1299,17 @@ def measure_judge_accuracy(
         output_tokens_total=sum(outcome.output_tokens for outcome in outcomes),
         breakdown=breakdown,
         outcomes=tuple(outcomes),
+        # 캐시 계열은 `sum` 이 아니라 누적기로 접는다 — 미측정을 0 으로 만들지 않는다.
+        cache_creation_tokens_total=reduce(
+            accumulate_optional_tokens,
+            (outcome.cache_creation_input_tokens for outcome in outcomes),
+            cast(int | None, None),
+        ),
+        cache_read_tokens_total=reduce(
+            accumulate_optional_tokens,
+            (outcome.cache_read_input_tokens for outcome in outcomes),
+            cast(int | None, None),
+        ),
     )
 
 
@@ -2212,6 +2245,28 @@ def _grand_total(pipeline: PipelineAgreement) -> int:
     )
 
 
+def _cache_token_lines(accuracy: JudgeAccuracy) -> list[str]:
+    """판정 프롬프트 캐시 계열 — **판정 입력 토큰과 분리해서** 적는다.
+
+    캐싱 켜짐 조건에서 `input_tokens` 는 캐시 적중분을 **제외한** 비캐시 입력이다. 세 값을
+    뭉뚱그려 "입력 토큰이 줄었다"고 적으면 그 자체가 은폐다 — write 는 일반 입력보다 비싸고
+    read 는 싸므로 단가가 다른 값을 한 칸에 넣을 수 없다.
+
+    **재지 않은 실행은 0 이 아니라 "미측정"** 이다(`scripts/AGENTS.md` 불변식 5).
+    달러 환산은 싣지 않는다 — 저장소에 기준일·출처가 붙은 단가 표가 아직 없다.
+    """
+    if not accuracy.cache_measured:
+        return [
+            "- 판정 프롬프트 캐시: **미측정** (캐시 계열 토큰을 보고하지 않은 실행 — 0 이 아니다)"
+        ]
+    return [
+        f"- 판정 프롬프트 캐시(판정 입력 토큰과 별도 칸): "
+        f"write {accuracy.cache_creation_tokens_total} / "
+        f"read {accuracy.cache_read_tokens_total} "
+        f"— 위 '판정 토큰 입력'은 **캐시 적중분을 제외한 비캐시 입력**이다"
+    ]
+
+
 def _render_measurement_three(
     accuracy: JudgeAccuracy | SkippedMeasurement, conditions: RunConditions
 ) -> list[str]:
@@ -2279,6 +2334,7 @@ def _render_measurement_three(
             f"- 판정 토큰: 입력 {accuracy.input_tokens_total} / "
             f"출력 {accuracy.output_tokens_total} "
             f"(픽스처당 {_num(accuracy.tokens_per_fixture)})",
+            *_cache_token_lines(accuracy),
             "",
             "### 사유 2종별 내역",
             "",
@@ -2573,6 +2629,11 @@ def _measurement_three_json(
             "input_total": accuracy.input_tokens_total,
             "output_total": accuracy.output_tokens_total,
             "per_fixture": accuracy.tokens_per_fixture,
+            #: 캐시 계열은 **판정 토큰 정의를 왜곡하지 않게 분리 표기**한다. 켜짐 조건의
+            #: `input_total` 은 캐시 적중분을 제외한 비캐시 입력이고, write/read 는 단가가
+            #: 서로 다르다. 재지 않은 실행은 0 이 아니라 `null`(미측정)이다.
+            "cache_creation_total": accuracy.cache_creation_tokens_total,
+            "cache_read_total": accuracy.cache_read_tokens_total,
         },
         "reason_breakdown": [
             {
@@ -2601,6 +2662,8 @@ def _measurement_three_json(
                 "contradiction_extra": outcome.contradiction_extra,
                 "input_tokens": outcome.input_tokens,
                 "output_tokens": outcome.output_tokens,
+                "cache_creation_input_tokens": outcome.cache_creation_input_tokens,
+                "cache_read_input_tokens": outcome.cache_read_input_tokens,
                 "matched": outcome.reasons_matched,
                 "error": outcome.error,
             }

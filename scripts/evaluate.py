@@ -801,8 +801,9 @@ def _condition_fingerprint(
         "judge_effort": run_settings.judge_effort or "기본값",
         "judge_prompt_version": text_digest(JUDGE_SYSTEM_PROMPT, prefix="judge-"),
         "judge_fixture_version": content_digest(args.judge_fixtures, prefix="fixture-") or "미상",
-        # 판정 프롬프트 캐싱은 아직 배선이 없다. 배선하면 설정에서 읽도록 바꾼다.
-        "judge_prompt_caching": "off",
+        # 판정 프롬프트 캐싱. **하드코딩으로 두면 캐싱을 켜도 지문이 거짓말을 한다** —
+        # 판정자를 조립하는 것과 같은 설정(`run_settings`)에서 읽는다.
+        "judge_prompt_caching": "on" if run_settings.judge_prompt_caching_enabled else "off",
         "l2_enabled": "on" if settings.l2_enabled else "off",
     }
 
