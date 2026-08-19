@@ -60,6 +60,8 @@ from reply_gate.evaluation import (
     RunConditions,
     SkippedMeasurement,
     StubGenerationClient,
+    assess_targets,
+    attach_regression_guard,
     build_report,
     load_golden_set,
     load_judge_fixtures,
@@ -104,12 +106,13 @@ def _processed(
     judge_output_tokens: int = 0,
     evidence: tuple[Evidence, ...] = (),
     failed_stage: str | None = None,
+    intent: IntentSource | None = IntentSource.POLICY,
 ) -> ProcessedInquiry:
     return ProcessedInquiry(
         inquiry_id="00000000-0000-4000-8000-000000000000",
         order_no=None,
         content="문의",
-        intent=IntentSource.POLICY,
+        intent=intent,
         status=status,
         answer="답변" if status is InquiryStatus.ANSWERED else None,
         claims=(Claim(text="답변", citation_ids=("policy:refund:2-1",)),),
@@ -170,6 +173,8 @@ def _conditions(
     l2_enabled: bool = True,
     judge: str = "결정론 대역",
     retrieval_strategy: str = "vector+rewrite",
+    fingerprint: dict[str, str] | None = None,
+    declared: tuple[str, ...] = (),
 ) -> RunConditions:
     return RunConditions(
         started_at=utc_now_iso(),
@@ -191,6 +196,9 @@ def _conditions(
         l2_enabled=l2_enabled,
         measurement2_is_real=is_real,
         measurement3_is_real=judge_is_real,
+        billed=is_real,
+        condition_fingerprint=fingerprint or {},
+        declared_experiment_fields=declared,
     )
 
 
@@ -1333,9 +1341,9 @@ def test_확정된_목표치가_리포트에_실린다() -> None:
     report = _report(pipeline=SkippedMeasurement(reason="미요청"))
     markdown = render_markdown(report)
     assert "## 목표치 대비" in markdown
-    assert "| 측정 1 구조적 오류 검출률 | ≥ 100% |" in markdown
-    assert "| 측정 1 정상 초안 오탐률 | ≤ 0% |" in markdown
-    assert "| 측정 2 허용 결과 집합 대비 일치율 | ≥ 75% |" in markdown
+    assert "| 측정 1 구조적 오류 검출률 | 달성 목표 | ≥ 100% |" in markdown
+    assert "| 측정 1 정상 초안 오탐률 | 달성 목표 | ≤ 0% |" in markdown
+    assert "| 측정 2 허용 결과 집합 대비 일치율 | 하한 경보선 | ≥ 75% |" in markdown
 
     metrics = report_to_json(report)["targets"]["metrics"]
     by_key = {metric["key"]: metric for metric in metrics}
@@ -1398,10 +1406,12 @@ def test_실측된_일치율은_달성과_미달을_실제로_판정한다() -> 
         if metric["key"] == "match_rate"
     )
     assert met_json["met"] is True and met_json["verdict"] == "달성"
-    assert missed_json["met"] is False and missed_json["verdict"] == "미달"
+    # 합산 일치율은 **하한 경보선**이라 미달 문면이 "경보"다(결정 0006 재확정).
+    # `met` 은 여전히 False 다 — 경계 판정 자체가 사라진 것이 아니라 성격이 바뀐 것이다.
+    assert missed_json["met"] is False and missed_json["verdict"] == "경보"
 
     assert "| 100.0% | 달성 |" in render_markdown(met_report)
-    assert "| 0.0% | **미달** |" in render_markdown(missed_report)
+    assert "| 0.0% | **경보** |" in render_markdown(missed_report)
 
 
 def test_대역_일치율은_달성으로_판정하지_않는다() -> None:
@@ -1433,7 +1443,7 @@ def _stem(
     return resolve_report_stem(
         requested=requested,
         live_requested=True,
-        measurement2_is_real=real,
+        billed=real,
         l2_enabled=l2,
         out_dir=tmp_path,
     )
@@ -1695,7 +1705,12 @@ def test_판정_키가_없으면_측정2_와_측정3_을_모두_건너뛴다(
     # 양성 대조 — L2 가 꺼져 있으면 판정 키 부재는 사유가 아니고 뒤 검사(DB)로 넘어간다.
     args = evaluate.build_parser().parse_args(["--live"])
     settings = _l2_settings(judge_key=False).model_copy(update={"l2_enabled": False})
-    assert evaluate._skip_reason(args=args, settings=settings) == "DB 사유"
+    assert (
+        evaluate._skip_reason(
+            args=args, settings=settings, selected=evaluate.selected_measurements(args)
+        )
+        == "DB 사유"
+    )
 
 
 def test_stub_llm_실행에서_측정3_은_미실행_사유로_남는다(
@@ -1707,7 +1722,12 @@ def test_stub_llm_실행에서_측정3_은_미실행_사유로_남는다(
     _block_outbound_sockets(monkeypatch)
 
     args = evaluate.build_parser().parse_args(["--stub-llm"])
-    reason = evaluate._judge_skip_reason(args=args, settings=_l2_settings(), skip=None)
+    reason = evaluate._judge_skip_reason(
+        args=args,
+        settings=_l2_settings(),
+        skip=None,
+        selected=evaluate.selected_measurements(args),
+    )
 
     assert reason is not None
     assert "--live" in reason
@@ -2217,3 +2237,297 @@ def test_stub_llm_진입점이_실제_DB_에서_판정_대역까지_배선한다
     assert payload["conditions"]["l2_enabled"] is True
     assert payload["conditions"]["measurement2_is_real"] is False
     assert not list(tmp_path.glob("evaluation-live*"))
+
+
+# ── 케이스 귀인 개선 3건 (docs/tracking/findings.md 20번) ─────────────────────
+
+
+def test_귀인이_정책_검색_실행_여부를_명시_필드로_적는다(tmp_path: Path) -> None:
+    """의도가 `order` 로 라우팅해 **검색이 아예 안 돈** 케이스와 검색이 걸러진 케이스를
+    가른다. 지금까지는 검색 토큰 0 + `sql:` 단독 채택으로 역추론해야 했다."""
+    sql_row = Evidence(
+        id="sql:11111111-1111-4111-8111-111111111111:1",
+        source=EvidenceSource.SQL,
+        content="SELECT ...",
+        evidence_text="배송중",
+    )
+    support = Evidence(
+        id="policy:support:4-1",
+        source=EvidenceSource.POLICY,
+        content="고객센터 운영 안내",
+        evidence_text="고객센터 운영 안내",
+    )
+    agreement = measure_pipeline_agreement(
+        cases=[_case("G09"), _case("G19"), _case("G17")],
+        pipeline=ScriptedPipeline(
+            [
+                # G09: 의도 분류가 order 로 보내 정책 검색이 실행되지 않았다.
+                _processed(evidence=(sql_row,), intent=IntentSource.ORDER),
+                # G19: 검색은 돌았는데 정답 조항이 걸러졌다.
+                _processed(evidence=(support,), intent=IntentSource.BOTH),
+                # G17: 의도 해석 자체가 무너졌다 — 실행 여부를 알 수 없다.
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.LLM_CALL_FAILED,
+                    intent=None,
+                ),
+            ]
+        ),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    assert agreement.outcomes[0].intent == "order"
+    payload = report_to_json(_report(pipeline=agreement))
+    by_id = {item["case_id"]: item for item in payload["failure_attribution"]["cases"]}
+    assert by_id["G09"]["policy_retrieval_ran"] is False
+    assert "order" in (by_id["G09"]["policy_retrieval_note"] or "")
+    assert by_id["G19"]["policy_retrieval_ran"] is True
+    # 미상은 False 가 아니다 — 0 으로 채우지 않는다는 규칙이 케이스 단위에도 적용된다.
+    assert by_id["G17"]["policy_retrieval_ran"] is None
+
+    markdown = render_markdown(_report(pipeline=agreement))
+    assert "정책 검색 미실행" in markdown
+
+
+def test_주문_단계_사전_인계는_빈_정답의_기대_경로다(tmp_path: Path) -> None:
+    """G28 의 `order_not_found` 종결은 "구조적 사유가 이긴다" 계약상 정상이다
+    (docs/business-rules.md). 기대 경로 목록에 없으면 매번 비정상으로 찍힌다."""
+    agreement = measure_pipeline_agreement(
+        cases=[
+            _case(
+                "G28",
+                statuses=(InquiryStatus.ESCALATED,),
+                reasons=(EscalationReason.ORDER_NOT_FOUND,),
+                category="no_evidence",
+            )
+        ],
+        pipeline=ScriptedPipeline(
+            [
+                _processed(
+                    status=InquiryStatus.ESCALATED,
+                    escalation=EscalationReason.ORDER_NOT_FOUND,
+                    intent=IntentSource.BOTH,
+                )
+            ]
+        ),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    payload = report_to_json(_report(pipeline=agreement))
+    breakdown = payload["failure_attribution"]
+    case = breakdown["cases"][0]
+    assert case["classification"] == "expected_no_answer"
+    assert case["normal_behavior"] is True
+    assert case["normal_behavior_path"] == "order_stage_pre_handoff"
+    assert case["anomaly_reason"] is None
+    assert breakdown["expected_no_answer_anomaly_count"] == 0
+    assert "주문 단계 사전 인계" in render_markdown(_report(pipeline=agreement))
+
+
+def test_generation_issue_는_최종_상태와_matched_를_병기한다(tmp_path: Path) -> None:
+    """1차 기각 후 재생성으로 회복한 케이스가 종결 실패처럼 읽히면 안 된다."""
+    support = Evidence(
+        id="policy:support:4-1",
+        source=EvidenceSource.POLICY,
+        content="고객센터 운영 안내",
+        evidence_text="고객센터 운영 안내",
+    )
+    channel = Evidence(
+        id="policy:support:4-2",
+        source=EvidenceSource.POLICY,
+        content="문의 접수 채널",
+        evidence_text="문의 접수 채널",
+    )
+    recovered = _processed(
+        status=InquiryStatus.ANSWERED,
+        attempts=(
+            AttemptRecord(
+                attempt_no=1,
+                verdict=Verdict.REJECT,
+                reject_reasons=(RejectReason.UNSUPPORTED_CLAIM,),
+                draft={},
+            ),
+            AttemptRecord(attempt_no=2, verdict=Verdict.PASS, reject_reasons=(), draft={}),
+        ),
+        evidence=(support, channel),
+    )
+    agreement = measure_pipeline_agreement(
+        cases=[_case("G20")],
+        pipeline=ScriptedPipeline([recovered]),
+        app_conn=_NO_CONN,
+        readonly_conn=_NO_CONN,
+    )
+
+    payload = report_to_json(_report(pipeline=agreement))
+    case = payload["failure_attribution"]["cases"][0]
+    assert case["classification"] == "generation_issue"
+    assert case["final_status"] == "answered"
+    assert case["matched"] is True
+    markdown = render_markdown(_report(pipeline=agreement))
+    assert "최종 answered" in markdown and "라벨 일치" in markdown
+
+
+# ── 리포트 이름 규칙 — 자격 판정 근거는 "과금 실행 여부" ──────────────────────
+
+
+def test_측정_2_를_건너뛴_과금_실행도_라이브_이름을_받는다(tmp_path: Path) -> None:
+    """측정 3 단독 실측이 `evaluation` 스템으로 떨어지면 gitignore 에 걸려 다음 실행에
+    덮인다 — 과금된 산출물이 그렇게 사라진다. 이름 계열은 늘리지 않는다."""
+    assert _stem(tmp_path, real=True, l2=True) == "evaluation-live-l2-1"
+    assert (
+        _stem(tmp_path, requested="evaluation-live-l2-7", real=True, l2=True)
+        == "evaluation-live-l2-7"
+    )
+
+
+def test_과금이_아닌_실행은_여전히_라이브_이름을_못_쓴다(tmp_path: Path) -> None:
+    """양방향 불변식은 그대로다 — 근거만 `measurement2_is_real` 에서 과금 여부로 바뀐다."""
+    with pytest.raises(ReportStemError):
+        _stem(tmp_path, requested="evaluation-live-l2-1", real=False, l2=True)
+
+
+# ── 합산 일치율은 하한 경보선이다 (결정 0006 재확정) ─────────────────────────
+
+
+def test_합산_일치율_목표는_하한_경보선이고_판정은_케이스가_한다() -> None:
+    by_key = {target.key: target for target in TARGETS}
+    assert by_key["match_rate"].alert_only is True
+    assert by_key["detection_rate"].alert_only is False
+    assert by_key["false_positive_rate"].alert_only is False
+
+
+def test_하한_경보선_미달은_경보로_적힌다() -> None:
+    report = _real_agreement_report(matched=False)
+    verdicts = {item.target.key: item.verdict for item in assess_targets(report)}
+    assert verdicts["match_rate"] == "경보"
+    markdown = render_markdown(report)
+    assert "하한 경보선" in markdown
+    assert "케이스 단위" in markdown
+
+
+# ── 회귀 가드가 리포트에 실린다 ──────────────────────────────────────────────
+
+
+def test_리포트가_회귀_가드_두_줄을_싣는다(tmp_path: Path) -> None:
+    report = _real_agreement_report(matched=True)
+    markdown = render_markdown(report)
+    assert "## 회귀 가드 — 이중 기준선 두 줄 보고" in markdown
+    payload = report_to_json(report)
+    # 넘기지 않은 가드는 "미산출 + 사유"다 — 통과로 대체하지 않는다.
+    assert payload["regression_guard"]["computed"] is False
+    assert payload["regression_guard"]["reason"]
+
+
+def test_실행_조건에_조건_지문과_선언된_실험_변인이_실린다() -> None:
+    conditions = _conditions(
+        is_real=True,
+        fingerprint={"abstention_tau": "0.42", "abstention_gate_statistic": "mean_top_k"},
+        declared=("abstention_tau", "abstention_gate_statistic"),
+    )
+    report = _report(pipeline=SkippedMeasurement(reason="미요청"), conditions=conditions)
+    payload = report_to_json(report)
+    assert payload["conditions"]["condition_fingerprint"]["abstention_tau"] == "0.42"
+    assert payload["conditions"]["declared_experiment_fields"] == [
+        "abstention_tau",
+        "abstention_gate_statistic",
+    ]
+    assert payload["conditions"]["billed"] is True
+    assert payload["conditions"]["measurement_scope"]
+    markdown = render_markdown(report)
+    assert "조건 지문" in markdown
+    assert "abstention_tau" in markdown
+    assert "선언된 실험 변인" in markdown
+
+
+def test_attach_regression_guard_가_리포트에_두_줄을_붙인다(tmp_path: Path) -> None:
+    """실행 진입점이 쓰는 이음매 — 승격 참조가 없으면 "기준선 미등재"가 산출물에 남는다."""
+    report = _real_agreement_report(matched=True)
+    attached = attach_regression_guard(
+        report,
+        stem="evaluation-live-l2-9",
+        reports_dir=tmp_path,
+        promoted_reference_path=tmp_path / "없는-참조.json",
+    )
+    payload = report_to_json(attached)["regression_guard"]
+    assert payload["computed"] is True
+    assert payload["verdict"] == "기준선 미등재"
+    assert payload["promotion"]["registered"] is False
+    assert payload["binding"]["role"] == "구속"
+    assert payload["alert"]["role"] == "경보"
+    assert "기준선 미등재" in render_markdown(attached)
+
+
+# ── 측정 3 단독 실측 — 과금된 산출물의 보존 경로 ─────────────────────────────
+
+
+def test_측정3_단독_실측은_DB_도_생성_키도_없이_라이브_이름으로_보존된다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**계산된** 과금 여부를 통과시키는 테스트다 — 손으로 넣은 `billed` 가 아니다.
+
+    측정 3 이 실제로 필요로 하는 것은 판정 키 + L2 켜짐뿐이다. DB 도 `OPENAI_API_KEY` 도
+    없는 실행이 판정 픽스처를 사고, 그 산출물이 `evaluation` 스템으로 떨어지면 gitignore 에
+    걸려 다음 실행에 덮인다 — 그 손실을 막는 것이 이 경로의 존재 이유다.
+    """
+    monkeypatch.setattr(evaluate, "get_settings", lambda: _l2_settings(live_keys=False))
+    # DB 없음 · 생성 키 없음 — 측정 2 는 어차피 못 돌고, 고르지도 않았다.
+    monkeypatch.setattr(evaluate, "database_unavailable_reason", lambda *, settings: "DB 없음")
+    monkeypatch.setattr(evaluate, "build_judge", lambda settings: OracleJudge(JUDGE_FIXTURES))
+    _block_outbound_sockets(monkeypatch)
+
+    assert evaluate.main(["--live", "--measurements", "3", "--out-dir", str(tmp_path)]) == 0
+
+    # 이름 계열은 늘리지 않는다 — 기존 l2 계열 그대로다.
+    json_path = tmp_path / "evaluation-live-l2-1.json"
+    assert json_path.exists(), sorted(path.name for path in tmp_path.iterdir())
+    assert not (tmp_path / "evaluation.json").exists()
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["conditions"]["billed"] is True
+    # 측정 2 는 "미실행 + 사유"다 — 0 으로 채우지 않는다.
+    assert payload["conditions"]["measurement2_is_real"] is False
+    measurement2 = payload["measurement_2_pipeline_agreement"]
+    assert measurement2["executed"] is False
+    assert "--measurements" in measurement2["skip_reason"]
+    # 측정 3 은 실제로 돌았다.
+    judged = payload["measurement_3_l2_judge_accuracy"]
+    assert judged["executed"] is True
+    assert judged["total"] == len(JUDGE_FIXTURES)
+    # 조건 지문에 측정 범위가 사실대로 실린다.
+    assert payload["conditions"]["measurement_scope"] == "measurement_1_3_only"
+
+
+def test_측정_선택은_측정_2_의_DB_생성_키_전제를_건너뛴다(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """양성 대조 — 측정 2 를 고르면 DB 부재가 그대로 측정 2 의 사유가 된다."""
+    settings = _l2_settings()
+    args = evaluate.build_parser().parse_args(["--live", "--measurements", "3"])
+    selected = evaluate.selected_measurements(args)
+    assert "--measurements" in str(
+        evaluate._skip_reason(args=args, settings=settings, selected=selected)
+    )
+    # 측정 3 은 측정 2 의 사유를 물려받지 않는다 — 키와 L2 만 본다.
+    assert (
+        evaluate._judge_skip_reason(args=args, settings=settings, skip="DB 없음", selected=selected)
+        is None
+    )
+
+    both = evaluate.build_parser().parse_args(["--live"])
+    both_selected = evaluate.selected_measurements(both)
+    # 둘 다 고른 실행에서는 여전히 물려받는다 — 요청되지 않은 부분 구매를 막는다.
+    inherited = evaluate._judge_skip_reason(
+        args=both, settings=settings, skip="DB 없음", selected=both_selected
+    )
+    assert inherited is not None and "측정 2 와 같은 사유" in inherited
+
+
+def test_알_수_없는_측정_선택은_측정_시작_전에_거부된다() -> None:
+    args = evaluate.build_parser().parse_args(["--live", "--measurements", "4"])
+    with pytest.raises(SystemExit):
+        evaluate.selected_measurements(args)
+    empty = evaluate.build_parser().parse_args(["--live", "--measurements", " "])
+    with pytest.raises(SystemExit):
+        evaluate.selected_measurements(empty)

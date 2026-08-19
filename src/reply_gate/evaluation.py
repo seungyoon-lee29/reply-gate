@@ -31,7 +31,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, Protocol
@@ -46,6 +46,7 @@ from reply_gate.contracts import (
     Evidence,
     EvidenceSource,
     InquiryStatus,
+    IntentSource,
     RejectReason,
     Verdict,
     is_policy_evidence_id,
@@ -62,6 +63,17 @@ from reply_gate.pipeline import (
     new_inquiry_id,
 )
 from reply_gate.query_rewrite import QUERY_REWRITE_STAGE
+from reply_gate.regression_guard import (
+    DEFAULT_PROMOTED_BASELINE_PATH,
+    ConditionFingerprint,
+    GuardUnavailable,
+    RegressionGuard,
+    build_regression_guard,
+    fingerprint_from_conditions,
+    guard_to_json,
+    render_guard_section,
+    run_summary_from_payload,
+)
 
 __all__ = [
     "DEFAULT_GOLDEN_SET_PATH",
@@ -93,6 +105,7 @@ __all__ = [
     "StubGenerationClient",
     "TargetAssessment",
     "assess_targets",
+    "attach_regression_guard",
     "build_report",
     "display_path",
     "load_golden_set",
@@ -161,7 +174,7 @@ def resolve_report_stem(
     *,
     requested: str | None,
     live_requested: bool,
-    measurement2_is_real: bool,
+    billed: bool,
     l2_enabled: bool,
     out_dir: Path,
 ) -> str:
@@ -169,12 +182,18 @@ def resolve_report_stem(
 
     규칙은 두 겹이고 **둘 다 양방향**이다.
 
-    **(1) 라이브 이름 ⇔ 실측**
+    **(1) 라이브 이름 ⇔ 과금 실행**
 
-    * 실측이 아닌 실행(측정 2 미실행·대역)은 라이브 이름을 쓸 수 없다. `--live` 를 줬어도
-      키·DB 문제로 측정 2 가 미실행이면 비실측이므로 기본 이름은 `evaluation` 으로 떨어진다.
-    * 실측(과금) 실행은 라이브 이름만 쓸 수 있다 — 실측 결과가 gitignore 되는 이름으로
-      새어 나가 다음 기본 실행에 덮이는 것을 막는다.
+    * 과금 실행이 아닌 실행(대역·선검사 미통과)은 라이브 이름을 쓸 수 없다. `--live` 를
+      줬어도 키·DB 문제로 과금이 일어나지 않으면 기본 이름은 `evaluation` 으로 떨어진다.
+    * 과금 실행은 라이브 이름만 쓸 수 있다 — 실측 결과가 gitignore 되는 이름으로 새어
+      나가 다음 기본 실행에 덮이는 것을 막는다.
+    * **자격 판정 근거는 "측정 2 실측 여부"가 아니라 "과금 실행 여부"다.** 불변식의 목적은
+      "과금된 산출물을 잃지 않는다"이고 측정 2 는 그 목적의 낡은 대리 변수였다 — 측정 2 를
+      건너뛴 측정 3 단독 실측이 라이브 이름을 거부당해 `evaluation` 스템으로 떨어지면
+      `.gitignore` 의 `reports/*` 에 걸려 추적되지 않은 채 다음 실행에 덮인다. 이름 계열은
+      `evaluation-live-l2-*` 그대로이므로 계열 불증가·덮어쓰기 금지·추적 패턴이 유지되고,
+      미실행 측정은 리포트에 "미실행 + 사유"로 적힌다.
 
     **(2) L2 켜짐 실측 ⇔ `evaluation-live-l2` 접두**
 
@@ -194,11 +213,11 @@ def resolve_report_stem(
 
     실행 전에 호출해야 한다: 여기서 거부되면 과금도 측정도 시작되지 않아야 한다.
     """
-    del live_requested  # 판정 근거는 "실측인가"이지 "실측을 요청했는가"가 아니다.
+    del live_requested  # 판정 근거는 "과금됐는가"이지 "실측을 요청했는가"가 아니다.
     series = LIVE_L2_REPORT_STEM if l2_enabled else LIVE_REPORT_STEM
 
     if requested is None:
-        if not measurement2_is_real:
+        if not billed:
             stem = DEFAULT_REPORT_STEM
         elif l2_enabled:
             # 3회 반복 실측이 기본 이름 충돌로 죽지 않게 빈 번호를 코드가 찾는다.
@@ -224,31 +243,31 @@ def resolve_report_stem(
     is_live_name = folded.startswith(LIVE_REPORT_STEM)
     is_l2_name = folded.startswith(LIVE_L2_REPORT_STEM)
 
-    if is_live_name and not measurement2_is_real:
+    if is_live_name and not billed:
         raise ReportStemError(
-            f"거부: `{stem}` 은 라이브 실측 리포트 이름인데 이 실행은 실측이 아니다"
-            f"(측정 2 미실행 또는 대역). 라이브 산출물을 덮어쓰면 문서가 인용하는 수치의 "
+            f"거부: `{stem}` 은 라이브 실측 리포트 이름인데 이 실행은 과금 실행이 아니다"
+            f"(대역 또는 선검사 미통과). 라이브 산출물을 덮어쓰면 문서가 인용하는 수치의 "
             f"근거가 사라진다. 다른 --report-stem 을 쓰거나 기본값(`{DEFAULT_REPORT_STEM}`)을 쓰라."
         )
-    if measurement2_is_real and not stem.startswith(LIVE_REPORT_STEM):
+    if billed and not stem.startswith(LIVE_REPORT_STEM):
         raise ReportStemError(
-            f"거부: 실측(과금) 실행이 `{stem}` 에 쓰면 산출물이 gitignore 되어 다음 기본 "
+            f"거부: 과금 실행이 `{stem}` 에 쓰면 산출물이 gitignore 되어 다음 기본 "
             f"실행에 덮인다 — 실제로 한 번 그렇게 잃었다. `{series}` 로 시작하는 이름을 쓰라."
         )
-    if measurement2_is_real and l2_enabled and not stem.startswith(LIVE_L2_REPORT_STEM):
+    if billed and l2_enabled and not stem.startswith(LIVE_L2_REPORT_STEM):
         raise ReportStemError(
             f"거부: L2 켜짐 실측이 `{stem}` 에 쓰면 L2 꺼짐 기준선 계열과 섞인다 — 산출물만 "
             f"보고는 어느 쪽이 L2 를 포함해 잰 값인지 알 수 없게 된다. "
             f"`{LIVE_L2_REPORT_STEM}` 로 시작하는 이름을 쓰라 (예: "
             f"--report-stem {_next_free_live_stem(out_dir, prefix=LIVE_L2_REPORT_STEM)})."
         )
-    if measurement2_is_real and not l2_enabled and is_l2_name:
+    if billed and not l2_enabled and is_l2_name:
         raise ReportStemError(
             f"거부: `{stem}` 은 L2 켜짐 실측 계열 이름인데 이 실행은 L2 가 꺼져 있다. "
             f"꺼짐 기준선은 `{LIVE_REPORT_STEM}` 계열에만 쓴다 — 계열이 뒤섞이면 두 실측을 "
             f"대조하는 근거가 사라진다."
         )
-    if measurement2_is_real:
+    if billed:
         candidates = (out_dir / f"{stem}{ext}" for ext in (".md", ".json"))
         existing = [path for path in candidates if path.exists()]
         if existing:
@@ -510,6 +529,10 @@ class GoldenOutcome:
     retrieval_output_tokens: int = 0
     #: 검색 단계가 폴백한 사유. 인계 사유가 아니다 — 폴백한 문의도 답변으로 끝날 수 있다.
     retrieval_fallback_reason: str | None = None
+    #: 의도 해석이 고른 근거 소스(`policy`/`order`/`both`). **정책 검색이 실제로 돌았는지**를
+    #: 이 값이 들고 있다 — 지금까지는 검색 토큰 0 + `sql:` 단독 채택으로 역추론해야 했다
+    #: (docs/tracking/findings.md 20번 ①). 의도 해석이 무너진 문의는 `None`(미상)이다.
+    intent: str | None = None
 
     @property
     def rejected_at_least_once(self) -> bool:
@@ -803,6 +826,7 @@ def evaluate_case(
         retrieval_input_tokens=processed.retrieval_input_tokens,
         retrieval_output_tokens=processed.retrieval_output_tokens,
         retrieval_fallback_reason=processed.retrieval_fallback_reason,
+        intent=None if processed.intent is None else processed.intent.value,
     )
 
 
@@ -1300,6 +1324,35 @@ class RunConditions:
     #: 전부 뒤집힌다 — 실행 조건의 판정 모델 문자열 한 줄만으로 구분하면 리포트가 스스로
     #: "과금된 실측"이라고 거짓 신고할 수 있다.
     measurement3_is_real: bool
+    #: **과금 실행인가.** 리포트 이름의 자격과 회귀 가드 실행 여부가 이 값을 본다.
+    #: 측정 2 실측 여부와 갈릴 수 있다 — 측정 3 만 사는 실행도 과금이다.
+    billed: bool = False
+    #: 측정 범위. 풀셋인지 부분(예: 측정 3 단독)인지가 대조 가능성을 가른다.
+    measurement_scope: str = "full"
+    #: **조건 지문** — 두 실측이 애초에 대조 가능한지를 가르는 열린 맵이다
+    #: (`regression_guard.FINGERPRINT_FIELDS` 가 하한이고 상한은 아니다). 새 검색·판정 축을
+    #: 붙이는 작업은 **여기 값을 추가**하면 되고 이 모듈을 다시 열지 않아도 된다.
+    #: 비어 있는 항목은 0 이 아니라 **미상**으로 읽힌다.
+    condition_fingerprint: Mapping[str, str] = field(default_factory=dict)
+    #: 이번 실행이 "의도적으로 바꾼 축"으로 **선언한** 지문 항목. 선언된 차이는 대조를
+    #: 진행하며 차이 목록을 병기하고, 선언되지 않은 불일치만 "대조 불가"다.
+    declared_experiment_fields: tuple[str, ...] = ()
+
+    def fingerprint(self) -> ConditionFingerprint:
+        """대조 가능성을 결정하는 지문. 파생값은 명시 지문에 덮인다(명시가 이긴다)."""
+        return fingerprint_from_conditions(
+            {
+                "similarity_threshold": self.similarity_threshold,
+                "top_k": self.top_k,
+                "embedding_dimensions": self.embedding_dimensions,
+                "retrieval_strategy": self.retrieval_strategy,
+                "generation": self.generation,
+                "judge": self.judge,
+                "measurement_scope": self.measurement_scope,
+                "condition_fingerprint": dict(self.condition_fingerprint),
+                "declared_experiment_fields": list(self.declared_experiment_fields),
+            }
+        )
 
 
 @dataclass(frozen=True)
@@ -1314,6 +1367,10 @@ class MetricTarget:
     #: 확률 층 지표인가. 대역 실행의 값으로는 판정하지 않는다 — 대역 수치를 실제 수치처럼
     #: "달성"으로 찍으면 리포트가 거짓말을 한다(scripts/AGENTS.md 불변식 6과 같은 규칙).
     probabilistic: bool = False
+    #: **하한 경보선인가.** 달성 목표가 아니라 "그 아래면 무언가 크게 부서졌다"는 경보선이다
+    #: (결정 0006 재확정). 미달을 "미달"이 아니라 "경보"로 적는다 — 사이클 성패 판정은
+    #: 케이스 단위(회귀 가드)가 맡고 합산은 병기일 뿐이라는 것이 리포트 문면에 드러나야 한다.
+    alert_only: bool = False
 
     def met(self, value: float | None) -> bool | None:
         """달성 여부. **측정하지 않았으면 `None`** — 미측정을 미달로 적지 않는다."""
@@ -1335,8 +1392,9 @@ class MetricTarget:
 #: 끝났다** — 결정 0008 의 라벨 재정렬 뒤로는 **L2 를 꺼도 86.7%** 라 이 경계가 층 기여를
 #: 판별하지 못한다. 2026-08-14 재확정으로 **값은 유지하되 성격이 하한 경보선으로 바뀌었고,
 #: 회귀 판정은 케이스 단위(비악화 가드 + 케이스별 귀인)가 맡는다** — 결정 0006 의 "측정 2
-#: 목표치 재확정" 절이 소유자다. 그 가드를 여기 상설 목표로 올리려면 이전 실측을 기준선으로
-#: 들어야 해서(리포트가 리포트를 읽는다) 설계가 필요하다 — 아직 하지 않았다.
+#: 목표치 재확정" 절이 소유자다. 그 가드는 이제 상설이다: `regression_guard` 가 이전 실측을
+#: 기준선으로 들고(리포트가 리포트를 읽는다) 케이스 단위로 판정하며, 여기 남은 75% 는
+#: `alert_only` 로 성격이 박힌 **하한 경보선**이다.
 #: 측정 3(L2 판정 단위 정확도)은 **여기 없다**: 목표치를 두지 않기로 했으므로 경계가 없다.
 TARGETS: Final[tuple[MetricTarget, ...]] = (
     MetricTarget(key="detection_rate", label="측정 1 구조적 오류 검출률", bound=1.0),
@@ -1351,6 +1409,7 @@ TARGETS: Final[tuple[MetricTarget, ...]] = (
         label="측정 2 허용 결과 집합 대비 일치율",
         bound=0.75,
         probabilistic=True,
+        alert_only=True,
     ),
 )
 
@@ -1387,6 +1446,16 @@ class FailureAttributionCase:
     normal_behavior: bool | None
     normal_behavior_path: str | None
     anomaly_reason: str | None
+    #: **정책 검색이 실제로 돌았는가.** 의도 분류가 `order` 로 라우팅해 검색이 아예 안 돈
+    #: 케이스와, 검색이 돌았는데 걸러진 케이스는 다른 실패다 — 전자는 컷과 무관하다.
+    #: 의도 해석이 무너졌으면 `None`(미상)이고, **미상을 False 로 접지 않는다.**
+    policy_retrieval_ran: bool | None = None
+    #: 위 판정의 근거 한 줄. 산출물만 보고 역추론하지 않아도 되게 남긴다.
+    policy_retrieval_note: str | None = None
+    #: 최종 상태와 라벨 일치 여부. `generation_issue` 가 종결 실패처럼 읽히는 것을 막는다 —
+    #: 1차 기각 뒤 재생성으로 회복해 `answered`/일치로 끝난 케이스가 실제로 그렇다.
+    final_status: str | None = None
+    matched: bool = False
 
 
 @dataclass(frozen=True)
@@ -1427,6 +1496,12 @@ class EvaluationReport:
     pipeline: PipelineAgreement | SkippedMeasurement
     judge_accuracy: JudgeAccuracy | SkippedMeasurement
     failure_attribution: FailureAttribution | UnavailableBreakdown
+    #: 회귀 가드 두 줄 보고. 돌리지 않았으면 **미산출 + 사유**이지 통과가 아니다.
+    regression_guard: RegressionGuard | GuardUnavailable = field(
+        default_factory=lambda: GuardUnavailable(
+            reason="호출자가 회귀 가드를 넘기지 않았다 — 대조하지 않았다는 뜻이다"
+        )
+    )
 
     def measured(self) -> dict[str, float | None]:
         """목표치 대조에 쓰는 실측값. 측정 2 미실행이면 일치율은 `None`.
@@ -1461,9 +1536,10 @@ def assess_targets(report: EvaluationReport) -> tuple[TargetAssessment, ...]:
             )
             continue
         met = target.met(value)
-        assessments.append(
-            TargetAssessment(target=target, value=value, met=met, verdict="달성" if met else "미달")
-        )
+        # 하한 경보선의 미달은 사이클 판정이 아니라 **경보**다 — 판정은 케이스 단위가
+        # 맡는다(결정 0006 재확정). 문면을 "미달"로 두면 합산이 다시 판정처럼 읽힌다.
+        verdict = "달성" if met else "경보" if target.alert_only else "미달"
+        assessments.append(TargetAssessment(target=target, value=value, met=met, verdict=verdict))
     return tuple(assessments)
 
 
@@ -1474,20 +1550,56 @@ def build_report(
     pipeline: PipelineAgreement | SkippedMeasurement,
     judge_accuracy: JudgeAccuracy | SkippedMeasurement,
     retrieval_labels_path: Path | None = None,
+    regression_guard: RegressionGuard | GuardUnavailable | None = None,
 ) -> EvaluationReport:
     """리포트를 조립한다. **측정 3 도 명시해야 한다** — 기본값으로 비워 두면 미실행이
-    조용히 "사유 없는 미실행"으로 찍힌다."""
+    조용히 "사유 없는 미실행"으로 찍힌다.
+
+    회귀 가드는 리포트 JSON 을 입력으로 쓰므로 조립 뒤에 붙이는 것이 자연스럽다 —
+    `attach_regression_guard` 가 그 순서를 들고 있다. 여기서 넘기지 않으면 가드 절은
+    **미산출 + 사유**로 남는다."""
     failure_attribution = _build_failure_attribution(
         pipeline=pipeline,
         retrieval_labels_path=retrieval_labels_path,
     )
-    return EvaluationReport(
+    report = EvaluationReport(
         conditions=conditions,
         gate_accuracy=gate_accuracy,
         pipeline=pipeline,
         judge_accuracy=judge_accuracy,
         failure_attribution=failure_attribution,
     )
+    return (
+        report if regression_guard is None else replace(report, regression_guard=regression_guard)
+    )
+
+
+def attach_regression_guard(
+    report: EvaluationReport,
+    *,
+    stem: str,
+    reports_dir: Path,
+    promoted_reference_path: Path = DEFAULT_PROMOTED_BASELINE_PATH,
+) -> EvaluationReport:
+    """조립된 리포트에 회귀 가드 두 줄을 붙인다.
+
+    **승격은 여기서 일어나지 않는다** — 이 경로는 승격 참조 파일을 읽기만 하고, 쓰는 코드는
+    저장소 어디에도 없다(구조 테스트가 검사한다). 가드 산출이 실패해도 리포트를 죽이지
+    않는다: 이미 과금된 측정 산출물을 잃지 않는 것이 우선이고, 실패는 **미산출 + 사유**로
+    남는다(`scripts/AGENTS.md` 불변식 5·13 과 같은 규칙).
+    """
+    try:
+        summary = run_summary_from_payload(report_to_json(report), stem=stem, source=stem)
+        guard: RegressionGuard | GuardUnavailable = build_regression_guard(
+            current=summary,
+            reports_dir=reports_dir,
+            promoted_reference_path=promoted_reference_path,
+        )
+    except Exception as error:  # 가드 실패가 이미 과금된 산출물을 죽이면 안 된다
+        guard = GuardUnavailable(
+            reason=f"회귀 가드 산출이 실패했다({type(error).__name__}): {error}"
+        )
+    return replace(report, regression_guard=guard)
 
 
 def _build_failure_attribution(
@@ -1534,6 +1646,7 @@ def _build_failure_attribution(
             evidence_id for evidence_id in adopted if is_policy_evidence_id(evidence_id)
         )
         is_failure = outcome.rejected_at_least_once or outcome.status is InquiryStatus.ESCALATED
+        policy_retrieval_ran, policy_retrieval_note = _policy_retrieval_state(outcome)
         if relevant and not is_failure and set(relevant) <= adopted_set:
             # 정답 조항을 전부 채택하고 정상 답변한 케이스는 분해 대상이 아니다.
             continue
@@ -1555,8 +1668,17 @@ def _build_failure_attribution(
                 and bool(adopted)
                 and l2_rejected
             )
-            normal_behavior = zero_evidence_normal or l2_rejection_normal
-            if zero_evidence_normal:
+            # 주문 단계 사전 인계는 계약상 **정상 종결**이다 — business-rules 의
+            # "구조적 사유가 이긴다"가 정책 근거를 모았든 아니든 인계를 시키기 때문이다.
+            # 기대 경로 목록에 없으면 매 실행 비정상으로 찍힌다(findings 20번 ②).
+            order_stage_normal = (
+                outcome.status is InquiryStatus.ESCALATED
+                and outcome.escalation_reason in ORDER_STAGE_ESCALATIONS
+            )
+            normal_behavior = zero_evidence_normal or l2_rejection_normal or order_stage_normal
+            if order_stage_normal:
+                normal_behavior_path = "order_stage_pre_handoff"
+            elif zero_evidence_normal:
                 normal_behavior_path = "retrieval_zero_evidence"
             elif l2_rejection_normal:
                 normal_behavior_path = "l2_rejected_with_evidence"
@@ -1595,6 +1717,10 @@ def _build_failure_attribution(
                 normal_behavior=normal_behavior,
                 normal_behavior_path=normal_behavior_path,
                 anomaly_reason=anomaly_reason,
+                policy_retrieval_ran=policy_retrieval_ran,
+                policy_retrieval_note=policy_retrieval_note,
+                final_status=None if outcome.status is None else outcome.status.value,
+                matched=outcome.matched,
             )
         )
 
@@ -1622,6 +1748,32 @@ def _build_failure_attribution(
         ),
         cases=tuple(attributed),
     )
+
+
+#: 주문 단계에서 초안 전에 인계되는 **구조적** 사유. business-rules 의 "구조적 사유가
+#: 이긴다"가 정하는 목록 그대로다 — 이 종결은 계약상 정상이지 anomaly 가 아니다.
+ORDER_STAGE_ESCALATIONS: Final[frozenset[EscalationReason]] = frozenset(
+    {
+        EscalationReason.MISSING_ORDER_REF,
+        EscalationReason.ORDER_NOT_FOUND,
+        EscalationReason.SQL_FAILED,
+    }
+)
+
+
+def _policy_retrieval_state(outcome: GoldenOutcome) -> tuple[bool | None, str | None]:
+    """정책 검색이 실제로 돌았는가 — 의도 라우팅이 답을 들고 있다.
+
+    **미상(`None`)을 False 로 접지 않는다.** 의도 해석이 무너진 문의는 "검색이 안 돌았다"가
+    아니라 "돌았는지 알 수 없다"이고, 옛 산출물처럼 의도 필드가 없는 경우도 같다.
+    """
+    if outcome.intent is None:
+        return None, "의도 라우팅 기록 없음 — 정책 검색 실행 여부 미상"
+    if outcome.intent == IntentSource.ORDER.value:
+        return False, "의도 분류가 `order` 로 라우팅해 정책 검색이 실행되지 않았다"
+    if outcome.intent in (IntentSource.POLICY.value, IntentSource.BOTH.value):
+        return True, f"의도 분류가 `{outcome.intent}` 라 정책 검색이 실행됐다"
+    return None, f"알 수 없는 의도 라벨: {outcome.intent}"
 
 
 def utc_now_iso() -> str:
@@ -1694,15 +1846,52 @@ def render_markdown(report: EvaluationReport) -> str:
         f"- OPENAI_API_KEY 설정 여부: {'설정됨' if conditions.api_key_present else '없음'}",
         f"- ANTHROPIC_API_KEY 설정 여부: "
         f"{'설정됨' if conditions.judge_api_key_present else '없음'}",
+        f"- 과금 실행: {'예' if conditions.billed else '아니오'}"
+        f" · 측정 범위: {conditions.measurement_scope}",
         "",
     ]
+    lines.extend(_render_fingerprint(conditions))
     lines.extend(_render_targets(report))
     lines.extend(_render_measurement_one(report.gate_accuracy))
     lines.extend(_render_measurement_two(report.pipeline, conditions))
     lines.extend(_render_failure_attribution(report.failure_attribution))
     lines.extend(_render_measurement_three(report.judge_accuracy, conditions))
+    lines.extend(render_guard_section(report.regression_guard))
     lines.append(_LIMITS)
     return "\n".join(lines)
+
+
+def _render_fingerprint(conditions: RunConditions) -> list[str]:
+    """조건 지문 — **대조 가능성을 결정하는** 항목만 따로 세운다.
+
+    실행 조건 전체를 눈으로 훑어 비교하지 않게 한다. 값이 없는 항목은 0 이 아니라
+    **미상**으로 적히고, 이번 실행이 의도적으로 바꾼 축은 선언 목록이 들고 있다.
+    """
+    fingerprint = conditions.fingerprint()
+    declared = set(fingerprint.declared)
+    lines = [
+        "### 조건 지문 (대조 가능성)",
+        "",
+        "선언 없이 달라진 조건끼리는 대조하지 않는다. **선언된 실험 변인**은 대조를 진행하고",
+        "차이 목록을 병기한다.",
+        "",
+        "| 항목 | 값 | 선언 |",
+        "| --- | --- | :---: |",
+    ]
+    lines.extend(
+        f"| `{name}` | {fingerprint.describe(name)} | "
+        f"{'**선언된 실험 변인**' if name in declared else ''} |"
+        for name in fingerprint.values
+    )
+    lines.append("")
+    if declared:
+        lines.extend(
+            [
+                "선언된 실험 변인: " + ", ".join(f"`{name}`" for name in fingerprint.declared),
+                "",
+            ]
+        )
+    return lines
 
 
 def _render_targets(report: EvaluationReport) -> list[str]:
@@ -1713,14 +1902,22 @@ def _render_targets(report: EvaluationReport) -> list[str]:
         "2026-08-05 확정(`docs/tracking/decisions/0006-지표-목표치를-실측-뒤에-확정한다.md`).",
         "미측정 지표와 대역으로 낸 확률 층 수치는 판정하지 않는다.",
         "",
-        "| 지표 | 목표 | 실측 | 판정 |",
-        "| --- | --- | ---: | :---: |",
+        "**합산 일치율은 달성 목표가 아니라 하한 경보선이다**(결정 0006 재확정) — 그 아래로",
+        "내려가면 무언가 크게 부서졌다는 신호일 뿐이고, **사이클 성패 판정은 케이스 단위**",
+        "(회귀 가드의 비악화 판정 + 케이스별 귀인)가 맡는다. 합산은 병기다.",
+        "",
+        "| 지표 | 성격 | 경계 | 실측 | 판정 |",
+        "| --- | --- | --- | ---: | :---: |",
     ]
     for item in assess_targets(report):
         value_cell = "미측정" if item.value is None else _pct(item.value)
         verdict_cell = "**미달**" if item.verdict == "미달" else item.verdict
+        if item.verdict == "경보":
+            verdict_cell = "**경보**"
+        role = "하한 경보선" if item.target.alert_only else "달성 목표"
         lines.append(
-            f"| {item.target.label} | {item.target.describe()} | {value_cell} | {verdict_cell} |"
+            f"| {item.target.label} | {role} | {item.target.describe()} | "
+            f"{value_cell} | {verdict_cell} |"
         )
     lines.append("")
     return lines
@@ -1963,6 +2160,11 @@ def _render_failure_attribution(
         "answered_without_relevant_evidence": "근거 없이 답변 확정",
         "expected_no_answer": "빈 정답 정상 인계",
     }
+    normal_paths = {
+        "retrieval_zero_evidence": "검색 0건 종료",
+        "l2_rejected_with_evidence": "근거 채택 후 L2 검출",
+        "order_stage_pre_handoff": "주문 단계 사전 인계 — 구조적 사유가 이긴다(계약상 정상)",
+    }
     for item in attribution.cases:
         relevant = ", ".join(f"`{value}`" for value in item.relevant_evidence_ids) or "없음"
         adopted = ", ".join(f"`{value}`" for value in item.adopted_evidence_ids) or "없음"
@@ -1970,10 +2172,21 @@ def _render_failure_attribution(
         if item.classification == "expected_no_answer":
             if item.normal_behavior is False:
                 route = f" / 비정상: {item.anomaly_reason}"
-            elif item.normal_behavior_path == "retrieval_zero_evidence":
-                route = " / 검색 0건 종료"
-            elif item.normal_behavior_path == "l2_rejected_with_evidence":
-                route = " / 근거 채택 후 L2 검출"
+            elif item.normal_behavior_path in normal_paths:
+                route = f" / {normal_paths[item.normal_behavior_path]}"
+        # 정책 검색이 아예 안 돈 케이스는 컷과 무관한 실패다 — 이름으로 갈라 적는다.
+        if item.policy_retrieval_ran is False:
+            route += " / **정책 검색 미실행**"
+            if item.policy_retrieval_note:
+                route += f"({item.policy_retrieval_note})"
+        elif item.policy_retrieval_ran is None:
+            route += " / 정책 검색 실행 여부 미상"
+        # 1차 기각 뒤 재생성으로 회복한 케이스가 종결 실패처럼 읽히지 않게 병기한다.
+        if item.classification == "generation_issue":
+            route += (
+                f" / 최종 {item.final_status or '미상'}"
+                f"·{'라벨 일치' if item.matched else '라벨 불일치'}"
+            )
         label = (
             "빈 정답 비정상 종결"
             if item.classification == "expected_no_answer" and item.normal_behavior is False
@@ -2147,6 +2360,11 @@ def report_to_json(report: EvaluationReport) -> dict[str, Any]:
             "judge_api_key_present": conditions.judge_api_key_present,
             "measurement2_is_real": conditions.measurement2_is_real,
             "measurement3_is_real": conditions.measurement3_is_real,
+            "billed": conditions.billed,
+            "measurement_scope": conditions.measurement_scope,
+            # 대조 가능성을 결정하는 지문. 값이 없는 항목은 null(미상)이고 0 이 아니다.
+            "condition_fingerprint": dict(conditions.fingerprint().values),
+            "declared_experiment_fields": list(conditions.declared_experiment_fields),
         },
         "measurement_1_l1_gate_accuracy": {
             "deterministic": True,
@@ -2199,6 +2417,7 @@ def report_to_json(report: EvaluationReport) -> dict[str, Any]:
     payload["measurement_3_l2_judge_accuracy"] = _measurement_three_json(
         report.judge_accuracy, conditions
     )
+    payload["regression_guard"] = guard_to_json(report.regression_guard)
     return payload
 
 
@@ -2234,6 +2453,10 @@ def _failure_attribution_json(
                 "normal_behavior": item.normal_behavior,
                 "normal_behavior_path": item.normal_behavior_path,
                 "anomaly_reason": item.anomaly_reason,
+                "policy_retrieval_ran": item.policy_retrieval_ran,
+                "policy_retrieval_note": item.policy_retrieval_note,
+                "final_status": item.final_status,
+                "matched": item.matched,
             }
             for item in attribution.cases
         ],
@@ -2301,6 +2524,8 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
                 "retrieval_input_tokens": outcome.retrieval_input_tokens,
                 "retrieval_output_tokens": outcome.retrieval_output_tokens,
                 "retrieval_fallback_reason": outcome.retrieval_fallback_reason,
+                # 정책 검색이 돌았는지를 산출물에서 바로 읽게 한다 — 역추론 금지.
+                "intent": outcome.intent,
                 "matched": outcome.matched,
                 "mismatches": list(outcome.mismatches),
                 "error": outcome.error,
