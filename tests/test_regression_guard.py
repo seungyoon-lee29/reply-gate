@@ -35,6 +35,7 @@ from reply_gate.regression_guard import (
     fingerprint_from_conditions,
     guard_to_json,
     load_promoted_baseline,
+    load_run_summary,
     render_guard_section,
     run_summary_from_payload,
 )
@@ -264,11 +265,36 @@ def test_승격_참조가_비어_있으면_빠진_항목을_이름으로_적는�
     assert "promotion" in loaded.reason or "승격" in loaded.reason
 
 
-def test_저장소의_승격_참조는_사람이_채울_자리로_커밋되어_있다() -> None:
-    """참조 파일 자체는 저장소에 있고, 등재는 비어 있다 — 자동 승격이 없다는 증거다."""
+def test_저장소의_승격_참조는_사람의_등재_기록을_들고_있다() -> None:
+    """등재는 사람이 한다 — 누가·언제·무엇을 근거로가 없으면 구속 판정의 출처가 사라진다.
+
+    (등재 **경로**가 사람뿐이라는 것은 구조 테스트가 따로 못박는다.)
+    """
     assert DEFAULT_PROMOTED_BASELINE_PATH.exists()
     loaded = load_promoted_baseline()
-    assert isinstance(loaded, BaselineNotRegistered)
+    assert isinstance(loaded, PromotedBaseline)
+    assert loaded.promoted_at and loaded.promoted_by and loaded.reason
+    assert len(loaded.report_stems) == RUN_SET_SIZE
+
+
+def test_등재된_기준선이_자기가_가리키는_산출물과_맞는다() -> None:
+    """실제 등재로 확인한다 — 참조의 조건 지문과 세 산출물이 한 조건이어야 한다."""
+    promotion = load_promoted_baseline()
+    assert isinstance(promotion, PromotedBaseline)
+    runs = [
+        run_summary_from_payload(
+            json.loads((_ROOT / "reports" / f"{stem}.json").read_text(encoding="utf-8")),
+            stem=stem,
+            source=stem,
+        )
+        for stem in promotion.report_stems
+    ]
+    head = runs[0].fingerprint
+    for other in runs[1:]:
+        same, reason = other.fingerprint.same_condition(head)
+        assert same, reason
+    same, reason = ConditionFingerprint(values=promotion.fingerprint.values).same_condition(head)
+    assert same, reason
 
 
 def test_두_줄이_상반되면_승격_기준선이_판정을_가진다(tmp_path: Path) -> None:
@@ -1113,3 +1139,83 @@ def test_짝_때문에_어긋난_항목은_그렇게_적는다(tmp_path: Path) -
     assert model.describe() == (
         "embedding_model: 기준선 `text-embedding-3-small` → 이번 `text-embedding-3-large`"
     )
+
+
+# ── 세트 편입 — 정족수를 채우려고 다른 조건을 끌어오지 않는다 ────────────────
+
+
+def test_승격_직후_1회차_실측은_옛_산출물로_정족수를_채우지_않는다() -> None:
+    """**3회 연속 실측의 1회차·2회차가 거짓 미달을 커밋하는 것을 막는다.**
+
+    승격된 기준선(7·8·9)은 이번 세트에서 제외되므로, 9 를 현재 실행으로 두면 조건이 확인된
+    실측은 자기 자신 하나뿐이다. 예전에는 지문이 통째로 없는 사이클 2 산출물이 "전부 미상 =
+    어긋남 없음"으로 읽혀 정족수를 채웠고, 멀쩡한 케이스 셋이 `1/3` 으로 찍혀 **미달**이
+    나왔다. 라이브 리포트는 사후 편집하지 않으므로 그 거짓 판정은 기록에 영구히 남는다.
+    """
+    reports = _ROOT / "reports"
+    current = load_run_summary(reports / "evaluation-live-l2-9.json")
+    guard = build_regression_guard(current=current, reports_dir=reports)
+    assert isinstance(guard, RegressionGuard)
+
+    # ① 옛 계열이 세트에 섞이지 않는다.
+    assert guard.candidate_stems == ("evaluation-live-l2-9",)
+    for stale in ("evaluation-live-l2-1", "evaluation-live-l2-2", "evaluation-live-l2-3"):
+        assert stale not in guard.candidate_stems
+    assert guard.candidate_run_count == 1
+
+    # ② 그래서 판정은 미달도 통과도 아닌 보류다.
+    assert guard.verdict == "보류"
+    assert guard.binding.match_shortfalls == ()
+    assert guard.binding.evidence_losses == ()
+
+    # ③ 왜 정족수를 못 채웠는지가 산출물에 이름으로 남는다.
+    assert "1/3" in guard.binding.verdict_reason
+    assert "evaluation-live-l2-2" in guard.binding.verdict_reason
+    assert any("evaluation-live-l2-2" in item for item in guard.candidate_exclusions)
+    payload = guard_to_json(guard)
+    assert payload["candidate_exclusions"]
+    assert "조건 불일치로 세트에서 제외" in "\n".join(render_guard_section(guard))
+
+
+def test_조건이_확인된_3회가_모이면_진짜_회귀는_그대로_미달이다(tmp_path: Path) -> None:
+    """음성 대조 — 편입을 조인 것이 가드를 무디게 만들면 안 된다."""
+    lost = dict(_healthy_cases())
+    lost["G18"] = (True, ["policy:refund:2-4", "policy:refund:2-6"], ["policy:refund:2-4"])
+    guard = _run_guard(tmp_path, candidate_cases=[lost] * RUN_SET_SIZE)
+
+    assert guard.candidate_run_count == RUN_SET_SIZE
+    assert guard.candidate_stems == (
+        "evaluation-live-l2-4",
+        "evaluation-live-l2-5",
+        "evaluation-live-l2-6",
+    )
+    assert guard.candidate_exclusions == ()
+    assert guard.verdict == "미달"
+    assert guard.binding.evidence_losses[0].dropped_evidence_ids == ("policy:refund:2-4",)
+
+
+def test_지문이_확인되지_않는_실행은_같은_조건으로_묶지_않는다() -> None:
+    """`comparable` 과 다른 술어다 — 미상은 대조에서는 관용하고 편입에서는 막는다."""
+    legacy = ConditionFingerprint.from_values({"acceptance_cut": "0.3"})
+    current = ConditionFingerprint.from_values(_BASE_FINGERPRINT)
+
+    # 기준선 대조에서는 여전히 관용한다(옛 산출물 때문에 대조를 죽이지 않는다).
+    assert current.compare(legacy).comparable is True
+    # 그러나 한 세트로 묶지는 않는다.
+    same, reason = legacy.same_condition(current)
+    assert same is False
+    assert reason is not None and "확인되지 않는다" in reason
+
+    # 양성 대조 — 완전히 같은 지문끼리는 묶인다.
+    twin = ConditionFingerprint.from_values(_BASE_FINGERPRINT)
+    assert twin.same_condition(current) == (True, None)
+
+
+def test_실행이_적어_보낸_미상_문자열도_미상으로_읽는다() -> None:
+    """ "미상"끼리 같다고 읽으면 확인되지 않은 조건이 확인된 것처럼 묶인다."""
+    left = ConditionFingerprint.from_values({**_BASE_FINGERPRINT, "label_version": "미상"})
+    right = ConditionFingerprint.from_values({**_BASE_FINGERPRINT, "label_version": "미상"})
+    assert left.values["label_version"] is None
+    same, reason = left.same_condition(right)
+    assert same is False
+    assert reason is not None and "label_version" in reason

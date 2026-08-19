@@ -201,7 +201,10 @@ class ConditionFingerprint:
     ) -> ConditionFingerprint:
         normalized: dict[str, str | None] = dict.fromkeys(FINGERPRINT_FIELDS)
         for key, value in (values or {}).items():
-            normalized[str(key)] = None if value is None else _as_text(value)
+            text = None if value is None else _as_text(value)
+            # 실행이 "미상"이라고 적어 보낸 값도 미상이다 — 문자열로 남겨 두면 두 실행의
+            # "미상"끼리 같다고 읽혀 확인되지 않은 조건이 확인된 것처럼 묶인다.
+            normalized[str(key)] = None if text == UNKNOWN else text
         return cls(values=normalized, declared=tuple(declared))
 
     def effective(self, name: str) -> tuple[str | None, ...]:
@@ -214,6 +217,38 @@ class ConditionFingerprint:
     def describe(self, name: str) -> str:
         value = self.values.get(name)
         return UNKNOWN if value is None else value
+
+    def same_condition(self, other: ConditionFingerprint) -> tuple[bool, str | None]:
+        """두 실측이 **같은 조건임이 확인되는가.** 확인되지 않으면 사유를 함께 돌려준다.
+
+        `compare` 와 다른 술어다. `compare` 의 `comparable` 은 "선언 없이 어긋난 항목이
+        없다"이고 **미상은 어긋남이 아니다** — 기준선 대조에서는 그게 옳다(옛 산출물에 없는
+        항목 때문에 대조를 죽이지 않는다). 하지만 **한 세트로 묶는 데는 그 관용이 독이다**:
+        지문이 통째로 없는 산출물이 전부 미상이라는 이유로 "같은 조건"이 되어 3회 정족수를
+        채우고, 다른 조건에서 나온 케이스 결과가 이번 실측의 일치 횟수로 계산된다. 실제로
+        그렇게 멀쩡한 케이스 셋이 `1/3` 으로 찍혀 **거짓 미달**이 나왔다.
+
+        그래서 세트 편입은 **확인된 동일성**만 인정한다 — 모든 항목이 양쪽에서 알려져 있고
+        값이 같아야 한다. 모르면 묶지 않는다.
+        """
+        comparison = self.compare(other)
+        if comparison.undeclared_differences:
+            return False, "조건이 다르다: " + " · ".join(
+                item.describe() for item in comparison.undeclared_differences
+            )
+        if comparison.declared_differences:
+            # 선언은 기준선과의 **대조를 진행시키는** 장치이지 세트를 섞는 장치가 아니다.
+            return False, "선언된 실험 변인이 달라 다른 조건이다: " + " · ".join(
+                item.describe() for item in comparison.declared_differences
+            )
+        if comparison.unknown_fields:
+            # 미상 항목은 열 개를 넘기 쉬워(옛 산출물은 새 항목이 통째로 없다) 전부 나열하면
+            # 제외 사유 한 줄이 리포트를 덮는다. 개수와 앞머리만 적는다.
+            names = comparison.unknown_fields
+            head = ", ".join(names[:3])
+            more = f" 외 {len(names) - 3}개" if len(names) > 3 else ""
+            return False, f"조건 지문이 확인되지 않는다(미상 {len(names)}개: {head}{more})"
+        return True, None
 
     def compare(self, baseline: ConditionFingerprint) -> FingerprintComparison:
         """기준선과 대조한다. `self` 가 이번 실행이고 선언 목록도 이번 실행의 것이다."""
@@ -464,6 +499,9 @@ class RunSet:
 
     label: str
     runs: tuple[RunSummary, ...]
+    #: 조건이 확인되지 않아 **세트에 넣지 않은** 산출물과 그 사유. 정족수를 못 채운 이유가
+    #: 산출물에 남아야 사람이 "왜 보류인가"를 리포트만 보고 알 수 있다.
+    exclusions: tuple[str, ...] = ()
 
     @property
     def stems(self) -> tuple[str, ...]:
@@ -511,23 +549,29 @@ def assemble_candidate_set(
     size: int = RUN_SET_SIZE,
     exclude: Iterable[str] = (),
 ) -> RunSet:
-    """이번 실측 세트를 모은다 — 현재 실행 + **지문이 같은** 직전 실행들.
+    """이번 실측 세트를 모은다 — 현재 실행 + **조건 동일성이 확인된** 직전 실행들.
 
     승격 기준선으로 등재된 산출물은 제외한다. 그것을 이번 세트에 섞으면 기준선이 자기
     자신과 대조되어 판정이 자기추인이 된다.
+
+    **정족수를 채우려고 아무 산출물이나 끌어오지 않는다.** 조건이 확인되지 않은 실행을
+    끼워 넣으면 다른 조건에서 나온 케이스 결과가 이번 실측의 일치 횟수로 계산돼, 멀쩡한
+    케이스가 `1/3` 으로 찍히고 **거짓 미달**이 나온다. 3회 연속 실측의 1회차·2회차는
+    아직 세트가 안 찬 것이 정상이고, 그때 나올 답은 미달도 통과도 아닌 **보류**다.
     """
     skipped = {current.stem, *exclude}
     runs = [current]
+    exclusions: list[str] = []
     for summary in _collect_live_runs(reports_dir, l2_enabled=current.l2_enabled, exclude=skipped):
         if len(runs) >= size:
             break
-        comparison = summary.fingerprint.compare(current.fingerprint)
-        # 지문이 **똑같은** 실행만 한 세트다. 선언된 차이도 여기서는 다른 조건이다 —
-        # 선언은 기준선과의 대조를 진행시키는 장치이지 세트를 섞는 장치가 아니다.
-        if comparison.comparable and not comparison.declared_differences:
+        same, reason = summary.fingerprint.same_condition(current.fingerprint)
+        if same:
             runs.append(summary)
+        else:
+            exclusions.append(f"`{summary.stem}` — {reason}")
     runs.sort(key=lambda run: (run.started_at, run.stem))
-    return RunSet(label="이번 실측", runs=tuple(runs))
+    return RunSet(label="이번 실측", runs=tuple(runs), exclusions=tuple(exclusions))
 
 
 def discover_recent_live_set(
@@ -537,20 +581,27 @@ def discover_recent_live_set(
     size: int = RUN_SET_SIZE,
     exclude: Iterable[str] = (),
 ) -> RunSet | None:
-    """직전 라이브 세트를 자동 탐색한다 — 가장 최근 실행과 **지문이 같은** 것들."""
+    """직전 라이브 세트를 자동 탐색한다 — 가장 최근 실행과 **조건 동일성이 확인된** 것들.
+
+    편입 규칙은 이번 실측 세트와 같다. 경보 줄이라고 느슨하게 묶으면 경보가 섞인 세트에서
+    나온 수치가 되고, 그것은 정보가 아니라 잡음이다.
+    """
     runs = _collect_live_runs(reports_dir, l2_enabled=l2_enabled, exclude=exclude)
     if not runs:
         return None
     head = runs[0]
     grouped = [head]
+    exclusions: list[str] = []
     for summary in runs[1:]:
         if len(grouped) >= size:
             break
-        comparison = summary.fingerprint.compare(head.fingerprint)
-        if comparison.comparable and not comparison.declared_differences:
+        same, reason = summary.fingerprint.same_condition(head.fingerprint)
+        if same:
             grouped.append(summary)
+        else:
+            exclusions.append(f"`{summary.stem}` — {reason}")
     grouped.sort(key=lambda run: (run.started_at, run.stem))
-    return RunSet(label="직전 라이브", runs=tuple(grouped))
+    return RunSet(label="직전 라이브", runs=tuple(grouped), exclusions=tuple(exclusions))
 
 
 # ══ 승격 기준선 참조 ════════════════════════════════════════════════════════
@@ -841,7 +892,12 @@ def compare_run_sets(
     # 채우기"다. 사유가 아래 미판정 줄에만 남아 있는 것으로는 부족하다 — 판정 문면이 말해야 한다.
     held: list[str] = []
     if candidate_runs < expected_run_count:
-        held.append(f"실측 {candidate_runs}/{expected_run_count} — 세트가 아직 안 찼다")
+        shortage = f"조건이 확인된 실측 {candidate_runs}/{expected_run_count} — 세트가 아직 안 찼다"
+        if candidate.exclusions:
+            # **정족수를 못 채운 이유를 이름으로 남긴다.** 그러지 않으면 다음 사람이
+            # "왜 3회가 아닌가"를 알 수 없어 정족수를 채우려 아무 산출물이나 끌어오게 된다.
+            shortage += " (조건 불일치로 제외: " + " · ".join(candidate.exclusions) + ")"
+        held.append(shortage)
     if not baseline_evidence_known:
         held.append("기준선에 귀인 절이 없어 **근거 부분 손실 검사가 돌지 않았다**")
     if not candidate_evidence_known:
@@ -1093,6 +1149,8 @@ class RegressionGuard:
     binding: BaselineLine
     alert: BaselineLine
     promotion: PromotedBaseline | BaselineNotRegistered
+    #: 조건이 확인되지 않아 이번 세트에서 제외된 산출물과 사유.
+    candidate_exclusions: tuple[str, ...] = ()
 
     @property
     def verdict(self) -> str:
@@ -1169,6 +1227,7 @@ def build_regression_guard(
         candidate_stems=candidate.stems,
         candidate_run_count=len(candidate.runs),
         expected_run_count=run_set_size,
+        candidate_exclusions=candidate.exclusions,
         binding=binding,
         alert=alert,
         promotion=promotion,
@@ -1293,6 +1352,11 @@ def render_guard_section(guard: RegressionGuard | GuardUnavailable) -> list[str]
         [
             f"- 이번 실측 세트: {guard.candidate_run_count}/{guard.expected_run_count}회 "
             + (", ".join(f"`{stem}`" for stem in guard.candidate_stems) or "없음"),
+            *(
+                ["  - 조건 불일치로 세트에서 제외: " + " · ".join(guard.candidate_exclusions)]
+                if guard.candidate_exclusions
+                else []
+            ),
             f"- **판정: {guard.verdict}** — 승격 기준선(구속) 줄이 결정한다. "
             "직전 라이브 줄은 경보이고 판정을 발동시키지 않는다.",
         ]
@@ -1383,6 +1447,8 @@ def guard_to_json(guard: RegressionGuard | GuardUnavailable) -> dict[str, Any]:
         "candidate_stems": list(guard.candidate_stems),
         "candidate_run_count": guard.candidate_run_count,
         "expected_run_count": guard.expected_run_count,
+        # 정족수를 못 채운 이유. 0 이나 침묵으로 두면 "세트가 찼다"와 구분되지 않는다.
+        "candidate_exclusions": list(guard.candidate_exclusions),
         "promotion": (
             {
                 "registered": True,
