@@ -72,3 +72,65 @@ def test_가드가_실제로_잡는_문장이_있다() -> None:
     # 단어 경계 덕분에 통과해야 하는 것들
     assert not _FORBIDDEN.search("inspection = _inspect_schema(raw_draft)")
     assert not _FORBIDDEN.search("import inspect")
+
+
+# ── docs/ 쪽 가드 ───────────────────────────────────────────────────────────
+#
+# `docs/` 에는 위 금지어를 그대로 걸 수 없다 — 하네스 배치를 설명하는 문서와 이 사고를
+# 기록한 문서가 `.dryforge`·`spec` 을 정당하게 쓴다. 대신 **깨지는 인용의 형태**를 막는다:
+# 절 기호(`§`) 인용은 **같은 파일의 번호 붙은 절**을 가리킬 때만 통과한다. 사이클 문서의
+# `§4-3` 은 그 파일에 4번 절이 없으므로 걸리고, `docs/problem.md` 가 자기 7번 절을
+# 가리키는 `§7` 은 통과한다. allowlist 가 필요 없는 것이 이 형태의 값이다.
+
+_DOCS = Path("docs")
+
+#: 절 기호 인용. `§4-3` 의 선두 번호(`4`)로 같은 파일의 절 번호와 대조한다.
+_SECTION_REF = re.compile(r"§\s*(\d+)")
+
+#: 번호 붙은 절 제목 — `## 7. 실측이 …` · `### 4-3. 지표`.
+_NUMBERED_HEADING = re.compile(r"^#+\s+(\d+)[.\-]")
+
+#: 코드 스팬·코드 블록. 금지 형태를 **예시로 인용하는 문장**은 백틱 안에 있어야 한다.
+_CODE_SPAN = re.compile(r"`[^`]*`")
+_FENCE = re.compile(r"^\s*```")
+
+
+def _strip_code(text: str) -> list[tuple[int, str]]:
+    """코드 블록을 통째로 빼고, 남은 줄에서 코드 스팬을 지운다."""
+    kept: list[tuple[int, str]] = []
+    in_fence = False
+    for number, line in enumerate(text.splitlines(), start=1):
+        if _FENCE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        kept.append((number, _CODE_SPAN.sub("", line)))
+    return kept
+
+
+def test_docs_의_절_인용이_같은_파일_안에서_풀린다() -> None:
+    offenders: list[str] = []
+    for path in sorted((_ROOT / _DOCS).rglob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        own = {int(m.group(1)) for m in map(_NUMBERED_HEADING.match, text.splitlines()) if m}
+        for number, line in _strip_code(text):
+            for ref in _SECTION_REF.finditer(line):
+                if int(ref.group(1)) not in own:
+                    offenders.append(f"{path.relative_to(_ROOT)}:{number}: {line.strip()}")
+
+    assert not offenders, (
+        "사이클 문서를 절 라벨로 인용하면 아카이브 시점에 복원 불가능해진다 "
+        '(docs/standards.md "사이클 문서를 절 라벨로 인용하지 않는다"). '
+        "규칙을 내용으로 옮겨 적어라:\n" + "\n".join(offenders)
+    )
+
+
+def test_docs_가드가_실제로_잡는다() -> None:
+    """음성 대조 — 절 번호가 없는 파일에서 절 인용이 잡히는지 확인한다."""
+    lines = _strip_code("# 결정 0014\n\n채택 규칙(spec §4-3)이 순서를 구속한다.\n")
+    assert any(_SECTION_REF.search(line) for _, line in lines)
+    # 백틱 안의 예시와 자기 절 인용은 통과해야 한다
+    assert not any(_SECTION_REF.search(line) for _, line in _strip_code("`spec §4-3` 같은 인용"))
+    assert _NUMBERED_HEADING.match("## 7. 실측이 문제정의를 어떻게 바꿨나")
+    assert _NUMBERED_HEADING.match("### 4-3. 채택 규칙")

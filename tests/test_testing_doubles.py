@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+import pytest
+
 from reply_gate.config import Settings
 from reply_gate.contracts import Claim, Draft, Evidence, EvidenceSource, RejectReason, Verdict
 from reply_gate.evidence import EvidenceCollector
@@ -128,6 +130,14 @@ def test_대역_조립기는_실제_조립과_같은_협력자를_쓴다() -> No
     stub_collector = cast(EvidenceCollector, stub._collector)
     real_collector = cast(EvidenceCollector, real._collector)
     assert stub_collector._rewrite_client is real_collector._rewrite_client is generation
+    # 채택 축도 같아야 한다 — 기권 게이트가 한쪽에만 걸리면 대역이 재는 채택 집합이
+    # 제품과 달라지고, 그 차이가 "대역 완주" 수치에 조용히 섞인다.
+    assert stub_collector._abstention_gate == real_collector._abstention_gate
+    assert stub_collector._abstention_gate == settings.abstention_gate()
+    assert stub_collector._settings.vector_similarity_threshold == pytest.approx(
+        real_collector._settings.vector_similarity_threshold
+    )
+    assert stub_collector._settings.vector_top_k == real_collector._settings.vector_top_k
     # 다른 것은 판정자 하나뿐이다 — 그게 이 조립기의 존재 이유다.
     assert isinstance(stub._judge, StubJudge)
     assert not isinstance(real._judge, StubJudge)

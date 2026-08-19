@@ -265,8 +265,6 @@ def test_policy_search_returns_exactly_top_k_rows(
         conn=app_conn,
         query_vector=vector,
         top_k=top_k,
-        # 임계값을 -1 로 두어 컷이 아니라 **검색 자체**가 몇 행을 주는지만 본다.
-        similarity_threshold=-1.0,
         embedding_model=embedder.model,
         embedding_dimensions=embedder.dimensions,
     )

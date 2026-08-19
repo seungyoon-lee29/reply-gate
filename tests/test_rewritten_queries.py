@@ -31,13 +31,19 @@ _EVALUATION_MODULES = frozenset(
 )
 
 
+def _package_module_names() -> set[str]:
+    """패키지의 모든 파이썬 파일. **재귀로 훑는다** — 비재귀 glob 은 하위 패키지를 통째로
+    놓쳐서, 하나 생기는 순간 그 안의 런타임 코드가 조용히 가드 밖으로 나간다."""
+    return {
+        path.relative_to(_PACKAGE_DIR).as_posix()
+        for path in _PACKAGE_DIR.rglob("*.py")
+        if "__pycache__" not in path.parts
+    }
+
+
 def _runtime_module_names() -> tuple[str, ...]:
     """패키지 디렉터리에서 검사 대상 런타임 모듈을 유도한다."""
-    return tuple(
-        sorted(
-            path.name for path in _PACKAGE_DIR.glob("*.py") if path.name not in _EVALUATION_MODULES
-        )
-    )
+    return tuple(sorted(_package_module_names() - _EVALUATION_MODULES))
 
 
 _FORBIDDEN_MODULES = frozenset(
@@ -410,7 +416,7 @@ def test_런타임_실행_경로는_재작성_평가_픽스처와_격리된다()
 def test_격리_검사_대상은_패키지에서_유도되어_새_모듈을_자동으로_덮는다() -> None:
     """검사 대상이 손으로 관리되는 목록이면 새 런타임 모듈이 조용히 빠져나간다."""
     checked = set(_runtime_module_names())
-    present = {path.name for path in _PACKAGE_DIR.glob("*.py")}
+    present = _package_module_names()
 
     # 면제 목록에 있는 파일만 빠지고, 그 밖의 모든 패키지 파일이 검사된다.
     assert checked == present - _EVALUATION_MODULES

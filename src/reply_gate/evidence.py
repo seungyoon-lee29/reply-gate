@@ -63,7 +63,13 @@ from reply_gate.llm import (
 from reply_gate.order_ref import is_valid_order_no, normalize_order_no
 from reply_gate.policy_index import PolicySearchHit, search_policy_chunks
 from reply_gate.query_rewrite import rewrite_query
-from reply_gate.retrieval_strategies import VectorHit, merge_rewritten_rankings
+from reply_gate.retrieval_strategies import (
+    AbstentionGate,
+    VectorHit,
+    apply_abstention_gate,
+    merge_rewritten_rankings,
+    truncate_for_gate,
+)
 from reply_gate.sql_guard import (
     SCHEMA_WHITELIST,
     SqlGuardRejection,
@@ -92,6 +98,7 @@ __all__ = [
     "SqlFailure",
     "SqlFailureKind",
     "SqlGenerationResult",
+    "adopt_policy_hits",
     "build_intent_user_prompt",
     "build_sql_user_prompt",
     "classify_intent",
@@ -534,8 +541,10 @@ def merge_policy_rankings(
     rewritten: Sequence[PolicySearchHit],
     top_k: int,
 ) -> tuple[PolicySearchHit, ...]:
-    """원문·재작성 질의의 검색 결과를 합집합으로 모아 상위 `top_k` 를 돌려준다
+    """원문·재작성 질의의 검색 결과를 합집합으로 모아 상위 `top_k` **후보**를 돌려준다
     (docs/architecture.md "대표 흐름" 3단계).
+
+    입력도 출력도 **임계값 전**이다. 무엇이 근거가 되는지는 `adopt_policy_hits` 가 정한다.
 
     같은 조항이 두 질의에 다 걸리면 **더 큰 유사도**를 쓴다 — 합침 규칙은 오프라인 비교
     하네스와 **같은 구현**(`retrieval_strategies.merge_rewritten_rankings`)이다. 여기서
@@ -548,8 +557,10 @@ def merge_policy_rankings(
     k 개 있다는 뜻이고, 그 k 개는 합집합 점수도 `m` 보다 커서 X 는 합집합 top_k 밖이다.
     역방향도 같은 논증이다. 그래서 **재작성 때문에 후보 상한이 2배가 되지 않는다.**
 
-    임계값은 각 질의 검색이 이미 적용했다 — max 로 합치므로 "한쪽에서만 컷을 넘은 조항"은
-    그대로 살아남고, 양쪽에서 미달인 조항은 합쳐도 미달이라 순서를 바꿔도 결과가 같다.
+    **컷을 합침 뒤로 옮겨도 채택 집합은 그대로다.** 컷 미만 후보는 컷 이상 후보보다 항상
+    아래로 정렬되므로 합집합 상위 `top_k` 자리를 뺏을 수 없고, 뺏을 수 있는 유일한 경우
+    (컷 이상 후보가 `top_k` 개보다 적을 때)에는 뒤이어 컷이 다시 지운다. 그래서 순서를
+    바꾼 것은 **게이트가 볼 슬라이스**뿐이고 근거 집합은 사이클 3 과 같다.
     """
     if top_k <= 0:
         return ()
@@ -562,6 +573,39 @@ def merge_policy_rankings(
         original=_vector_hits(original), rewritten=_vector_hits(rewritten)
     )
     return tuple(best[hit.evidence_id] for hit in merged[:top_k])
+
+
+def adopt_policy_hits(
+    *,
+    candidates: Sequence[PolicySearchHit],
+    top_k: int,
+    similarity_threshold: float,
+    gate: AbstentionGate | None,
+) -> tuple[PolicySearchHit, ...]:
+    """상위 `top_k` 후보에서 실제로 근거가 될 것을 고른다 — **질의 축 → 항목 축** 순서다.
+
+    1. **질의 축(기권 게이트)**: 상위 `top_k` 점수 분포의 산포가 τ 미만이면 그 질의의 채택
+       집합이 **통째로** 빈다. 어떤 항목을 남길지 고르는 일이 없으므로 항목 간 비교에
+       상대 축을 들이지 않는다 — 결정 0009 의 절대 축 원칙이 그대로 남는다.
+    2. **항목 축(절대 하한)**: 게이트가 발동하지 않았으면 코사인 ≥ 컷 만 채택한다.
+
+    **통계량 입력은 컷 전 슬라이스다**(`docs/tracking/decisions/0014`).
+    `search_policy_chunks` 의 SQL `LIMIT top_k` 가 자른 뒤 여기서 임계값이 걸리는 순서가
+    오프라인 격자와 같고, 그래서 두 경로가 같은 수를 낸다. 컷 뒤 슬라이스로 재면 컷 위
+    후보가 둘뿐인 케이스(G04)의 산포가 τ 아래로 떨어져 정답 조항을 잃는다.
+
+    **통계량이 미정의면(측정된 후보 2건 미만) 게이트는 열린 채로 남는다.** 미정의를 0 으로
+    채우면 모든 양수 τ 에서 기권이 되어, 후보가 하나뿐인 질의가 근거 없이 인계된다.
+    원시연산(`retrieval_strategies.apply_abstention_gate`)이 값 대신 사유를 들고 오는 것이
+    그 계약이고 여기서 뒤집지 않는다.
+    """
+    if not candidates:
+        return ()
+    if gate is not None:
+        scores = truncate_for_gate([hit.similarity for hit in candidates], top_k=top_k)
+        if apply_abstention_gate(gate, scores).abstains:
+            return ()
+    return tuple(hit for hit in candidates if hit.similarity >= similarity_threshold)
 
 
 def _policy_evidence(hit: PolicySearchHit) -> Evidence:
@@ -696,6 +740,9 @@ class EvidenceCollector:
         self._embedder = embedding_client
         self._settings = resolved
         self._rewrite_client = rewrite_client
+        # 기권 게이트는 설정에서 한 번만 조립한다 — 켜고 끄는 자리가 하나여야 런타임과
+        # 리포트의 조건 지문이 갈리지 않는다. `None` 은 "꺼짐"이고 채택은 절대 하한만 남는다.
+        self._abstention_gate = resolved.abstention_gate()
 
     def collect(
         self,
@@ -769,11 +816,14 @@ class EvidenceCollector:
     def _collect_policy(
         self, *, ledger: _Ledger, conn: psycopg.Connection[DictRow], content: str
     ) -> None:
-        """(질의 재작성) → 문의 임베딩 → pgvector 유사도 검색 → 임계값을 넘은 상위 k 개 조항.
+        """(질의 재작성) → 문의 임베딩 → pgvector 유사도 검색 → 상위 k 개 후보 → 채택 판정.
 
         **원문과 재작성문을 둘 다 검색해 합집합으로 모은다**
         (docs/architecture.md "대표 흐름" 3단계) — 재작성이 주제를
         옮겼을 때 원문이 안전망이다. 재작성을 얻지 못하면 원문만으로 계속한다(폴백).
+
+        검색이 돌려주는 것은 `LIMIT top_k` 후보 그대로이고, **무엇이 근거가 되는지는
+        `adopt_policy_hits` 가 정한다** — 질의 단위 기권 게이트 다음에 절대 하한이다.
         """
         queries = [content]
         rewritten = self._rewrite(ledger=ledger, content=content)
@@ -793,7 +843,6 @@ class EvidenceCollector:
                 conn=conn,
                 query_vector=vector,
                 top_k=self._settings.vector_top_k,
-                similarity_threshold=self._settings.vector_similarity_threshold,
                 embedding_model=self._embedder.model,
                 embedding_dimensions=self._embedder.dimensions,
             )
@@ -801,10 +850,16 @@ class EvidenceCollector:
             # 없는 벡터로 검색하지 않고, 있는 만큼만 합친다.
             for vector in embedding.vectors[: len(queries)]
         ]
-        hits = merge_policy_rankings(
+        candidates = merge_policy_rankings(
             original=rankings[0],
             rewritten=rankings[1] if len(rankings) > 1 else (),
             top_k=self._settings.vector_top_k,
+        )
+        hits = adopt_policy_hits(
+            candidates=candidates,
+            top_k=self._settings.vector_top_k,
+            similarity_threshold=self._settings.vector_similarity_threshold,
+            gate=self._abstention_gate,
         )
         ledger.evidence.extend(_policy_evidence(hit) for hit in hits)
 

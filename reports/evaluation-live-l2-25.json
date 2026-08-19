@@ -1,0 +1,907 @@
+{
+  "targets": {
+    "decided_at": "2026-08-05",
+    "decision": "docs/tracking/decisions/0006-지표-목표치를-실측-뒤에-확정한다.md",
+    "metrics": [
+      {
+        "key": "detection_rate",
+        "label": "측정 1 구조적 오류 검출률",
+        "bound": 1.0,
+        "direction": "at_least",
+        "measured": 1.0,
+        "met": true,
+        "verdict": "달성"
+      },
+      {
+        "key": "false_positive_rate",
+        "label": "측정 1 정상 초안 오탐률",
+        "bound": 0.0,
+        "direction": "at_most",
+        "measured": 0.0,
+        "met": true,
+        "verdict": "달성"
+      },
+      {
+        "key": "match_rate",
+        "label": "측정 2 허용 결과 집합 대비 일치율",
+        "bound": 0.75,
+        "direction": "at_least",
+        "measured": null,
+        "met": null,
+        "verdict": "미측정"
+      }
+    ]
+  },
+  "conditions": {
+    "started_at": "2026-08-19T09:21:26+00:00",
+    "generation": "미실행",
+    "embedding": "미실행",
+    "embedding_dimensions": 1536,
+    "judge": "Anthropic `claude-sonnet-5` (effort=기본값)",
+    "l2_enabled": true,
+    "retrieval_strategy": "vector+rewrite",
+    "similarity_threshold": 0.3,
+    "top_k": 5,
+    "l1_fixture_count": 27,
+    "golden_case_count": 30,
+    "judge_fixture_count": 11,
+    "l1_fixtures_path": "data/l1_fixtures.jsonl",
+    "golden_set_path": "data/golden_set.jsonl",
+    "judge_fixtures_path": "data/judge_fixtures.jsonl",
+    "api_key_present": true,
+    "judge_api_key_present": true,
+    "measurement2_is_real": false,
+    "measurement3_is_real": true,
+    "billed": true,
+    "measurement_scope": "measurement_1_3_only",
+    "condition_fingerprint": {
+      "label_version": "golden-79e0da454f3a",
+      "retrieval_labels_version": "labels-7fb4ceef7aa6",
+      "acceptance_cut": "0.3",
+      "abstention_gate_statistic": "rank1_minus_rank_k_spread",
+      "abstention_tau": "0.06",
+      "query_rewrite": "on",
+      "embedding_model": "text-embedding-3-small",
+      "embedding_dimensions": "1536",
+      "top_k": "5",
+      "generation_model": "gpt-5.6-terra",
+      "judge_model": "claude-sonnet-5",
+      "judge_effort": "기본값",
+      "judge_prompt_version": "judge-e26f6c8e0b84",
+      "judge_fixture_version": "fixture-2b8f33392b36",
+      "judge_prompt_caching": "on",
+      "measurement_scope": "measurement_1_3_only",
+      "generation_effort": "기본값",
+      "l2_enabled": "on"
+    },
+    "declared_experiment_fields": [
+      "judge_prompt_caching",
+      "judge_fixture_version"
+    ]
+  },
+  "measurement_1_l1_gate_accuracy": {
+    "deterministic": true,
+    "llm_calls": 0,
+    "total": 27,
+    "violation_total": 19,
+    "violation_detected": 19,
+    "detection_rate": 1.0,
+    "clean_total": 8,
+    "clean_false_positive": 0,
+    "false_positive_rate": 0.0,
+    "reason_set_exact_rate": 1.0,
+    "reason_breakdown": [
+      {
+        "reason": "schema_violation",
+        "expected_count": 9,
+        "detected_count": 9,
+        "detection_rate": 1.0,
+        "spurious_count": 0
+      },
+      {
+        "reason": "missing_citation",
+        "expected_count": 4,
+        "detected_count": 4,
+        "detection_rate": 1.0,
+        "spurious_count": 0
+      },
+      {
+        "reason": "invalid_citation",
+        "expected_count": 5,
+        "detected_count": 5,
+        "detection_rate": 1.0,
+        "spurious_count": 0
+      },
+      {
+        "reason": "pii_detected",
+        "expected_count": 6,
+        "detected_count": 6,
+        "detection_rate": 1.0,
+        "spurious_count": 0
+      }
+    ],
+    "outcomes": [
+      {
+        "fixture_id": "F01",
+        "category": "clean",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "matched": true
+      },
+      {
+        "fixture_id": "F02",
+        "category": "clean",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "matched": true
+      },
+      {
+        "fixture_id": "F03",
+        "category": "clean",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "matched": true
+      },
+      {
+        "fixture_id": "F04",
+        "category": "clean",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "matched": true
+      },
+      {
+        "fixture_id": "F05",
+        "category": "pii_echo",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "matched": true
+      },
+      {
+        "fixture_id": "F06",
+        "category": "pii_echo",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "matched": true
+      },
+      {
+        "fixture_id": "F07",
+        "category": "pii_echo",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "matched": true
+      },
+      {
+        "fixture_id": "F08",
+        "category": "clean",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "matched": true
+      },
+      {
+        "fixture_id": "F09",
+        "category": "schema_violation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation"
+        ],
+        "actual_reasons": [
+          "schema_violation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F10",
+        "category": "schema_violation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation"
+        ],
+        "actual_reasons": [
+          "schema_violation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F11",
+        "category": "schema_violation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation"
+        ],
+        "actual_reasons": [
+          "schema_violation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F12",
+        "category": "schema_violation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation"
+        ],
+        "actual_reasons": [
+          "schema_violation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F13",
+        "category": "schema_violation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation"
+        ],
+        "actual_reasons": [
+          "schema_violation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F14",
+        "category": "schema_violation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation"
+        ],
+        "actual_reasons": [
+          "schema_violation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F15",
+        "category": "schema_violation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation"
+        ],
+        "actual_reasons": [
+          "schema_violation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F16",
+        "category": "missing_citation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "missing_citation"
+        ],
+        "actual_reasons": [
+          "missing_citation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F17",
+        "category": "missing_citation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "missing_citation"
+        ],
+        "actual_reasons": [
+          "missing_citation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F18",
+        "category": "invalid_citation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "invalid_citation"
+        ],
+        "actual_reasons": [
+          "invalid_citation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F19",
+        "category": "invalid_citation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "invalid_citation"
+        ],
+        "actual_reasons": [
+          "invalid_citation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F20",
+        "category": "invalid_citation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "invalid_citation"
+        ],
+        "actual_reasons": [
+          "invalid_citation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F21",
+        "category": "pii_detected",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "pii_detected"
+        ],
+        "actual_reasons": [
+          "pii_detected"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F22",
+        "category": "pii_detected",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "pii_detected"
+        ],
+        "actual_reasons": [
+          "pii_detected"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F23",
+        "category": "pii_detected",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "pii_detected"
+        ],
+        "actual_reasons": [
+          "pii_detected"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F24",
+        "category": "pii_detected",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "pii_detected"
+        ],
+        "actual_reasons": [
+          "pii_detected"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F25",
+        "category": "combined",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation",
+          "pii_detected"
+        ],
+        "actual_reasons": [
+          "schema_violation",
+          "pii_detected"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F26",
+        "category": "combined",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "missing_citation",
+          "invalid_citation"
+        ],
+        "actual_reasons": [
+          "missing_citation",
+          "invalid_citation"
+        ],
+        "matched": true
+      },
+      {
+        "fixture_id": "F27",
+        "category": "combined",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "schema_violation",
+          "missing_citation",
+          "invalid_citation",
+          "pii_detected"
+        ],
+        "actual_reasons": [
+          "schema_violation",
+          "missing_citation",
+          "invalid_citation",
+          "pii_detected"
+        ],
+        "matched": true
+      }
+    ]
+  },
+  "limits": {
+    "pii": "L1 은 패턴형 PII 만 검사한다. 이름·주소 등 비패턴형은 어느 층의 대상도 아니다.",
+    "content": "L1 은 내용의 진위를 검사하지 않는다 — 그 층은 L2 이고, 끄면 없다.",
+    "measurement_2": "확률 층이라 재실행하면 값이 달라진다. 일치율에 초안 전 인계 포함.",
+    "measurement_3": "확률 층이고 과금된다. 목표치를 두지 않아 달성 판정이 없다."
+  },
+  "deferred": [
+    "L1 필터링에 의한 L2 호출 감소율",
+    "RAG 검색 품질 단계별 개선표",
+    "비패턴형 개인정보(이름·주소) 검출"
+  ],
+  "measurement_2_pipeline_agreement": {
+    "executed": false,
+    "skip_reason": "측정 2 를 실행 선택에서 제외했다 (`--measurements`) — 고르지 않은 측정이다"
+  },
+  "failure_attribution": {
+    "computed": false,
+    "reason": "측정 2 미실행: 측정 2 를 실행 선택에서 제외했다 (`--measurements`) — 고르지 않은 측정이다"
+  },
+  "measurement_3_l2_judge_accuracy": {
+    "executed": true,
+    "is_real": true,
+    "deterministic": false,
+    "billed": true,
+    "target": null,
+    "target_note": "없음 — 무목표 관측 (결정 0006)",
+    "total": 11,
+    "judged_total": 11,
+    "error_total": 0,
+    "violation_total": 6,
+    "violation_detected": 6,
+    "detection_rate": 1.0,
+    "clean_total": 5,
+    "clean_false_positive": 1,
+    "false_positive_rate": 0.2,
+    "reason_set_exact": 9,
+    "reason_set_exact_rate": 0.8181818181818182,
+    "claim_total": 19,
+    "claim_verdict_matched": 18,
+    "claim_verdict_match_rate": 0.9473684210526315,
+    "contradiction_expected_total": 4,
+    "contradiction_matched_total": 3,
+    "contradiction_extra_total": 0,
+    "contradiction_recall": 0.75,
+    "tokens": {
+      "input_total": 6832,
+      "output_total": 5488,
+      "per_fixture": 1120.0,
+      "cache_creation_total": 0,
+      "cache_read_total": 23210
+    },
+    "reason_breakdown": [
+      {
+        "reason": "unsupported_claim",
+        "expected_count": 4,
+        "detected_count": 4,
+        "detection_rate": 1.0,
+        "spurious_count": 1
+      },
+      {
+        "reason": "contradictory_evidence",
+        "expected_count": 3,
+        "detected_count": 2,
+        "detection_rate": 0.6666666666666666,
+        "spurious_count": 0
+      }
+    ],
+    "outcomes": [
+      {
+        "fixture_id": "J01",
+        "category": "clean",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "claim_total": 2,
+        "claim_verdict_matched": 2,
+        "contradiction_expected": 0,
+        "contradiction_matched": 0,
+        "contradiction_extra": 0,
+        "input_tokens": 595,
+        "output_tokens": 289,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 2110,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J02",
+        "category": "clean",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "claim_total": 2,
+        "claim_verdict_matched": 2,
+        "contradiction_expected": 0,
+        "contradiction_matched": 0,
+        "contradiction_extra": 0,
+        "input_tokens": 805,
+        "output_tokens": 246,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 2110,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J03",
+        "category": "adjacent_citation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "unsupported_claim"
+        ],
+        "actual_reasons": [
+          "unsupported_claim"
+        ],
+        "claim_total": 1,
+        "claim_verdict_matched": 1,
+        "contradiction_expected": 0,
+        "contradiction_matched": 0,
+        "contradiction_extra": 0,
+        "input_tokens": 365,
+        "output_tokens": 305,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 2110,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J04",
+        "category": "direct_no_value",
+        "expected_verdict": "pass",
+        "actual_verdict": "reject",
+        "expected_reasons": [],
+        "actual_reasons": [
+          "unsupported_claim"
+        ],
+        "claim_total": 2,
+        "claim_verdict_matched": 1,
+        "contradiction_expected": 0,
+        "contradiction_matched": 0,
+        "contradiction_extra": 0,
+        "input_tokens": 630,
+        "output_tokens": 914,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 2110,
+        "matched": false,
+        "error": null
+      },
+      {
+        "fixture_id": "J05",
+        "category": "contradiction_unstated",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "contradictory_evidence"
+        ],
+        "actual_reasons": [
+          "contradictory_evidence"
+        ],
+        "claim_total": 1,
+        "claim_verdict_matched": 1,
+        "contradiction_expected": 1,
+        "contradiction_matched": 1,
+        "contradiction_extra": 0,
+        "input_tokens": 532,
+        "output_tokens": 576,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 2110,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J06",
+        "category": "contradiction_stated",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "claim_total": 1,
+        "claim_verdict_matched": 1,
+        "contradiction_expected": 1,
+        "contradiction_matched": 1,
+        "contradiction_extra": 0,
+        "input_tokens": 728,
+        "output_tokens": 577,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 2110,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J07",
+        "category": "contradiction_uncited",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "contradictory_evidence"
+        ],
+        "actual_reasons": [
+          "contradictory_evidence"
+        ],
+        "claim_total": 2,
+        "claim_verdict_matched": 2,
+        "contradiction_expected": 1,
+        "contradiction_matched": 1,
+        "contradiction_extra": 0,
+        "input_tokens": 720,
+        "output_tokens": 831,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 2110,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J08",
+        "category": "mixed",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "unsupported_claim"
+        ],
+        "actual_reasons": [
+          "unsupported_claim"
+        ],
+        "claim_total": 3,
+        "claim_verdict_matched": 3,
+        "contradiction_expected": 0,
+        "contradiction_matched": 0,
+        "contradiction_extra": 0,
+        "input_tokens": 820,
+        "output_tokens": 485,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 2110,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J09",
+        "category": "distorted_citation",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "unsupported_claim"
+        ],
+        "actual_reasons": [
+          "unsupported_claim"
+        ],
+        "claim_total": 1,
+        "claim_verdict_matched": 1,
+        "contradiction_expected": 0,
+        "contradiction_matched": 0,
+        "contradiction_extra": 0,
+        "input_tokens": 388,
+        "output_tokens": 236,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 2110,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J10",
+        "category": "direct_no_value",
+        "expected_verdict": "pass",
+        "actual_verdict": "pass",
+        "expected_reasons": [],
+        "actual_reasons": [],
+        "claim_total": 2,
+        "claim_verdict_matched": 2,
+        "contradiction_expected": 0,
+        "contradiction_matched": 0,
+        "contradiction_extra": 0,
+        "input_tokens": 543,
+        "output_tokens": 496,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 2110,
+        "matched": true,
+        "error": null
+      },
+      {
+        "fixture_id": "J11",
+        "category": "combined",
+        "expected_verdict": "reject",
+        "actual_verdict": "reject",
+        "expected_reasons": [
+          "unsupported_claim",
+          "contradictory_evidence"
+        ],
+        "actual_reasons": [
+          "unsupported_claim"
+        ],
+        "claim_total": 2,
+        "claim_verdict_matched": 2,
+        "contradiction_expected": 1,
+        "contradiction_matched": 0,
+        "contradiction_extra": 0,
+        "input_tokens": 706,
+        "output_tokens": 533,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 2110,
+        "matched": false,
+        "error": null
+      }
+    ]
+  },
+  "regression_guard": {
+    "computed": true,
+    "verdict": "대조 불가",
+    "verdict_owner": "승격 기준선(구속)",
+    "disagreement": false,
+    "candidate_stems": [
+      "evaluation-live-l2-25"
+    ],
+    "candidate_run_count": 1,
+    "expected_run_count": 3,
+    "candidate_exclusions": [
+      "`evaluation-live-l2-18` — 조건이 다르다: judge_prompt_caching: 기준선 `on` → 이번 `off`",
+      "`evaluation-live-l2-17` — 조건이 다르다: judge_prompt_caching: 기준선 `on` → 이번 `off`",
+      "`evaluation-live-l2-16` — 조건이 다르다: judge_prompt_caching: 기준선 `on` → 이번 `off`",
+      "`evaluation-live-l2-15` — 조건이 다르다: judge_prompt_caching: 기준선 `on` → 이번 `off`",
+      "`evaluation-live-l2-14` — 조건이 다르다: judge_prompt_caching: 기준선 `on` → 이번 `off`",
+      "`evaluation-live-l2-13` — 조건이 다르다: judge_prompt_caching: 기준선 `on` → 이번 `off`",
+      "`evaluation-live-l2-12` — 조건이 다르다: judge_fixture_version: 기준선 `fixture-2b8f33392b36` → 이번 `fixture-836322e97320` · judge_prompt_caching: 기준선 `on` → 이번 `off` · measurement_scope: 기준선 `measurement_1_3_only` → 이번 `full`",
+      "`evaluation-live-l2-11` — 조건이 다르다: judge_fixture_version: 기준선 `fixture-2b8f33392b36` → 이번 `fixture-836322e97320` · judge_prompt_caching: 기준선 `on` → 이번 `off` · measurement_scope: 기준선 `measurement_1_3_only` → 이번 `full`",
+      "`evaluation-live-l2-10` — 조건이 다르다: judge_fixture_version: 기준선 `fixture-2b8f33392b36` → 이번 `fixture-836322e97320` · judge_prompt_caching: 기준선 `on` → 이번 `off` · measurement_scope: 기준선 `measurement_1_3_only` → 이번 `full`",
+      "`evaluation-live-l2-6` — 조건이 다르다: acceptance_cut: 기준선 `0.3` → 이번 `0.5`",
+      "`evaluation-live-l2-5` — 조건이 다르다: acceptance_cut: 기준선 `0.3` → 이번 `0.5`",
+      "`evaluation-live-l2-4` — 조건이 다르다: acceptance_cut: 기준선 `0.3` → 이번 `0.5`",
+      "`evaluation-live-l2-3` — 조건 지문이 확인되지 않는다(미상 11개: label_version, retrieval_labels_version, abstention_gate_statistic 외 8개)",
+      "`evaluation-live-l2-2` — 조건 지문이 확인되지 않는다(미상 11개: label_version, retrieval_labels_version, abstention_gate_statistic 외 8개)",
+      "`evaluation-live-l2-1` — 조건 지문이 확인되지 않는다(미상 11개: label_version, retrieval_labels_version, abstention_gate_statistic 외 8개)"
+    ],
+    "promotion": {
+      "registered": true,
+      "path": "data/promoted_baseline.json",
+      "promoted_at": "2026-08-19",
+      "promoted_by": "사용자 (사이클 4 · 관측 요약 보고 뒤 확인)",
+      "reason": "현 기본값 조합(재작성 켜짐 · 컷 0.30 · 캐싱 없음 · T6 이전 판정 프롬프트)의 첫 풀셋 라이브 3회. 관측 넷을 모두 충족했다 — G17 재작성 유지 3/3 · G18·G01·G02 상충쌍 동시 채택 각 3/3 · G21-G24 판정 층 인계 3/3 · G04 정답 조항 채택 + 정상 답변 3/3. 측정 1 은 앞선 여섯 세트와 동일하고 측정 3 은 3회 중 2회가 동일(1회는 오탐 1건 — 9세트 만의 첫 관측). 새 회귀 가드가 붙은 코드로 산출돼 근거 부분 손실 검사가 온전히 작동하는 첫 세트다.",
+      "repromotion": false,
+      "supersedes": [],
+      "report_stems": [
+        "evaluation-live-l2-7",
+        "evaluation-live-l2-8",
+        "evaluation-live-l2-9"
+      ]
+    },
+    "binding": {
+      "label": "승격 기준선",
+      "role": "구속",
+      "verdict": "대조 불가",
+      "verdict_reason": "선언되지 않은 조건 불일치 — 어긋난 항목: abstention_gate_statistic: 기준선 `미배선` → 이번 `rank1_minus_rank_k_spread` · abstention_tau: 기준선 `미배선` → 이번 `0.06` (짝인 `embedding_model` 도 함께 달라졌다) · measurement_scope: 기준선 `full` → 이번 `measurement_1_3_only`",
+      "baseline_stems": [
+        "evaluation-live-l2-7",
+        "evaluation-live-l2-8",
+        "evaluation-live-l2-9"
+      ],
+      "baseline_source": "data/promoted_baseline.json",
+      "fingerprint": {
+        "comparable": false,
+        "declared_differences": [
+          {
+            "field": "judge_fixture_version",
+            "baseline": "fixture-836322e97320",
+            "candidate": "fixture-2b8f33392b36",
+            "diverged_by_pair": null
+          },
+          {
+            "field": "judge_prompt_caching",
+            "baseline": "off",
+            "candidate": "on",
+            "diverged_by_pair": null
+          }
+        ],
+        "undeclared_differences": [
+          {
+            "field": "abstention_gate_statistic",
+            "baseline": "미배선",
+            "candidate": "rank1_minus_rank_k_spread",
+            "diverged_by_pair": null
+          },
+          {
+            "field": "abstention_tau",
+            "baseline": "미배선",
+            "candidate": "0.06",
+            "diverged_by_pair": "embedding_model"
+          },
+          {
+            "field": "measurement_scope",
+            "baseline": "full",
+            "candidate": "measurement_1_3_only",
+            "diverged_by_pair": null
+          }
+        ],
+        "unknown_fields": []
+      },
+      "match_shortfalls": [],
+      "match_collapses": [],
+      "match_decreases": [],
+      "evidence_losses": [],
+      "measurement1_changes": [],
+      "unknown_notes": [],
+      "notes": [
+        "선언된 실험 변인이 있어 대조를 진행한다 — 차이: judge_fixture_version: 기준선 `fixture-836322e97320` → 이번 `fixture-2b8f33392b36` · judge_prompt_caching: 기준선 `off` → 이번 `on`",
+        "측정 3 은 무변경 검사 대상이 아니다 — 판정 층 개선의 성공이 무관한 축의 원복을 발동시키면 안 되기 때문이다. 기준선 100.0% / 이번 100.0% — 두 세트의 값이 같다.",
+        "합산 일치율은 하한 경보선이고 사이클 판정은 케이스 단위가 맡는다."
+      ]
+    },
+    "alert": {
+      "label": "직전 라이브",
+      "role": "경보",
+      "verdict": "대조 불가",
+      "verdict_reason": "선언되지 않은 조건 불일치 — 어긋난 항목: judge_prompt_version: 기준선 `judge-7fad677f9ac6` → 이번 `judge-e26f6c8e0b84`",
+      "baseline_stems": [
+        "evaluation-live-l2-16",
+        "evaluation-live-l2-17",
+        "evaluation-live-l2-18"
+      ],
+      "baseline_source": "reports/ 자동 탐색",
+      "fingerprint": {
+        "comparable": false,
+        "declared_differences": [
+          {
+            "field": "judge_prompt_caching",
+            "baseline": "off",
+            "candidate": "on",
+            "diverged_by_pair": null
+          }
+        ],
+        "undeclared_differences": [
+          {
+            "field": "judge_prompt_version",
+            "baseline": "judge-7fad677f9ac6",
+            "candidate": "judge-e26f6c8e0b84",
+            "diverged_by_pair": null
+          }
+        ],
+        "unknown_fields": []
+      },
+      "match_shortfalls": [],
+      "match_collapses": [],
+      "match_decreases": [],
+      "evidence_losses": [],
+      "measurement1_changes": [],
+      "unknown_notes": [],
+      "notes": [
+        "선언된 실험 변인이 있어 대조를 진행한다 — 차이: judge_prompt_caching: 기준선 `off` → 이번 `on`",
+        "측정 3 은 무변경 검사 대상이 아니다 — 판정 층 개선의 성공이 무관한 축의 원복을 발동시키면 안 되기 때문이다. 기준선 100.0% / 이번 100.0% — 두 세트의 값이 같다.",
+        "합산 일치율은 하한 경보선이고 사이클 판정은 케이스 단위가 맡는다."
+      ]
+    }
+  }
+}

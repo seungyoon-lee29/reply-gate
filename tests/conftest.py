@@ -10,15 +10,45 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
+from typing import Any
 
 import psycopg
 import pytest
 from psycopg.rows import DictRow
+from pydantic_settings import SettingsConfigDict
 from scripts.seed_orders import seed_orders
 
 from reply_gate.config import Settings, get_settings
 from reply_gate.db import connect, database_unavailable_reason, readonly_connect
+
+
+class _DeclaredSettings(Settings):
+    """`.env` 를 읽지 않는 `Settings`. 선언값 검사 전용이다."""
+
+    model_config = SettingsConfigDict(env_file=None, env_file_encoding="utf-8", extra="ignore")
+
+
+def declared_settings(**overrides: Any) -> Settings:
+    """저장소가 **선언한** 기본값. 개발자의 `.env` 도 프로세스 환경도 읽지 않는다.
+
+    인자 없는 `Settings()` 는 `.env` 와 환경 변수를 함께 읽는다. "기본값이 결정대로인가"를
+    재는 테스트가 그것을 쓰면 **로컬 환경을 재게 된다** — 개발자가 `ABSTENTION_TAU` 를
+    잠깐 바꿔 두면 결정 기록과 코드가 갈렸는데도 초록이 뜬다(사이클 4 리뷰 advisory).
+
+    환경을 지운 뒤 되돌리는 것은 이 함수 안에서 끝난다 — 반환된 `Settings` 는 그 시점의
+    선언값을 이미 들고 있다. **환경 변수 경로를 일부러 재는 테스트는 이것을 쓰지 않는다.**
+    """
+    field_names = {name.upper() for name in Settings.model_fields}
+    stashed = {key: os.environ[key] for key in list(os.environ) if key.upper() in field_names}
+    for key in stashed:
+        del os.environ[key]
+    try:
+        return _DeclaredSettings(**overrides)
+    finally:
+        os.environ.update(stashed)
+
 
 #: 접속 가능 여부는 세션당 1회만 확인한다(테스트마다 붙었다 떼면 느리다).
 _skip_reason_cache: list[str | None] = []

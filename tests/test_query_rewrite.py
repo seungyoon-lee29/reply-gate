@@ -32,6 +32,7 @@ from reply_gate.query_rewrite import (
     rewrite_query,
 )
 from reply_gate.testing import LexicalEmbeddingClient
+from tests.conftest import declared_settings
 
 _ROOT = Path(__file__).resolve().parents[1]
 INQUIRY = "상담원과 통화하고 싶은데 몇 번으로 걸면 되나요?"
@@ -204,7 +205,7 @@ def test_제품_기본값은_재작성_켜짐과_컷_0_30_이다() -> None:
     조항(0.4676·0.4693)을 함께 잘라 정상 문의를 인계시키고 L2 모순 기각을 없앴다.
     셋 다 0.30 위다.
     """
-    settings = Settings()
+    settings = declared_settings()
 
     assert settings.query_rewrite_enabled is True
     assert settings.vector_similarity_threshold == 0.3

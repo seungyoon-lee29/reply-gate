@@ -123,9 +123,16 @@ def _collector(
     top_k: int = 5,
     max_rows: int = 50,
     query_rewrite_enabled: bool = True,
+    abstention_gate_enabled: bool = True,
 ) -> EvidenceCollector:
-    """기본은 **제품 기본값(재작성 켜짐)** 이다 — 테스트가 제품이 쓰지 않는 구성을 재면
-    배관 검증이 실제 실행과 다른 것을 검증한다."""
+    """기본은 **제품 기본값(재작성 켜짐 · 기권 게이트 켜짐)** 이다 — 테스트가 제품이 쓰지
+    않는 구성을 재면 배관 검증이 실제 실행과 다른 것을 검증한다.
+
+    다만 **τ 는 `text-embedding-3-small` 조건의 값**이고 여기 임베딩은 결정론 대역이다
+    (`docs/tracking/decisions/0014` 의 "받아들인 비용"). 게이트와 무관한 배관을 재는
+    테스트가 대역 분포 때문에 기권에 걸리면 그 테스트만 게이트를 명시적으로 끈다 —
+    그 끄기는 사유와 함께 호출부에 적는다.
+    """
     return EvidenceCollector(
         generation_client=cast(GenerationClient, client),
         embedding_client=LexicalEmbeddingClient(dimensions=1536),
@@ -134,6 +141,7 @@ def _collector(
             vector_similarity_threshold=threshold,
             sql_max_rows=max_rows,
             query_rewrite_enabled=query_rewrite_enabled,
+            abstention_gate_enabled=abstention_gate_enabled,
         ),
         rewrite_client=cast(GenerationClient, client) if query_rewrite_enabled else None,
     )
@@ -544,7 +552,9 @@ def test_상위_k_개까지만_근거로_삼는다(
 ) -> None:
     client = _client({INTENT_STAGE: [_intent("policy")]})
 
-    result = _collector(client, threshold=0.0, top_k=2).collect(
+    # 이 테스트가 재는 것은 `top_k` 상한 하나다. 대역 임베딩의 상위 2건은 산포가 τ 아래라
+    # 게이트를 켜 두면 상한이 아니라 기권을 재게 된다 — 그래서 여기서만 끈다.
+    result = _collector(client, threshold=0.0, top_k=2, abstention_gate_enabled=False).collect(
         inquiry_id=INQUIRY_ID,
         content="환불 신청 기간이 어떻게 되나요",
         order_no=None,

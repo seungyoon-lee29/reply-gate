@@ -42,10 +42,36 @@ __all__ = [
     "OpenAIEmbeddingClient",
     "OpenAIGenerationClient",
     "OptionalEmbeddingDependencyError",
+    "accumulate_optional_tokens",
 ]
 
 #: 최초 호출 + 재시도 1회 = 최대 2회 전송 시도 (docs/standards.md "재시도 상한").
 MAX_ATTEMPTS = 2
+
+
+def _optional_token_count(usage: object, field: str) -> int | None:
+    """캐시 계열 토큰 1개 — **없으면 0 이 아니라 `None`(해당 없음/미측정)이다.**
+
+    프롬프트 캐싱을 쓰지 않는 provider(OpenAI 생성 계열)와 캐시 계열 필드를 싣지 않는
+    응답에는 이 값이 아예 없다. 그때 0 으로 접으면 "캐시가 0 토큰 적중했다"(측정했고 0)와
+    "캐시를 잰 적이 없다"(미측정)가 같은 값이 되어, 리포트가 재지도 않은 축을 잰 것처럼
+    적는다 — 미실행·미측정을 0 으로 채우지 않는 규칙과 같은 자리다.
+    """
+    value = getattr(usage, field, None)
+    if value is None:
+        return None
+    return int(value)
+
+
+def accumulate_optional_tokens(total: int | None, value: int | None) -> int | None:
+    """캐시 계열 토큰 누적 — **미측정(`None`)을 0 으로 접지 않는다.**
+
+    한 번이라도 측정값이 있으면 합계는 측정값이고, 끝까지 없으면 합계도 미측정이다.
+    `None + 0` 을 0 으로 만들면 재지 않은 실행이 "0 토큰"으로 신고된다.
+    """
+    if value is None:
+        return total
+    return value if total is None else total + value
 
 
 def _pin_transport_policy[C](client: C, *, timeout: float) -> C:
@@ -85,6 +111,10 @@ class LLMCallError(RuntimeError):
     과금분이 있다 — 그것을 여기 싣지 않으면 호출자가 실비용을 0 으로 기록한다.
     규칙은 **실행됐으나 실패한 호출의 토큰도 그대로 집계한다**이며, 출처는
     `docs/contracts.md` "토큰 집계 경계" 다.
+
+    캐시 계열(`cache_creation_input_tokens`/`cache_read_input_tokens`)은 같은 규칙을 따르되
+    **기본값이 0 이 아니라 `None`(해당 없음/미측정)** 이다 — 캐싱을 쓰지 않는 경로에서 0 을
+    싣으면 재지 않은 축이 측정값으로 신고된다.
     """
 
     def __init__(
@@ -96,6 +126,8 @@ class LLMCallError(RuntimeError):
         cause: BaseException | None = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
+        cache_creation_input_tokens: int | None = None,
+        cache_read_input_tokens: int | None = None,
     ) -> None:
         super().__init__(f"LLM 호출 실패 (stage={stage}, reason={reason}, attempts={attempts})")
         self.stage = stage
@@ -104,6 +136,8 @@ class LLMCallError(RuntimeError):
         self.cause = cause
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
+        self.cache_creation_input_tokens = cache_creation_input_tokens
+        self.cache_read_input_tokens = cache_read_input_tokens
 
 
 class LLMFormatError(ValueError):
@@ -127,6 +161,8 @@ class LLMFormatError(ValueError):
         input_tokens: int = 0,
         output_tokens: int = 0,
         transport_attempts: int = 1,
+        cache_creation_input_tokens: int | None = None,
+        cache_read_input_tokens: int | None = None,
     ) -> None:
         super().__init__(f"구조화 출력 형식 불일치 (stage={stage}): {detail}")
         self.stage = stage
@@ -135,6 +171,9 @@ class LLMFormatError(ValueError):
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.transport_attempts = transport_attempts
+        #: 캐시 계열은 **0 이 아니라 `None`** 이 미측정이다 (`LLMCallError` 와 같은 규칙).
+        self.cache_creation_input_tokens = cache_creation_input_tokens
+        self.cache_read_input_tokens = cache_read_input_tokens
 
 
 @dataclass(frozen=True)
@@ -150,6 +189,12 @@ class JsonCompletion:
     input_tokens: int
     output_tokens: int
     transport_attempts: int = 1
+    #: 캐시에 **쓴** 토큰(약 1.25배 단가). 캐싱을 쓰지 않는 provider·응답에서는 `None`
+    #: (해당 없음)이고 **0 이 아니다** — 재지 않은 축을 0 으로 신고하지 않기 위해서다.
+    cache_creation_input_tokens: int | None = None
+    #: 캐시에서 **읽은** 토큰(약 0.1배 단가). 켜짐 조건에서 `input_tokens` 는 이 값을
+    #: **제외한** 비캐시 입력이므로, 둘을 뭉뚱그리면 적중이 "입력 토큰 감소"로 위장한다.
+    cache_read_input_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -236,7 +281,14 @@ def _call_with_one_retry[T](
 
 
 def _parse_json_completion(
-    *, stage: str, text: str, input_tokens: int, output_tokens: int, transport_attempts: int = 1
+    *,
+    stage: str,
+    text: str,
+    input_tokens: int,
+    output_tokens: int,
+    transport_attempts: int = 1,
+    cache_creation_input_tokens: int | None = None,
+    cache_read_input_tokens: int | None = None,
 ) -> JsonCompletion:
     """구조화 출력 원문을 파싱한다 — 빈 응답·비 JSON 은 `LLMFormatError` (양 래퍼 공통).
 
@@ -251,6 +303,8 @@ def _parse_json_completion(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             transport_attempts=transport_attempts,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
         )
     try:
         data = json.loads(text)
@@ -262,12 +316,16 @@ def _parse_json_completion(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             transport_attempts=transport_attempts,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
         ) from exc
     return JsonCompletion(
         data=data,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         transport_attempts=transport_attempts,
+        cache_creation_input_tokens=cache_creation_input_tokens,
+        cache_read_input_tokens=cache_read_input_tokens,
     )
 
 
@@ -403,7 +461,13 @@ def _is_anthropic_api_error(exc: Exception) -> bool:
 
 
 class AnthropicGenerationClient:
-    """L2 판정용 Anthropic 호출 래퍼 — OpenAI 래퍼와 같은 실패 정책을 따른다."""
+    """L2 판정용 Anthropic 호출 래퍼 — OpenAI 래퍼와 같은 실패 정책을 따른다.
+
+    `prompt_caching` 은 **호출 구성**이지 지침 변경이 아니다: 켜면 `system`(고정 프리픽스)을
+    `cache_control` 이 붙은 블록 하나로 보낸다. 문면은 한 글자도 바뀌지 않으므로 판정
+    프롬프트 판(`judge_prompt_version`)도 따라 움직이지 않는다. 브레이크포인트를 질의(user)
+    쪽에 두지 않는 이유는 그쪽이 호출마다 달라져 매번 새 프리픽스가 되기 때문이다.
+    """
 
     def __init__(
         self,
@@ -412,6 +476,7 @@ class AnthropicGenerationClient:
         model: str,
         timeout: float = 120.0,
         client: anthropic.Anthropic | None = None,
+        prompt_caching: bool = False,
     ) -> None:
         # 재시도·타임아웃은 이 래퍼가 단독 통제한다 (모듈 docstring 참조). 값을 `or`
         # 우변에만 두면 주입 시 우회되므로 **관문을 지나게** 한다.
@@ -420,10 +485,26 @@ class AnthropicGenerationClient:
             timeout=timeout,
         )
         self._model = model
+        self._prompt_caching = prompt_caching
 
     @property
     def model(self) -> str:
         return self._model
+
+    @property
+    def prompt_caching(self) -> bool:
+        """고정 프리픽스 캐싱이 켜져 있는가 — 실행 조건 지문이 읽는 값과 같은 스위치다."""
+        return self._prompt_caching
+
+    def _system_field(self, system: str) -> str | list[dict[str, Any]]:
+        """`system` 을 어떤 모양으로 보낼지 — 캐싱이 꺼져 있으면 **문자열 그대로**.
+
+        꺼짐 조건의 요청 모양을 바꾸지 않는 것이 중요하다: 기준선 실측과 조건이 갈리면
+        전후 비교가 캐싱만의 효과를 분리하지 못한다.
+        """
+        if not self._prompt_caching:
+            return system
+        return [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
 
     def complete_json(
         self,
@@ -454,7 +535,7 @@ class AnthropicGenerationClient:
         request: dict[str, Any] = {
             "model": self._model,
             "max_tokens": max_output_tokens,
-            "system": system,
+            "system": self._system_field(system),
             "messages": [{"role": "user", "content": user}],
             "output_config": output_config,
         }
@@ -473,6 +554,11 @@ class AnthropicGenerationClient:
         usage = getattr(response, "usage", None)
         input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
         output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+        # **캐싱 켜짐 조건에서 `input_tokens` 는 캐시 적중분을 제외한 값이다.** 이 두 줄이
+        # 없으면 적중이 "판정 입력 토큰 감소"로 보여 조용한 토큰 은폐가 된다 —
+        # 절감 주장의 전제가 여기다.
+        cache_creation = _optional_token_count(usage, "cache_creation_input_tokens")
+        cache_read = _optional_token_count(usage, "cache_read_input_tokens")
 
         # 안전 분류기 거절은 HTTP 200 + stop_reason="refusal" 로 온다.
         # 사용 가능한 산출이 없으므로 실패다 (OpenAI 래퍼의 거절 처리와 동수준).
@@ -485,6 +571,8 @@ class AnthropicGenerationClient:
                 attempts=sent,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                cache_creation_input_tokens=cache_creation,
+                cache_read_input_tokens=cache_read,
             )
 
         # adaptive thinking 이 켜져 있으면 text 블록 앞에 thinking 블록이 올 수 있다 —
@@ -503,6 +591,8 @@ class AnthropicGenerationClient:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             transport_attempts=sent,
+            cache_creation_input_tokens=cache_creation,
+            cache_read_input_tokens=cache_read,
         )
 
 

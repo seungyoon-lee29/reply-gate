@@ -703,6 +703,19 @@ def test_시스템_프롬프트는_의미_정책_4분면을_담는다() -> None:
     assert "판정 범위 밖" in JUDGE_SYSTEM_PROMPT
 
 
+def test_시스템_프롬프트는_특정_사안을_지목하지_않는다() -> None:
+    """판정 지시는 어느 픽스처에나 똑같이 적용되는 일반 규칙이어야 한다.
+
+    특정 조항 ID·픽스처 ID·근거 ID 를 지시에 넣으면 그 순간 측정 3 은 판정기의 능력이
+    아니라 프롬프트에 적어 둔 답을 재는 것이 된다. 구조 테스트로 못박는다.
+    """
+    import re
+
+    assert re.search(r"\d+\s*-\s*\d+", JUDGE_SYSTEM_PROMPT) is None, "조항 번호로 보이는 표기"
+    assert re.search(r"\bJ\d{2}\b", JUDGE_SYSTEM_PROMPT) is None, "판정 픽스처 ID"
+    assert "policy:" not in JUDGE_SYSTEM_PROMPT, "근거 ID 접두"
+
+
 def test_judge_는_gate_를_import_하지_않는다() -> None:
     """L2 는 L1 과 독립이다 — 경계 위반은 구조 테스트로 못박는다."""
     import reply_gate.judge as judge_module
