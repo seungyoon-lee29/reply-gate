@@ -23,6 +23,7 @@ import anthropic
 import pytest
 from scripts import evaluate
 
+import reply_gate.pipeline as pipeline_module
 from reply_gate.config import Settings
 from reply_gate.contracts import (
     Claim,
@@ -606,3 +607,31 @@ def test_판정_실패한_픽스처의_캐시_계열도_버려지지_않는다()
     assert accuracy.error_total == len(fixtures)
     assert accuracy.cache_creation_tokens_total == 1450 * len(fixtures)
     assert accuracy.cache_read_tokens_total == 0
+
+
+def test_런타임_집계가_없는_채로_캐싱을_기본으로_켤_수_없다() -> None:
+    """캐시 계열 집계는 지금 **측정 3 경로에만** 있다.
+
+    런타임(파이프라인 → 처리 기록)의 판정 토큰은 `judge_input_tokens` 하나뿐이라, 캐싱을
+    기본으로 켜면 그 값이 조용히 "비캐시 입력"으로 바뀌고 캐시 계열은 아무 데도 안 남는다.
+    측정 3 에서 막은 은폐가 런타임에서 그대로 재발한다는 뜻이다.
+
+    지금은 스위치가 꺼져 있어 잠재 상태다. 이 검사는 **기본값을 켜는 순간** 소리가 나게
+    한다 — 런타임 집계를 먼저 배선하지 않으면 실패한다. 런타임을 배선하면 이 검사는
+    저절로 조용해진다(전제가 사라진다).
+    """
+    파이프라인 = pathlib.Path(str(pipeline_module.__file__)).read_text(encoding="utf-8")
+    런타임_집계가_있다 = (
+        "cache_read_input_tokens" in 파이프라인 or "cache_creation_input_tokens" in 파이프라인
+    )
+    if 런타임_집계가_있다:
+        return
+
+    # `Settings` 를 assert 식 안에 그대로 두면 실패 출력이 설정 객체를 통째로 repr 하고,
+    # 거기에 API 키가 평문으로 실린다. **bool 로 먼저 묶는다.**
+    캐싱이_기본으로_켜져_있다 = bool(Settings().judge_prompt_caching_enabled)
+    assert not 캐싱이_기본으로_켜져_있다, (
+        "런타임 경로에 캐시 계열 토큰 집계가 없는 채로 판정 프롬프트 캐싱을 기본으로 켤 수 "
+        "없다 — `judge_input_tokens` 가 캐시 적중분을 제외한 값으로 조용히 바뀐다. "
+        "켜려면 파이프라인·처리 기록의 판정 토큰 집계를 먼저 배선해라."
+    )

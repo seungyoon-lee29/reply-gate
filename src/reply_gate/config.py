@@ -9,6 +9,7 @@ from __future__ import annotations
 from functools import lru_cache
 from urllib.parse import quote
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from reply_gate.retrieval_strategies import AbstentionGate, AbstentionStatistic
@@ -24,19 +25,25 @@ class Settings(BaseSettings):
     )
 
     # ── 외부 API 키 ─────────────────────────────────────────────────────────
+    #
+    # **둘 다 `repr=False` 다.** 이 필드가 repr 에 실리면 설정 객체가 실린 자리마다 키가
+    # 평문으로 따라간다 — 실패한 단언의 pytest 출력, 예외 트레이스백, 로그. 실제로
+    # `assert ... Settings(...) ...` 형태의 단언 하나가 실패하면서 키 전문을 출력했다.
+    # 값을 읽는 쪽은 그대로다(`settings.openai_api_key`) — repr 에만 안 실린다.
+    #
     # 생성(의도 해석·초안 생성·SQL 생성)·임베딩 공통 — docs/architecture.md "외부 의존".
-    openai_api_key: str = ""
+    openai_api_key: str = Field(default="", repr=False)
     #: L2 판정(Anthropic) 전용. 비밀 — 환경 변수 또는 .env 에만 둔다.
-    anthropic_api_key: str = ""
+    anthropic_api_key: str = Field(default="", repr=False)
 
     # ── Postgres 접속 ───────────────────────────────────────────────────────
     postgres_host: str = "localhost"
     postgres_port: int = 5433
     postgres_db: str = "reply_gate"
     postgres_app_user: str = "reply_gate_app"
-    postgres_app_password: str = ""
+    postgres_app_password: str = Field(default="", repr=False)
     postgres_ro_user: str = "reply_gate_ro"
-    postgres_ro_password: str = ""
+    postgres_ro_password: str = Field(default="", repr=False)
 
     # ── 모델 ────────────────────────────────────────────────────────────────
     # 생성 LLM 모델 등급은 조정 가능 기본값 (docs/operations.md "환경 변수").
