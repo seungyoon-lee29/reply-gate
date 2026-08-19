@@ -40,10 +40,14 @@
 돌리는 **강등 실행은 금지**다(기준선과 실행 조건이 오염된다).
 
 **리포트 이름 규칙은 두 겹이고 둘 다 양방향이다** (`evaluation.resolve_report_stem`):
-라이브 이름 ⇔ 실측, 그리고 **L2 켜짐 실측 ⇔ `evaluation-live-l2` 접두**. 실측(과금)
+라이브 이름 ⇔ **과금 실행**, 그리고 **L2 켜짐 실측 ⇔ `evaluation-live-l2` 접두**. 과금
 실행만 `evaluation-live*` 에 쓸 수 있고, 이미 있는 라이브 리포트는 덮어쓸 수 없다.
-`--live` 를 줬어도 키·DB 문제로 측정 2 가 미실행이면 비실측이므로 기본 이름은
+`--live` 를 줬어도 키·DB 문제로 선검사를 통과하지 못하면 과금이 아니므로 기본 이름은
 `evaluation` 으로 떨어진다. 검사는 측정 시작 전이다.
+
+**실행마다 회귀 가드가 두 줄로 보고한다** — 승격 기준선(구속) + 직전 라이브(경보).
+승격은 `data/promoted_baseline.json` 을 **사람이** 바꾸는 것뿐이고, 이 스크립트를 포함해
+저장소 어디에도 그 파일을 쓰는 경로가 없다.
 
 `--stub-llm` 은 정책 청크를 **어휘 임베딩 대역**으로 다시 적재해야 하므로, 적재를
 트랜잭션 안에서 하고 끝나면 **롤백한다**. 공유 DB 의 실제 임베딩을 덮어쓰지 않는다.
@@ -82,6 +86,7 @@ from reply_gate.evaluation import (
     SkippedMeasurement,
     StubGenerationClient,
     assess_targets,
+    attach_regression_guard,
     build_report,
     display_path,
     load_golden_set,
@@ -94,6 +99,7 @@ from reply_gate.evaluation import (
     utc_now_iso,
     write_report,
 )
+from reply_gate.judge import JUDGE_SYSTEM_PROMPT
 from reply_gate.llm import (
     EmbeddingClient,
     GenerationClient,
@@ -102,6 +108,12 @@ from reply_gate.llm import (
 )
 from reply_gate.pipeline import Judging, build_judge, build_pipeline
 from reply_gate.policy_index import index_policy_documents, load_policy_documents
+from reply_gate.regression_guard import (
+    GuardUnavailable,
+    RegressionGuard,
+    content_digest,
+    text_digest,
+)
 from reply_gate.testing import LexicalEmbeddingClient, StubJudge, build_stub_pipeline
 
 #: 대역 임베딩은 실제 모델과 유사도 분포가 달라 기본 임계값(0.3)에서 거의 다 걸러진다.
@@ -154,6 +166,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="정책 검색 유사도 임계값 (기본: --stub-llm 이면 0.05, 아니면 설정값)",
     )
     parser.add_argument("--top-k", type=int, default=None, help="정책 검색 상위 k (기본: 설정값)")
+    parser.add_argument(
+        "--declare-experiment",
+        action="append",
+        metavar="지문항목",
+        help=(
+            "이번 실행이 **의도적으로 바꾼** 조건 지문 항목(반복 가능). 선언된 항목의 차이는 "
+            "대조를 막지 않고 기준선 줄에 차이 목록으로 병기된다. 선언하지 않은 불일치만 "
+            "'대조 불가'다 — 조용한 조건 드리프트를 잡는 것이 지문의 존재 이유다."
+        ),
+    )
     return parser
 
 
@@ -429,6 +451,11 @@ def main(argv: list[str] | None = None) -> int:
     # 중단돼도 이 값은 True 로 남는다: 이름은 이미 이 값으로 확정됐고(측정 시작 전 결정),
     # 무엇보다 그 이름이 곧 "이 실행은 과금될 수 있었다"는 저장소에 남는 기록이다.
     measurement2_is_real = bool(args.live) and skip is None
+    # **과금 실행 여부**가 리포트 이름의 자격을 판정한다 — "측정 2 실측 여부"는 그 목적의
+    # 낡은 대리 변수였다. 지금은 값이 같지만, 측정 2 를 건너뛰고 측정 3 만 사는 실행이
+    # 생기면 갈린다. 그때 라이브 이름을 거부당하면 과금된 산출물이 gitignore 되는 이름으로
+    # 새어 다음 실행에 덮인다(`scripts/AGENTS.md` 불변식 7).
+    billed = measurement2_is_real
 
     # 리포트 이름은 **측정을 시작하기 전에** 확정한다 — 여기서 거부될 실행이 과금(라이브
     # 30건)이나 대역 재적재를 먼저 하고 나서 산출물만 버리는 일이 없어야 한다.
@@ -436,7 +463,7 @@ def main(argv: list[str] | None = None) -> int:
         stem = resolve_report_stem(
             requested=args.report_stem,
             live_requested=bool(args.live),
-            measurement2_is_real=measurement2_is_real,
+            billed=billed,
             l2_enabled=settings.l2_enabled,
             out_dir=args.out_dir,
         )
@@ -546,6 +573,14 @@ def main(argv: list[str] | None = None) -> int:
         # 진입점에서 측정 3 이 도는 조건은 `--live` + L2 켜짐 + 키뿐이다 — 완주했으면
         # 실제 판정 모델로 낸 값이다(대역 판정은 `--stub-llm` 이고 그때는 돌지 않는다).
         measurement3_is_real=measurement3_is_real,
+        billed=billed,
+        measurement_scope=_measurement_scope(skip=skip, judge_skip=judge_skip),
+        condition_fingerprint=_condition_fingerprint(
+            args=args, settings=settings, run_settings=run_settings
+        ),
+        # 선언된 실험 변인은 **실행이 명시**한다 — 코드가 추측하지 않는다. 선언되지 않은
+        # 지문 불일치는 "대조 불가"로 남고, 그것이 조용한 조건 드리프트를 잡는 자리다.
+        declared_experiment_fields=tuple(args.declare_experiment or ()),
     )
     report: EvaluationReport = build_report(
         conditions=conditions,
@@ -553,10 +588,12 @@ def main(argv: list[str] | None = None) -> int:
         pipeline=pipeline,
         judge_accuracy=judge_accuracy,
     )
+    report = attach_regression_guard(report, stem=stem, reports_dir=args.out_dir)
     markdown_path, json_path = write_report(report, out_dir=args.out_dir, stem=stem)
 
     _print_summary(report)
     _print_targets(report)
+    _print_regression_guard(report)
     print(f"\n리포트: {markdown_path}\n리포트(JSON): {json_path}")
     return exit_code
 
@@ -606,6 +643,70 @@ def _print_summary(report: EvaluationReport) -> None:
         print("  ※ 측정 3 은 확률 층이고 목표치는 미확정이다 — 달성·미달 판정이 붙지 않는다.")
     else:
         print("  ※ 위 측정 3 수치는 대역으로 낸 값이다 — 판정 모델의 정확도가 아니다.")
+
+
+def _measurement_scope(*, skip: str | None, judge_skip: str | None) -> str:
+    """측정 범위 — 풀셋인지 부분인지. 조건 지문의 한 항목이라 대조 가능성을 가른다."""
+    if skip is None and judge_skip is None:
+        return "full"
+    if skip is not None and judge_skip is None:
+        return "measurement_1_3_only"
+    if skip is None:
+        return "measurement_1_2_only"
+    return "measurement_1_only"
+
+
+def _condition_fingerprint(
+    *, args: argparse.Namespace, settings: Settings, run_settings: Settings
+) -> dict[str, str]:
+    """대조 가능성을 결정하는 지문 값들.
+
+    **새 축을 붙이는 작업은 여기 한 줄을 더하면 된다** — 지문 스키마는 열린 맵이라
+    `evaluation.py` 도 `regression_guard.py` 도 다시 열지 않는다. 예: 기권 게이트를
+    배선하면 `abstention_gate_statistic`·`abstention_tau` 에 설정값을 실으면 된다.
+
+    프롬프트·픽스처·라벨 버전은 **손으로 적지 않고 내용에서 끌어낸다** — 손으로 적는
+    버전 문자열은 갱신을 잊는 순간 조용한 드리프트가 된다.
+    """
+    return {
+        # 라벨 버전 = 골든셋 내용 지문. 결정 0008 의 라벨 재정렬 전후가 여기서 갈린다.
+        "label_version": content_digest(args.golden_set, prefix="golden-") or "미상",
+        "acceptance_cut": f"{run_settings.vector_similarity_threshold:g}",
+        # 기권 게이트는 아직 배선되지 않았다 — 없는 축을 0 으로 적지 않는다.
+        "abstention_gate_statistic": "미배선",
+        "abstention_tau": "미배선",
+        "query_rewrite": "on" if run_settings.query_rewrite_enabled else "off",
+        "embedding_model": run_settings.embedding_model,
+        "embedding_dimensions": str(run_settings.embedding_dimensions),
+        "top_k": str(run_settings.vector_top_k),
+        "generation_model": run_settings.generation_model,
+        "judge_model": run_settings.judge_model,
+        "judge_effort": run_settings.judge_effort or "기본값",
+        "judge_prompt_version": text_digest(JUDGE_SYSTEM_PROMPT, prefix="judge-"),
+        "judge_fixture_version": content_digest(args.judge_fixtures, prefix="fixture-") or "미상",
+        # 판정 프롬프트 캐싱은 아직 배선이 없다. 배선하면 설정에서 읽도록 바꾼다.
+        "judge_prompt_caching": "off",
+        "l2_enabled": "on" if settings.l2_enabled else "off",
+    }
+
+
+def _print_regression_guard(report: EvaluationReport) -> None:
+    """회귀 판정을 콘솔에도 찍는다 — 리포트 파일을 열어야만 미달을 아는 일이 없게."""
+    guard = report.regression_guard
+    if isinstance(guard, GuardUnavailable):
+        print(f"회귀 가드 — 미산출 (사유: {guard.reason})")
+        return
+    if not isinstance(guard, RegressionGuard):  # pragma: no cover - 방어
+        return
+    print(
+        f"회귀 가드 — 판정 [{guard.verdict}] (승격 기준선 구속) "
+        f"/ 직전 라이브 [{guard.alert.verdict}] (경보)"
+    )
+    print(f"  {guard.binding.verdict_reason}")
+    for finding in (*guard.binding.match_shortfalls, *guard.binding.match_collapses):
+        print(f"  - 일치 미달: {finding.describe()}")
+    for loss in guard.binding.evidence_losses:
+        print(f"  - 근거 부분 손실: {loss.describe()}")
 
 
 def _print_targets(report: EvaluationReport) -> None:
