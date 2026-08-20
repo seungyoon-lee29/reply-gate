@@ -50,8 +50,13 @@ def _scanned_files() -> list[Path]:
 
 
 def test_소스가_사이클_설계_문서를_인용하지_않는다() -> None:
+    scanned = _scanned_files()
+    # **검사 대상이 비면 이 가드는 아무것도 지키지 않는다**(`tests/AGENTS.md` 불변식 3).
+    # 아래 음성 대조는 정규식만 태우므로 목록 유도부가 망가져도 잡지 못한다.
+    names = {path.name for path in scanned}
+    assert {"gate.py", "evidence.py", "evaluate.py", "schema.sql"} <= names, sorted(names)
     offenders: list[str] = []
-    for path in _scanned_files():
+    for path in scanned:
         if path.name == Path(__file__).name:
             continue
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
@@ -134,3 +139,71 @@ def test_docs_가드가_실제로_잡는다() -> None:
     assert not any(_SECTION_REF.search(line) for _, line in _strip_code("`spec §4-3` 같은 인용"))
     assert _NUMBERED_HEADING.match("## 7. 실측이 문제정의를 어떻게 바꿨나")
     assert _NUMBERED_HEADING.match("### 4-3. 채택 규칙")
+
+
+# ── 하드 게이트 번호 인용 ───────────────────────────────────────────────────
+#
+# 위 두 가드는 **파일을 이름으로** 가리키는 인용만 본다. `하드 게이트 10` 처럼 번호만 적은
+# 인용은 어느 파일도 이름하지 않아 정규식이 통째로 놓친다 — 실제로 durable 문서 4곳과
+# 소스 주석 1곳이 `.dryforge/003/handoff.md` 의 번호 매김을 `docs/standards.md` 의 것인 양
+# 인용하고 있었다(그 목록은 5번까지였다). 아카이브 인용 사고의 **네 번째** 재발이고,
+# 형태만 바꿔 같은 사각으로 들어왔다.
+#
+# 그래서 번호를 **정본 목록의 길이로 검증한다.** 목록이 자라면 가드도 같이 자라므로
+# 상수를 손으로 맞출 필요가 없다.
+
+_STANDARDS = Path("docs/standards.md")
+
+#: `## 하드 게이트 — …` 절 안의 최상위 번호 항목. `1. **…**` 형태다.
+_GATE_SECTION = re.compile(r"^##\s+하드 게이트")
+_GATE_ITEM = re.compile(r"^(\d+)\.\s")
+
+#: 본문의 번호 인용. `하드 게이트 10` · `하드 게이트 9 다` · `하드 게이트 8 "…"`.
+_GATE_REF = re.compile(r"하드 게이트\s+(\d+)")
+
+
+def _declared_gate_numbers() -> set[int]:
+    """`docs/standards.md` 의 하드 게이트 목록이 실제로 정의하는 번호 집합."""
+    numbers: set[int] = set()
+    inside = False
+    for line in (_ROOT / _STANDARDS).read_text(encoding="utf-8").splitlines():
+        if line.startswith("## "):
+            inside = bool(_GATE_SECTION.match(line))
+            continue
+        if inside and (item := _GATE_ITEM.match(line)):
+            numbers.add(int(item.group(1)))
+    return numbers
+
+
+def test_하드_게이트_번호_인용이_정본_목록_안에서_풀린다() -> None:
+    declared = _declared_gate_numbers()
+    # 유도부가 비면 아래 대조는 전부 통과한다 — 목록이 실제로 읽혔는지 먼저 본다.
+    assert declared == set(range(1, len(declared) + 1)) and len(declared) >= 5, sorted(declared)
+
+    offenders: list[str] = []
+    targets = [*_scanned_files(), *sorted((_ROOT / _DOCS).rglob("*.md"))]
+    for path in targets:
+        if path.name == Path(__file__).name:
+            continue
+        for number, line in _strip_code(path.read_text(encoding="utf-8")):
+            for ref in _GATE_REF.finditer(line):
+                if int(ref.group(1)) not in declared:
+                    offenders.append(f"{path.relative_to(_ROOT)}:{number}: {line.strip()}")
+
+    assert not offenders, (
+        '정본 목록(docs/standards.md "하드 게이트")에 없는 번호다 — 사이클 문서의 번호 매김을 '
+        "인용했을 가능성이 높다. 규칙을 정본으로 옮겨 적고 그 번호를 인용하라:\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_하드_게이트_번호_가드가_실제로_잡는다() -> None:
+    """음성 대조 — 목록 밖 번호가 걸리고 목록 안 번호는 통과한다."""
+    declared = _declared_gate_numbers()
+    outside = max(declared) + 1
+    assert (hit := _GATE_REF.search(f"판정 기준은 하드 게이트 {outside} 이다"))
+    assert int(hit.group(1)) not in declared
+    assert (ok := _GATE_REF.search("여기가 열리면 하드 게이트 1 이 한 줄로 깨진다"))
+    assert int(ok.group(1)) in declared
+    # 백틱 안의 예시는 `_strip_code` 가 지운다 — 사고를 설명하는 문장이 스스로 걸리면 안 된다.
+    assert not any(_GATE_REF.search(line) for _, line in _strip_code("`하드 게이트 10` 같은 인용"))
