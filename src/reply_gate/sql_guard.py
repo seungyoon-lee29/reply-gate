@@ -17,8 +17,12 @@ data-modifying CTE(`WITH x AS (INSERT ...) SELECT ...`)를 놓친다 — 둘 다
    화이트리스트 구성원이 아니다: 한정된 컬럼(`o.col`)은 그 한정자가 가리키는 소스의 목록으로
    검사하고, 맨 이름 별칭은 PostgreSQL 이 실제로 출력 이름을 해석하는 자리(ORDER BY·GROUP BY)
    에서만 받아들인다.
-3. **함수 허용 목록** — `pg_sleep` 같은 호출이 실행 시간을 무한정 잡는 것을 막는다.
-   (권한이 필요한 함수는 안전장치 1이 막지만, 가용성은 권한이 막아주지 않는다.)
+3. **함수 허용 목록과 형변환 대상 타입 허용 목록** — `pg_sleep` 같은 호출이 실행 시간을
+   무한정 잡는 것을 막고, `cast(... AS regclass)` 같은 **시스템 카탈로그 참조 타입**이
+   화이트리스트 밖의 이름과 존재 여부를 결과로 실어 나르는 것을 막는다.
+   (권한이 필요한 함수는 안전장치 1이 막지만, 가용성은 권한이 막아주지 않는다. 카탈로그
+   참조 타입은 **안전장치 1도 막지 못한다** — 시스템 카탈로그는 read-only 계정도 읽으므로
+   막는 층이 이 가드 하나뿐이다.)
 4. **주문 1건 한정** — 생성된 쿼리가 **선검사를 통과한 주문번호 1건**으로 한정됨을 AST 로
    확인한다 (docs/architecture.md "대표 흐름" — 선검사를 통과한 주문에 대해 조회).
    어떤 행이 나올지를 LLM 이 정하게 두면 무관한 고객의 연락처가 근거로 채택되고,
@@ -26,6 +30,9 @@ data-modifying CTE(`WITH x AS (INSERT ...) SELECT ...`)를 놓친다 — 둘 다
    **외부 조인의 ON 절은 보존측 테이블을 거르지 않으므로** 한정 조건으로 인정할 수 없다
    (아래 `_check_joins`·`_is_inner_join`).
 5. **결과 행 수 상한** — 거부가 아니라 LIMIT 을 강제한다.
+6. **PII allowlist 출력 유래** — 어느 결과 컬럼의 값이 `orders` 직접 컬럼에서 왔는지를
+   스코프를 타고 내려가며 증명한다(아래 `_projection_provenance`). 증명하지 못한 출력은
+   **자동으로 불승인**이다 — 허용을 늘리는 방식이지 거부 목록을 두는 방식이 아니다.
 
 거부 규칙은 `SqlGuardRule` 이 전부이고, 거부 사유는 SQL 재생성 프롬프트에 그대로 실린다
 (docs/standards.md "재시도 상한" — 오류 내용을 피드백으로 1회 재시도). 그러므로 사유
@@ -36,17 +43,19 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum, StrEnum
 from types import MappingProxyType
-from typing import Final
+from typing import Final, NamedTuple
 
 import sqlglot
 from sqlglot import exp
 from sqlglot.errors import SqlglotError
 
+from reply_gate.gate import pii_shaped
 from reply_gate.order_ref import is_valid_order_no
 
 __all__ = [
+    "ALLOWED_CAST_TYPES",
     "ALLOWED_SCHEMAS",
     "ORDERS_TABLE",
     "ORDER_SCOPE_COLUMN",
@@ -54,6 +63,7 @@ __all__ = [
     "SqlGuardRejection",
     "SqlGuardRule",
     "ValidatedQuery",
+    "describe_allowed_cast_types",
     "describe_allowed_functions",
     "describe_whitelist",
     "validate_sql",
@@ -145,6 +155,54 @@ _ALLOWED_FUNCTION_TYPES: Final[tuple[type[exp.Func], ...]] = tuple(
     node_type for _, node_type in _ALLOWED_FUNCTIONS
 )
 
+#: 형변환의 **대상 타입** 허용 목록. **여기 없는 타입은 전부 거부한다.**
+#:
+#: 근거: 허용 함수 목록이 캐스트를 넣은 이유가 "숫자·일자를 문자열로 붙일 때"이고, 이 목록은
+#: 그 용도 — 숫자 · 일자 · 문자열 — 에 정확히 맞춘다. 대상 타입을 읽지 않으면
+#: `cast('inquiries' AS regclass)` 처럼 **시스템 카탈로그 참조 타입**으로 화이트리스트 밖
+#: 테이블의 이름과 존재 여부를 결과 컬럼에 실을 수 있다. 시스템 카탈로그는 read-only 계정도
+#: 읽으므로(PUBLIC 권한) 안전장치 1이 이 경로를 막지 못한다 — **막는 층이 이 목록 하나뿐이다.**
+#:
+#: 키는 프롬프트·거부 사유에 싣는 SQL 표기, 값은 sqlglot 이 그 표기를 파싱해 만드는 타입이다
+#: (`numeric` → `DECIMAL`, `real` → `FLOAT` 처럼 sqlglot 이 이름을 정규화한다). 카탈로그 참조
+#: 타입(`oid`·`reg*`)은 `exp.ObjectIdentifier` 로 파싱돼 `this` 가 열거형이 아니므로, 이
+#: 집합과의 대조만으로 자동 거부된다.
+_ALLOWED_CAST_TYPES: Final = (
+    # 문자열 — 근거 문장에 붙이는 형태.
+    ("text", exp.DataType.Type.TEXT),
+    ("varchar", exp.DataType.Type.VARCHAR),
+    ("char", exp.DataType.Type.CHAR),
+    # 숫자 — 수량·금액 계산과 표시.
+    ("int", exp.DataType.Type.INT),
+    ("bigint", exp.DataType.Type.BIGINT),
+    ("smallint", exp.DataType.Type.SMALLINT),
+    ("numeric", exp.DataType.Type.DECIMAL),
+    ("real", exp.DataType.Type.FLOAT),
+    ("double precision", exp.DataType.Type.DOUBLE),
+    # 일자 — 주문·배송 일자.
+    ("date", exp.DataType.Type.DATE),
+    ("timestamp", exp.DataType.Type.TIMESTAMP),
+    ("timestamptz", exp.DataType.Type.TIMESTAMPTZ),
+    ("time", exp.DataType.Type.TIME),
+)
+
+#: 프롬프트·거부 사유가 그대로 옮겨 적는 표기 목록. **정의는 여기 하나뿐이다** —
+#: SQL 생성 안내는 `describe_allowed_cast_types()` 를 부르기만 한다(구조 검사가 지킨다).
+ALLOWED_CAST_TYPES: Final[tuple[str, ...]] = tuple(name for name, _ in _ALLOWED_CAST_TYPES)
+
+_ALLOWED_CAST_TYPE_NODES: Final = frozenset(node_type for _, node_type in _ALLOWED_CAST_TYPES)
+
+#: **빈칸 채우기 계열** — 결과값이 인자 중 하나 **그대로**이고, 조각을 이어 붙이지 않는다.
+#: 그래서 인자가 전부 (직접 컬럼 | 개인정보 모양이 아닌 고정값) 이면 출력도 그 성질을
+#: 유지한다. 이어 붙이기 계열(`concat`·`||`)은 여기 없다 — 조각 하나하나는 개인정보 모양이
+#: 아닌데 합치면 번호가 되기 때문이다(`_projection_provenance`).
+#:
+#: **둘을 갈라 두는 것은 값이 흐르는 자리가 다르기 때문이다.** `coalesce` 는 어느 인자든
+#: 출력이 될 수 있지만 `nullif(a, b)` 의 출력은 `a` 아니면 NULL 이고 `b` 는 비교 상대일
+#: 뿐이다 — `b` 자리의 직접 컬럼을 유래로 세면 값이 흐르지 않는 자리로 승인이 난다.
+_COALESCE_FUNCTION_TYPES: Final[tuple[type[exp.Func], ...]] = (exp.Coalesce,)
+_NULLIF_FUNCTION_TYPES: Final[tuple[type[exp.Func], ...]] = (exp.Nullif,)
+
 #: sqlglot 이 `Func` 로 모델링하지만 **함수 호출이 아닌** 노드들 — 허용 목록의 대상이 아니다.
 #:
 #: * `Connector` — `AND`/`OR`/`XOR`. 연산자이지 호출이 아니다(WHERE 절을 쓰면 반드시 나온다).
@@ -194,6 +252,7 @@ class SqlGuardRule(StrEnum):
     NO_WHITELISTED_TABLE = "no_whitelisted_table"
     UNKNOWN_COLUMN = "unknown_column"
     FORBIDDEN_FUNCTION = "forbidden_function"
+    UNSUPPORTED_CAST_TYPE = "unsupported_cast_type"
     UNSUPPORTED_PROJECTION = "unsupported_projection"
     ORDER_SCOPE = "order_scope"
     UNSUPPORTED_LIMIT = "unsupported_limit"
@@ -234,13 +293,35 @@ def describe_whitelist(whitelist: Mapping[str, tuple[str, ...]] = SCHEMA_WHITELI
     return "\n".join(f"- {table}({', '.join(columns)})" for table, columns in whitelist.items())
 
 
-def describe_allowed_functions() -> str:
-    """SQL 생성 프롬프트·거부 사유에 싣는 허용 함수 목록."""
+def _describe_function_names() -> str:
+    """허용 함수 이름만 — 함수 거부 사유가 이 줄만 인용한다."""
     seen: list[str] = []
     for name, _ in _ALLOWED_FUNCTIONS:
         if name not in seen:
             seen.append(name)
     return ", ".join(seen)
+
+
+def describe_allowed_cast_types() -> str:
+    """SQL 생성 프롬프트·거부 사유에 싣는 **형변환 대상 타입** 목록.
+
+    목록의 정의는 이 모듈 하나이고, 생성 안내는 이 문면을 그대로 싣는다. 가드와 안내가
+    갈리면 생성기가 목록 밖 타입을 쓸 때마다 거부 → 재시도 1회 → 인계가 되고, 그 인계가
+    그대로 평가 수치에 남는다.
+    """
+    return (
+        f"cast 의 대상 타입은 {', '.join(ALLOWED_CAST_TYPES)} 뿐이다 — "
+        "그 밖의 타입(시스템 카탈로그 참조 타입 등)은 거부된다."
+    )
+
+
+def describe_allowed_functions() -> str:
+    """SQL 생성 프롬프트에 싣는 허용 함수 목록 + 형변환 대상 타입 목록.
+
+    프롬프트의 `[허용 함수]` 절이 곧 이 문자열이다. 캐스트 허용 목록을 여기 함께 싣는 것은
+    **정의를 두 곳에 두지 않기 위해서**다 — 안내 쪽 모듈이 자기 목록을 들면 한쪽만 넓혀진다.
+    """
+    return f"{_describe_function_names()}\n{describe_allowed_cast_types()}"
 
 
 def _reject(rule: SqlGuardRule, detail: str) -> SqlGuardRejection:
@@ -365,6 +446,15 @@ def _check_joins(statement: exp.Select) -> None:
 # ── 2. 스코프 해석 (테이블·컬럼 화이트리스트) ───────────────────────────────
 
 
+class _Exported(NamedTuple):
+    """스코프가 바깥에 내놓는 것 — 컬럼 이름들과, 그중 **유래가 증명된** 이름들."""
+
+    #: 이 스코프가 내놓는 출력 이름 전부 (소문자).
+    columns: frozenset[str]
+    #: 그중 값이 `orders` 직접 컬럼에서 왔음이 증명된 이름들. `columns` 의 부분집합이다.
+    pii_safe: frozenset[str]
+
+
 @dataclass(frozen=True)
 class _Source:
     """FROM/JOIN 이 스코프 안에 들여놓은 이름 하나."""
@@ -375,6 +465,12 @@ class _Source:
     columns: frozenset[str]
     #: 화이트리스트 **기저 테이블**이면 그 테이블 이름. CTE·파생 테이블이면 `None`.
     base_table: str | None
+    #: `columns` 중 값의 유래가 `orders` 직접 컬럼임이 증명된 것들.
+    #:
+    #: 기저 테이블이면 전부다. CTE·파생 테이블이면 **안쪽 스코프에서 증명된 부분집합**이고
+    #: (그래서 유래 추적이 임시 테이블 한 겹을 건너도 끊기지 않는다), 컬럼 별칭 목록으로
+    #: 이름을 갈아 끼운 소스는 자리 대응을 증명할 수 없으므로 비어 있다(fail-closed).
+    pii_safe_columns: frozenset[str]
 
 
 @dataclass
@@ -483,7 +579,7 @@ class _Analyzer:
         self,
         select: exp.Select,
         parent: _Scope | None,
-        cte_columns: Mapping[str, frozenset[str]],
+        cte_columns: Mapping[str, _Exported],
     ) -> _Scope:
         env = dict(cte_columns)
         self._register_ctes(select, env)
@@ -510,7 +606,7 @@ class _Analyzer:
                 self.build(nested, scope, env)
         return scope
 
-    def _register_ctes(self, select: exp.Select, env: dict[str, frozenset[str]]) -> None:
+    def _register_ctes(self, select: exp.Select, env: dict[str, _Exported]) -> None:
         with_node: exp.Expr | None = None
         for key in ("with_", "with"):
             candidate = select.args.get(key)
@@ -539,9 +635,13 @@ class _Analyzer:
             # CTE 는 상관 참조를 할 수 없다 — 부모 스코프를 주지 않는다.
             inner = self.build(body, None, env)
             declared = _alias_columns(cte)
-            env[name] = frozenset(declared) if declared else self._outputs(inner)
+            env[name] = (
+                # 컬럼 별칭 목록은 자리로 이름을 갈아 끼운다 — 어느 안쪽 projection 이
+                # 어느 이름이 되는지 증명하지 않으므로 유래를 하나도 넘기지 않는다.
+                _Exported(frozenset(declared), frozenset()) if declared else _exports(inner)
+            )
 
-    def _source(self, node: exp.Expr, env: Mapping[str, frozenset[str]]) -> _Source:
+    def _source(self, node: exp.Expr, env: Mapping[str, _Exported]) -> _Source:
         if isinstance(node, exp.Table):
             return self._table_source(node, env)
         if isinstance(node, exp.Subquery):
@@ -553,10 +653,12 @@ class _Analyzer:
                 )
             inner = self.build(body, None, env)
             declared = _alias_columns(node)
+            exported = _Exported(frozenset(declared), frozenset()) if declared else _exports(inner)
             return _Source(
                 name=node.alias.lower(),
-                columns=frozenset(declared) if declared else self._outputs(inner),
+                columns=exported.columns,
                 base_table=None,
+                pii_safe_columns=exported.pii_safe,
             )
         raise _reject(
             SqlGuardRule.UNSUPPORTED_SOURCE,
@@ -564,7 +666,7 @@ class _Analyzer:
             f"화이트리스트 테이블({self._whitelist_names})이나 부질의만 읽는다.",
         )
 
-    def _table_source(self, node: exp.Table, env: Mapping[str, frozenset[str]]) -> _Source:
+    def _table_source(self, node: exp.Table, env: Mapping[str, _Exported]) -> _Source:
         self._seen_tables.add(id(node))
         name = node.name.lower()
         schema = node.db.lower()
@@ -578,10 +680,12 @@ class _Analyzer:
             )
         declared = _alias_columns(node)
         if name in env and not schema and not catalog:
+            exported = _Exported(frozenset(declared), frozenset()) if declared else env[name]
             return _Source(
                 name=(node.alias or name).lower(),
-                columns=frozenset(declared) if declared else env[name],
+                columns=exported.columns,
                 base_table=None,
+                pii_safe_columns=exported.pii_safe,
             )
         if catalog:
             raise _reject(
@@ -607,25 +711,12 @@ class _Analyzer:
         if name not in self.base_tables:
             self.base_tables.append(name)
         return _Source(
-            name=(node.alias or name).lower(), columns=self._whitelist[name], base_table=name
+            name=(node.alias or name).lower(),
+            columns=self._whitelist[name],
+            base_table=name,
+            # 기저 테이블의 컬럼은 정의상 직접 컬럼이다 — 유래 추적의 바닥이다.
+            pii_safe_columns=self._whitelist[name],
         )
-
-    def _outputs(self, scope: _Scope) -> frozenset[str]:
-        """스코프가 바깥에 내놓는 컬럼 이름들 (파생 테이블·CTE 의 컬럼 목록)."""
-        names: set[str] = set()
-        for expression in scope.select.expressions:
-            if isinstance(expression, exp.Star):
-                for source in scope.sources.values():
-                    names |= source.columns
-            elif isinstance(expression, exp.Column) and isinstance(expression.this, exp.Star):
-                qualified = scope.sources.get(expression.table.lower())
-                if qualified is not None:
-                    names |= qualified.columns
-            else:
-                output = expression.output_name
-                if output:
-                    names.add(output.lower())
-        return frozenset(names)
 
     # ── 검사 ────────────────────────────────────────────────────────────────
 
@@ -779,6 +870,164 @@ def _resolve_bare(scope: _Scope | None, name: str) -> bool:
     return False
 
 
+def _resolve_bare_pii_safe(scope: _Scope | None, name: str) -> bool:
+    """한정자 없는 이름이 **유래가 증명된** 컬럼을 가리키는가.
+
+    이름을 내놓는 소스가 여럿이면 **전부** 증명돼 있어야 한다. 하나라도 아니면 어느 쪽이
+    나올지 코드가 정하지 못하므로 증명이 아니다.
+    """
+    while scope is not None:
+        owners = [source for source in scope.sources.values() if name in source.columns]
+        if owners:
+            return all(name in source.pii_safe_columns for source in owners)
+        scope = scope.parent
+    return False
+
+
+# ── PII allowlist 출력 유래 ─────────────────────────────────────────────────
+
+
+class _Provenance(Enum):
+    """결과 컬럼 값이 어디서 오는가."""
+
+    #: `orders` 직접 컬럼에서 왔음이 증명됐다 (임시 테이블·파생 테이블·빈칸 채우기 경유 포함).
+    DIRECT = "direct"
+    #: 값이 **개인정보 모양이 아닌 고정값**이다. 빈칸 채우기 자리에서만 의미가 있다.
+    FILLER = "filler"
+    #: 증명하지 못했다 — 그러므로 승인하지 않는다.
+    UNKNOWN = "unknown"
+
+
+def _unwrap_parens(node: exp.Expr) -> exp.Expr:
+    """괄호만 벗긴다. **부질의는 벗기지 않는다** — `unnest()` 는 `Subquery` 도 벗겨서,
+    스칼라 부질어를 안쪽 SELECT 로 오인하게 만든다."""
+    value = node
+    while isinstance(value, exp.Paren) and isinstance(value.this, exp.Expr):
+        value = value.this
+    return value
+
+
+def _coalesce_arguments(node: exp.Func) -> Iterator[exp.Expr]:
+    """`coalesce` 의 인자 전부 — 어느 것이든 출력이 될 수 있다."""
+    if isinstance(node.this, exp.Expr):
+        yield node.this
+    for item in node.args.get("expressions") or []:
+        if isinstance(item, exp.Expr):
+            yield item
+
+
+def _projection_provenance(node: exp.Expr, scope: _Scope) -> _Provenance:
+    """이 식의 값이 `orders` 직접 컬럼에서 왔음을 증명할 수 있는가.
+
+    **모르는 표현식은 자동으로 불승인**이다(fail-closed). 넓히는 방향은 허용 목록을 늘리는
+    것이지 거부 목록을 두는 것이 아니라, 새 SQL 문법이 생겨도 조용히 승인되지 않는다.
+
+    증명되는 세 가지뿐이다.
+
+    1. **직접 컬럼** — 기저 테이블의 컬럼. 임시 테이블(CTE)·파생 테이블을 거쳐도, 그 안쪽
+       스코프가 같은 방식으로 증명했으면 유래가 이어진다(`_Source.pii_safe_columns`).
+    2. **개인정보 모양이 아닌 고정값** — `'미정'` 처럼. **"개인정보 모양"의 정의는 이 모듈이
+       만들지 않는다** — L1 게이트가 단독 소유하는 패턴 집합(`gate.pii_shaped`)을 부르기만
+       한다. 층마다 자기 정규식을 두면 한쪽만 넓혀져 기준이 갈리고, 접기가 층마다 달라
+       실제로 그렇게 뚫렸다.
+    3. **빈칸 채우기(1·2의 조합)** — `coalesce`·`nullif` 는 값을 **그대로** 내놓고 조각을
+       이어 붙이지 않는다. `coalesce` 는 인자가 전부 1이나 2이고 그중 하나라도 1이면 출력의
+       가능한 값이 전부 (진짜 컬럼 값 | 개인정보가 아닌 고정값) 이다. `nullif(a, b)` 는
+       출력이 `a` 아니면 NULL 이므로 **`a` 가 1이어야** 하고, `b` 는 값이 흐르지 않는
+       비교 상대라 유래로 세지 않는다.
+
+    **이어 붙이기 계열(`concat`·`||`)은 여기 없다.** 조각 하나하나는 개인정보 모양이 아닌데
+    합치면 번호가 된다(`'01' || '0-9999-9999'`) — 그 길을 열지 않으려면 고정값이 이어 붙이기
+    안으로 들어가는 자리가 아예 없어야 한다. 조건 분기(`CASE`)도 넣지 않는다: 넓히는 이유가
+    "생성 안내가 빈칸 채우기를 광고한다"는 것이고, 조건 분기는 그 이유에 해당하지 않는다.
+    """
+    value = _unwrap_parens(node)
+
+    if isinstance(value, exp.Column):
+        if isinstance(value.this, exp.Star):
+            # `o.*` 는 projection 단위가 아니라 소스 단위로 따로 편다.
+            return _Provenance.UNKNOWN
+        name = value.name.lower()
+        qualifier = value.table.lower()
+        if qualifier:
+            source = _lookup_source(scope, qualifier)
+            proven = source is not None and name in source.pii_safe_columns
+        else:
+            proven = _resolve_bare_pii_safe(scope, name)
+        return _Provenance.DIRECT if proven else _Provenance.UNKNOWN
+
+    if isinstance(value, exp.Literal):
+        # `E'...'`·`U&'...'`·`$$...$$`·`N'...'` 는 `Literal` 이 아닌 별도 노드라 여기 오지
+        # 않는다 — 이스케이프가 풀린 뒤의 값을 이 모듈이 계산하지 않으므로 그 편이 옳다.
+        return _Provenance.UNKNOWN if pii_shaped(str(value.this)) else _Provenance.FILLER
+
+    if isinstance(value, _COALESCE_FUNCTION_TYPES):
+        provenances = [_projection_provenance(arg, scope) for arg in _coalesce_arguments(value)]
+        if not provenances or _Provenance.UNKNOWN in provenances:
+            return _Provenance.UNKNOWN
+        # 인자가 전부 고정값이면 유래가 없다 — 승인할 직접 컬럼이 하나도 없다는 뜻이다.
+        return _Provenance.DIRECT if _Provenance.DIRECT in provenances else _Provenance.UNKNOWN
+
+    if isinstance(value, _NULLIF_FUNCTION_TYPES):
+        compared = value.args.get("expression")
+        if not isinstance(compared, exp.Expr) or not isinstance(value.this, exp.Expr):
+            return _Provenance.UNKNOWN
+        if _projection_provenance(compared, scope) is _Provenance.UNKNOWN:
+            return _Provenance.UNKNOWN
+        return _projection_provenance(value.this, scope)
+
+    return _Provenance.UNKNOWN
+
+
+def _star_sources(projection: exp.Expr, scope: _Scope) -> tuple[_Source, ...] | None:
+    """이 projection 이 별표라면 그것이 펴는 소스들, 별표가 **아니면** `None`.
+
+    빈 튜플과 `None` 은 다른 상태다 — 빈 튜플은 "별표인데 한정자가 가리키는 소스를 해석하지
+    못했다"이고, 그때는 내놓는 이름을 모르므로 아무것도 넘기지 않는다(fail-closed).
+    """
+    if isinstance(projection, exp.Star):
+        return tuple(scope.sources.values())
+    value = projection.this if isinstance(projection, exp.Alias) else projection
+    if isinstance(value, exp.Column) and isinstance(value.this, exp.Star):
+        qualified = scope.sources.get(value.table.lower())
+        return () if qualified is None else (qualified,)
+    return None
+
+
+def _exports(scope: _Scope) -> _Exported:
+    """스코프가 바깥에 내놓는 컬럼 이름들과, 그중 유래가 증명된 이름들.
+
+    **같은 이름을 내놓는 projection 이 여럿이면 전부 증명돼야 한다.** 바깥 스코프의 출력
+    이름 중복 거부(`_check_unique_output_names`)는 안쪽 SELECT 를 보지 않으므로, 안쪽에서
+    계산값이 직접 컬럼과 같은 이름을 쓰면 여기서 걸러야 유래가 조용히 넘어가지 않는다.
+    """
+    columns: set[str] = set()
+    proven: set[str] = set()
+    unproven: set[str] = set()
+
+    def record(name: str, *, is_direct: bool) -> None:
+        columns.add(name)
+        (proven if is_direct else unproven).add(name)
+
+    for projection in scope.select.expressions:
+        stars = _star_sources(projection, scope)
+        if stars is not None:
+            for source in stars:
+                for column in source.columns:
+                    record(column, is_direct=column in source.pii_safe_columns)
+            continue
+        output = projection.output_name
+        if not output:
+            continue
+        value = projection.this if isinstance(projection, exp.Alias) else projection
+        record(
+            output.lower(),
+            is_direct=_projection_provenance(value, scope) is _Provenance.DIRECT,
+        )
+
+    return _Exported(frozenset(columns), frozenset(proven - unproven))
+
+
 # ── 3. 함수 허용 목록 ───────────────────────────────────────────────────────
 
 
@@ -803,7 +1052,31 @@ def _check_functions(statement: exp.Select) -> None:
         raise _reject(
             SqlGuardRule.FORBIDDEN_FUNCTION,
             f"허용되지 않은 함수를 호출했다: {_function_label(node)}. "
-            f"쓸 수 있는 함수는 {describe_allowed_functions()} 뿐이다.",
+            f"쓸 수 있는 함수는 {_describe_function_names()} 뿐이다.",
+        )
+
+
+def _check_cast_types(statement: exp.Select) -> None:
+    """형변환의 **대상 타입**을 허용 목록으로 판정한다 (fail-closed).
+
+    캐스트가 허용 함수인데 대상 타입을 읽지 않으면 `cast('inquiries' AS regclass)` 한 줄로
+    화이트리스트 밖 테이블의 **이름과 존재 여부**가 결과 컬럼이 된다 — 존재하면 이름이
+    돌아오고 없으면 오류가 그 사실을 알려주므로, 양방향으로 카탈로그를 훑을 수 있다.
+    시스템 카탈로그는 PUBLIC 권한이라 read-only 계정이 그대로 읽는다(실측으로 확인했다 —
+    `tests/test_sql_cast_allowlist.py`). **막는 층이 이 검사 하나뿐이다.**
+
+    카탈로그 참조 타입(`oid`·`reg*`)은 sqlglot 이 `exp.ObjectIdentifier` 로 만들어 `this` 가
+    타입 열거형이 아니고, 확장 타입은 `USERDEFINED` 다 — 둘 다 허용 집합에 들 수 없으므로
+    새 타입 표기가 생겨도 자동으로 거부된다.
+    """
+    for cast in statement.find_all(exp.Cast):
+        target = cast.args.get("to")
+        if isinstance(target, exp.DataType) and target.this in _ALLOWED_CAST_TYPE_NODES:
+            continue
+        label = _sql_of(target) if isinstance(target, exp.Expr) else "(알 수 없음)"
+        raise _reject(
+            SqlGuardRule.UNSUPPORTED_CAST_TYPE,
+            f"허용되지 않은 형변환 대상 타입이다: {label}. {describe_allowed_cast_types()}",
         )
 
 
@@ -876,40 +1149,25 @@ def _check_unique_output_names(scope: _Scope) -> None:
 
 
 def _pii_safe_output_columns(scope: _Scope) -> tuple[str, ...]:
-    """`orders` 직접 컬럼에서 온 최상위 출력명만 PII allowlist 출처로 승인한다.
+    """유래가 `orders` 직접 컬럼으로 증명된 최상위 출력명만 PII allowlist 출처로 승인한다.
 
-    계산식·함수·CTE·파생 테이블은 결과가 DB 에서 돌아와도 LLM 이 쓴 리터럴을 합성할 수 있다.
-    그 값은 표시·L2 근거로는 남기되 PII allowlist 에는 쓰지 않는다. 직접 컬럼과 base-table
-    별표만 승인하므로 검증기가 모르는 새 표현식은 자동으로 불승인된다.
+    승인되지 않은 출력의 값은 근거 렌더가 개인정보 모양이면 버린다 — DB 에서 돌아온 값이라도
+    LLM 이 쓴 리터럴을 합성한 것일 수 있기 때문이다. 반대로 **승인된 값은 마스킹하지 않는다**:
+    가리면 정상 에코가 근거와 대조되지 않아 오기각된다.
+
+    유래 판정은 `_projection_provenance` 하나가 한다 — 임시 테이블·파생 테이블 경유와
+    빈칸 채우기 관용구까지 거기서 증명하고, 증명하지 못한 것은 전부 불승인이다(fail-closed).
     """
     safe: list[str] = []
     for projection in scope.select.expressions:
-        if isinstance(projection, exp.Star):
-            for source in scope.sources.values():
-                if source.base_table is not None:
-                    safe.extend(sorted(source.columns))
+        stars = _star_sources(projection, scope)
+        if stars is not None:
+            for source in stars:
+                safe.extend(sorted(source.pii_safe_columns))
             continue
 
         value = projection.this if isinstance(projection, exp.Alias) else projection
-        if isinstance(value, exp.Column) and isinstance(value.this, exp.Star):
-            qualified_source = scope.sources.get(value.table.lower())
-            if qualified_source is not None and qualified_source.base_table is not None:
-                safe.extend(sorted(qualified_source.columns))
-            continue
-        if not isinstance(value, exp.Column):
-            continue
-
-        if value.table:
-            qualified_source = scope.sources.get(value.table.lower())
-            from_base_table = (
-                qualified_source is not None and qualified_source.base_table is not None
-            )
-        else:
-            from_base_table = any(
-                source.base_table is not None and value.name.lower() in source.columns
-                for source in scope.sources.values()
-            )
-        if from_base_table and projection.output_name:
+        if _projection_provenance(value, scope) is _Provenance.DIRECT and projection.output_name:
             safe.append(_database_output_name(projection))
 
     return tuple(dict.fromkeys(safe))
@@ -1071,6 +1329,7 @@ def validate_sql(
     tables = analyzer.referenced_tables()
     analyzer.check_columns()
     _check_functions(statement)
+    _check_cast_types(statement)
     _check_projections(statement)
     _check_unique_output_names(root_scope)
     analyzer.check_order_scope(order_no)

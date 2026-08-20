@@ -26,9 +26,19 @@ LLM 이 만든 SQL 문자열은 **아무것도 신뢰하지 않는다.** 세 층
 
 ### 1층 — read-only 계정
 
-`reply_gate_ro` 계정은 `orders` 테이블에 **SELECT 권한만** 있다. 그 외 어떤 테이블에도
+`reply_gate_ro` 계정은 `orders` 테이블에 **SELECT 권한만** 있다. 그 밖의 **업무 테이블**에는
 권한이 없다 — 처리 기록(`inquiries`, `inquiry_attempts`, `inquiry_evidence`,
-`inquiry_sql_failures`)과 `policy_chunks` 는 이 계정에서 아예 보이지 않는다.
+`inquiry_sql_failures`)과 `policy_chunks` 는 이 계정에서 `permission denied` 다.
+
+**시스템 카탈로그는 예외이고, 이 층이 막지 못한다.** `pg_catalog` 은 PostgreSQL 이 PUBLIC 에
+SELECT 를 주므로 `reply_gate_ro` 로도 `SELECT count(*) FROM pg_class` 가 돈다(실측했다).
+카탈로그 참조 타입 변환(`cast('inquiries' AS regclass)`)도 같은 이유로 실행되어, 화이트리스트
+밖 테이블의 **이름과 존재 여부**를 돌려준다. 그래서 이 두 경로를 막는 것은 권한이 아니라
+2층·3층이다 — 카탈로그 테이블 참조는 스키마 화이트리스트가, 카탈로그 참조 타입 변환은
+**형변환 대상 타입 허용 목록이 단독으로** 막는다. 권한을 조정해 닫을 수 있는 경로가 아니라는
+것이 이 서술의 요점이다(`REVOKE ... FROM PUBLIC` 은 psql 메타명령과 드라이버 내부 조회까지
+함께 깬다). 검증은 `tests/test_db_readonly.py`(업무 테이블 거부)와
+`tests/test_sql_cast_allowlist.py`(카탈로그 참조 타입이 읽히는 것과 가드가 거부하는 것)에 있다.
 
 `INSERT`/`UPDATE`/`DELETE`/`TRUNCATE`/`CREATE`/`DROP`/`ALTER` 는 전부 `InsufficientPrivilege` 다.
 권한을 넓히려면 `db/schema.sql` 의 `GRANT SELECT ... TO reply_gate_readers` 를 고쳐야 하고,
@@ -69,11 +79,23 @@ LLM 이 만든 SQL 문자열은 **아무것도 신뢰하지 않는다.** 세 층
 - **함수 허용 목록** — 조회에 필요한 것만(집계·문자열·날짜 포맷·`CASE`·캐스트). `pg_sleep`,
   `random`, `pg_read_file`, `current_setting` 등은 거부한다. `orders` 를 끼워 넣으면 함수
   호출로 워커를 몇 분씩 묶을 수 있었던 경로다.
-- **PII allowlist 출력 provenance** — 최상위 직접 상수 projection 은 거부한다. 그 밖의 함수·
-  CASE·CAST·문자열 연산·CTE 계산은 정상 조회를 깨지 않도록 실행을 허용하되, 결과 출력명을
-  PII allowlist 출처로 승인하지 않는다. 오직 가드가 `orders` 직접 컬럼으로 증명한 출력명만
-  승인하므로 새 SQL 표현식을 해석하지 못해도 fail-closed 다. dict 결과에서 계산값이 직접
-  컬럼 provenance 를 덮지 못하도록 별표 확장 뒤 중복되는 출력명도 거부한다.
+- **형변환 대상 타입 허용 목록** — 캐스트가 허용 함수이므로 **대상 타입도 함께 판정한다.**
+  허용 범위는 SQL 생성 안내가 광고하는 용도(숫자·일자·문자열)에 맞추고, 목록 밖 타입은
+  거부다(fail-closed). 시스템 카탈로그 참조 타입(`regclass`·`regtype`·`regproc`·`oid`)이
+  화이트리스트 밖 테이블의 이름과 존재 여부를 결과 컬럼으로 실어 나르던 경로이고,
+  1층이 막지 못하므로(위 "시스템 카탈로그는 예외이고") **막는 층이 이것 하나뿐이다.**
+  목록의 정의는 가드가 단독 소유하고 SQL 생성 안내가 같은 문면을 싣는다 — 갈리면 생성기가
+  목록 밖 타입을 쓸 때마다 거부 → 재시도 1회 → 인계가 되고, 그 인계가 평가 수치에 남는다.
+- **PII allowlist 출력 provenance** — 최상위 직접 상수 projection 은 거부한다. 그 밖의 계산
+  표현식은 정상 조회를 깨지 않도록 실행을 허용하되, 결과 출력명을 PII allowlist 출처로
+  승인하지 않는다. 승인되는 것은 가드가 **유래를 `orders` 직접 컬럼까지 따라가 증명한**
+  출력명뿐이다 — 직접 컬럼, 임시 테이블(CTE)·파생 테이블을 거친 직접 컬럼, 그리고 고정값이
+  패턴형 PII 가 **아닐 때만** 빈칸 채우기 관용구(`coalesce`·`nullif`)다. 값을 이어 붙이는
+  계열은 조각을 합쳐 번호를 만들 수 있으므로 고정값이 들어갈 자리를 두지 않는다. 새 SQL
+  표현식을 해석하지 못하면 자동으로 불승인이므로 fail-closed 다. "패턴형 PII 인가"의 정의는
+  L1 게이트가 단독 소유하고 가드가 가져다 쓴다(`gate.pii_shaped`) — 층마다 자기 정규식을
+  두면 한쪽만 넓혀져 기준이 갈린다. dict 결과에서 계산값이 직접 컬럼 provenance 를 덮지
+  못하도록 별표 확장 뒤 중복되는 출력명도 거부한다.
 - **결과 행 수 상한** — LIMIT 이 없으면 붙이고, 상한을 넘으면 낮춘다. 정수 리터럴이 아닌
   LIMIT 만 거부한다. **실행되는 것은 모델의 원문이 아니라 검증된 AST 를 다시 렌더링한 문자열**이라,
   파서와 실행기가 다른 문장을 보는 부류의 우회가 구조적으로 닫힌다.
@@ -86,8 +108,10 @@ LLM 이 만든 SQL 문자열은 **아무것도 신뢰하지 않는다.** 세 층
 - **탐지 대상**: 초안의 답변 텍스트에 있는 패턴형 PII. 검사 대상에 `citation_ids` 는 넣지 않는다.
 - **허용 기준**: 이번 문의의 수집 근거 원문에 같은 값이 있으면 허용. SQL 근거의 실행 SQL은
   표시용 `content` 에만 둔다. 비PII 계산값은 L2용 `evidence_text` 에 유지하지만 계산된 PII는
-  제외하고, `orders` 직접 컬럼 출력만 PII 출처로 승인한다. 없으면 기각.
-- **마스킹하지 않는다**: 승인된 직접 컬럼(`evidence_text`)의 연락처·이메일은 **원문 그대로** 담는다.
+  제외하고, **유래가 `orders` 직접 컬럼으로 증명된 출력**만 PII 출처로 승인한다(위
+  "PII allowlist 출력 provenance", `docs/business-rules.md` "PII 출처는 유래로 승인한다").
+  없으면 기각.
+- **마스킹하지 않는다**: 승인된 출력(`evidence_text`)의 연락처·이메일은 **원문 그대로** 담는다.
   요약하거나 가리면 정상 에코가 근거와 대조되지 않아 오기각된다.
 - **커버리지 한계**: 이름·주소 등 비패턴형은 검사하지 않는다. 이 한계를 축소해 말하지 않는 것이
   이 프로젝트의 서술 원칙이다.
