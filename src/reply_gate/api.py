@@ -60,7 +60,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from psycopg.rows import DictRow
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator
 
 from reply_gate.config import Settings, get_settings
 from reply_gate.contracts import GateResult, JudgeResult
@@ -385,7 +385,9 @@ class InquiryService:
 type ServiceOpener = Callable[[], AbstractContextManager[InquiryService]]
 
 
-def _require_api_key(settings: Settings) -> str:
+def _require_api_key(settings: Settings) -> SecretStr:
+    """자격 증명은 **비밀 전용 타입 그대로** 넘긴다 — 평문으로 꺼내는 자리는
+    호출 래퍼의 SDK 인자 한 줄뿐이다(`docs/security.md` "비밀 관리")."""
     if not settings.openai_api_key:
         raise MissingCredentialsError(
             "OPENAI_API_KEY 가 설정되지 않았다. `.env` 또는 환경 변수에 키를 넣고 다시 실행한다."

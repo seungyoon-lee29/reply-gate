@@ -15,6 +15,12 @@ docs/standards.md "재시도 상한"의
 샘플링 파라미터(temperature 등)는 보내지 않는다 — 결정론을 샘플링 파라미터로 보장하지
 않으며, 모델 계열에 따라 아예 받지 않는 경우도 있다
 (docs/standards.md "샘플링 파라미터를 보내지 않는다").
+
+**API 키는 비밀 전용 타입(`SecretStr`)으로 받는다.** 평문이 되는 자리는 각 래퍼 생성자의
+SDK 호출 인자 **한 줄뿐**이고(`api_key.get_secret_value()`), 그 세 줄이 이 패키지에서
+API 키가 평문이 되는 자리의 전부다. 꺼내는 자리를 눈으로 셀 수 있게 두는 것이 요점이라,
+편의로 `str` 도 받게 넓히지 않는다 — 넓히는 순간 어디서 이미 꺼내졌는지 알 수 없어진다
+(docs/security.md "비밀 관리").
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ import anthropic
 import openai
 from anthropic.types import Message
 from openai.types.responses import Response
+from pydantic import SecretStr
 
 __all__ = [
     "AnthropicGenerationClient",
@@ -358,7 +365,7 @@ class OpenAIGenerationClient:
     def __init__(
         self,
         *,
-        api_key: str,
+        api_key: SecretStr,
         model: str,
         timeout: float = 120.0,
         client: openai.OpenAI | None = None,
@@ -366,7 +373,8 @@ class OpenAIGenerationClient:
         # 재시도·타임아웃은 이 래퍼가 단독 통제한다 (모듈 docstring 참조). 값을 `or`
         # 우변에만 두면 주입 시 우회되므로 **관문을 지나게** 한다.
         self._client = _pin_transport_policy(
-            client or openai.OpenAI(api_key=api_key, max_retries=0, timeout=timeout),
+            client
+            or openai.OpenAI(api_key=api_key.get_secret_value(), max_retries=0, timeout=timeout),
             timeout=timeout,
         )
         self._model = model
@@ -472,7 +480,7 @@ class AnthropicGenerationClient:
     def __init__(
         self,
         *,
-        api_key: str,
+        api_key: SecretStr,
         model: str,
         timeout: float = 120.0,
         client: anthropic.Anthropic | None = None,
@@ -481,7 +489,10 @@ class AnthropicGenerationClient:
         # 재시도·타임아웃은 이 래퍼가 단독 통제한다 (모듈 docstring 참조). 값을 `or`
         # 우변에만 두면 주입 시 우회되므로 **관문을 지나게** 한다.
         self._client = _pin_transport_policy(
-            client or anthropic.Anthropic(api_key=api_key, max_retries=0, timeout=timeout),
+            client
+            or anthropic.Anthropic(
+                api_key=api_key.get_secret_value(), max_retries=0, timeout=timeout
+            ),
             timeout=timeout,
         )
         self._model = model
@@ -602,14 +613,15 @@ class OpenAIEmbeddingClient:
     def __init__(
         self,
         *,
-        api_key: str,
+        api_key: SecretStr,
         model: str,
         dimensions: int,
         timeout: float = 60.0,
         client: openai.OpenAI | None = None,
     ) -> None:
         self._client = _pin_transport_policy(
-            client or openai.OpenAI(api_key=api_key, max_retries=0, timeout=timeout),
+            client
+            or openai.OpenAI(api_key=api_key.get_secret_value(), max_retries=0, timeout=timeout),
             timeout=timeout,
         )
         self._model = model

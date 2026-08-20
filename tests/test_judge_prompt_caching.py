@@ -22,6 +22,7 @@ from typing import Any, Final, cast
 
 import anthropic
 import pytest
+from pydantic import SecretStr
 from scripts import evaluate
 
 import reply_gate.pipeline as pipeline_module
@@ -132,7 +133,7 @@ def _anthropic_client(
     messages = _RecordingCalls(outcomes)
     fake_sdk = cast(anthropic.Anthropic, SimpleNamespace(messages=messages))
     client = AnthropicGenerationClient(
-        api_key="test",
+        api_key=SecretStr("test"),
         model="claude-sonnet-5",
         client=fake_sdk,
         prompt_caching=prompt_caching,
@@ -242,7 +243,9 @@ def test_OpenAI_래퍼의_캐시_계열은_해당_없음이다() -> None:
     """양성 대조가 아니라 경계 확인 — 생성 계열은 이 축을 재지 않는다."""
     calls = _RecordingCalls([_openai_response(json.dumps({"verdict": "pass"}))])
     fake_sdk = cast(Any, SimpleNamespace(responses=calls))
-    client = OpenAIGenerationClient(api_key="test", model="gpt-5.6-terra", client=fake_sdk)
+    client = OpenAIGenerationClient(
+        api_key=SecretStr("test"), model="gpt-5.6-terra", client=fake_sdk
+    )
 
     result = client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
 
@@ -444,7 +447,7 @@ def test_판정_클라이언트가_설정_스위치를_그대로_받는다(enabl
     judge = build_judge(
         Settings(
             l2_enabled=True,
-            anthropic_api_key="키가-아닌-테스트값",
+            anthropic_api_key=SecretStr("키가-아닌-테스트값"),
             judge_prompt_caching_enabled=enabled,
         )
     )

@@ -25,6 +25,7 @@ from typing import Any, cast
 import psycopg
 import pytest
 from psycopg.rows import DictRow
+from pydantic import SecretStr
 
 from reply_gate.config import Settings
 from reply_gate.contracts import (
@@ -982,7 +983,7 @@ def test_판정_기본_배선은_Anthropic_계열이다() -> None:
     """같은 계열로 바꾸면 self-judging bias 로 검출률이 오염된다 (결정 0004)."""
     settings = Settings(
         l2_enabled=True,
-        anthropic_api_key="키가-아닌-테스트값",
+        anthropic_api_key=SecretStr("키가-아닌-테스트값"),
         judge_effort="low",
         judge_max_output_tokens=4321,
     )
@@ -1000,7 +1001,7 @@ def test_판정_기본_배선은_Anthropic_계열이다() -> None:
 
 def test_판정_클라이언트는_첫_호출_때_만들어진다() -> None:
     """조립은 키를 요구하지 않는다 — 조회 전용 경로가 키 없이도 살아 있어야 한다."""
-    judge = _built_judge(Settings(l2_enabled=True, anthropic_api_key=""))
+    judge = _built_judge(Settings(l2_enabled=True, anthropic_api_key=SecretStr("")))
     client = cast(LazyJudgeClient, judge._client)
 
     # `anthropic.Anthropic(api_key="")` 는 생성자에서 예외를 던지지 않는다 — 키 검사는
@@ -1014,7 +1015,7 @@ def test_build_pipeline_은_스위치가_켜져_있어도_조립에_성공한다
     pipeline = build_pipeline(
         generation_client=cast(GenerationClient, scripted_client({})),
         embedding_client=cast(EmbeddingClient, LexicalEmbeddingClient(dimensions=1536)),
-        settings=Settings(l2_enabled=True, anthropic_api_key=""),
+        settings=Settings(l2_enabled=True, anthropic_api_key=SecretStr("")),
     )
 
     assert pipeline._judge is not None

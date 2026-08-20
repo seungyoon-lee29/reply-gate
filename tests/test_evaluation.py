@@ -26,6 +26,7 @@ from typing import Any, cast
 import psycopg
 import pytest
 from psycopg.rows import DictRow
+from pydantic import SecretStr
 from scripts import evaluate
 
 from reply_gate.config import Settings, get_settings
@@ -1621,8 +1622,8 @@ def _l2_settings(
     key = "키가-아닌-테스트값"
     return Settings(
         l2_enabled=l2_enabled,
-        openai_api_key=key if live_keys else "",
-        anthropic_api_key=key if judge_key else "",
+        openai_api_key=SecretStr(key if live_keys else ""),
+        anthropic_api_key=SecretStr(key if judge_key else ""),
     )
 
 

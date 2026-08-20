@@ -4,7 +4,11 @@ docs/security.md "text-to-SQL 안전장치" 1번(read-only DB 계정)의 코드 
 실행 경로는 반드시 `readonly_connect()` 를 쓴다 — 권한 자체가 SELECT 뿐이라 실수로
 쓰기 경로를 타도 DB 가 거부한다.
 
-DSN 은 `reply_gate.config.Settings` 가 만든다. 이 모듈은 비밀을 직접 다루지 않는다.
+DSN 은 `reply_gate.config.Settings` 가 만든다. **이 모듈은 자격 증명을 꺼내지 않는다** —
+비밀번호 필드는 비밀 전용 타입이고, 평문으로 꺼내는 자리는 접속 문자열을 조립하는
+`Settings.database_url`/`readonly_database_url` 두 줄뿐이다. 여기서는 이미 조립된 문자열을
+받아 psycopg 에 넘긴다. 오류 메시지·로그에 쓰는 접속 대상 설명은 비밀번호를 아예 담지
+않는다(`describe_target`).
 """
 
 from __future__ import annotations

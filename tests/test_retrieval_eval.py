@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from pydantic import SecretStr
 
 from reply_gate.evaluation import load_golden_set
 from reply_gate.llm import (
@@ -896,8 +897,8 @@ def test_embedding_model_axis_has_four_documented_candidates() -> None:
 def test_missing_BGE_dependency_marks_only_that_axis_row_unmeasured(tmp_path: Path) -> None:
     evaluated: list[str] = []
 
-    def factory(candidate: EmbeddingCandidate, api_key: str) -> EmbeddingClient:
-        assert api_key == "test-key"
+    def factory(candidate: EmbeddingCandidate, api_key: SecretStr) -> EmbeddingClient:
+        assert api_key.get_secret_value() == "test-key"
         if candidate.provider is EmbeddingProvider.LOCAL:
             raise OptionalEmbeddingDependencyError("미측정 — 로컬 의존성 미설치")
         return _CandidateEmbedder(candidate.dimensions)
@@ -910,7 +911,9 @@ def test_missing_BGE_dependency_marks_only_that_axis_row_unmeasured(tmp_path: Pa
             json=tmp_path / f"{candidate.key}.json",
         )
 
-    result = run_embedding_model_axis(api_key="test-key", evaluate=evaluate, client_factory=factory)
+    result = run_embedding_model_axis(
+        api_key=SecretStr("test-key"), evaluate=evaluate, client_factory=factory
+    )
 
     assert evaluated == ["3-small-1536", "3-large-1536", "3-large-3072"]
     assert [row.measured for row in result.rows] == [True, True, True, False]

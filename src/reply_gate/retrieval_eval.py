@@ -15,6 +15,8 @@ from pathlib import Path
 from statistics import fmean
 from typing import Any, Final, cast
 
+from pydantic import SecretStr
+
 from reply_gate.adoption_axis import ABSTENTION_CASE_IDS, CONFLICT_PAIR_CASE_IDS
 from reply_gate.config import get_settings
 from reply_gate.evaluation import DEFAULT_GOLDEN_SET_PATH, GoldenCase, load_golden_set
@@ -2656,7 +2658,7 @@ def _cutoff_sweep(*, start: float, end: float, step: float) -> tuple[float, ...]
 
 
 def _build_embedding_candidate_client(
-    candidate: EmbeddingCandidate, *, api_key: str
+    candidate: EmbeddingCandidate, *, api_key: SecretStr
 ) -> EmbeddingClient:
     if candidate.provider is EmbeddingProvider.OPENAI:
         if not api_key:
@@ -2671,10 +2673,10 @@ def _build_embedding_candidate_client(
 
 def run_embedding_model_axis(
     *,
-    api_key: str,
+    api_key: SecretStr,
     evaluate: Callable[[EmbeddingCandidate, EmbeddingClient], ReportPaths],
     candidates: Sequence[EmbeddingCandidate] = DEFAULT_EMBEDDING_CANDIDATES,
-    client_factory: Callable[[EmbeddingCandidate, str], EmbeddingClient] | None = None,
+    client_factory: Callable[[EmbeddingCandidate, SecretStr], EmbeddingClient] | None = None,
 ) -> EmbeddingAxisResult:
     """후속 격자 실행이 쓰는 모델 축.
 
