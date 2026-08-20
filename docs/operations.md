@@ -82,6 +82,10 @@ uv run python -m scripts.seed_orders
 > 스키마를 고친 뒤에는 볼륨째 재생성해야 한다:
 > `docker compose down -v && docker compose up -d --wait` → 이 단계를 다시 실행.
 > DDL 이 전부 `CREATE TABLE IF NOT EXISTS` 라 기존 테이블의 컬럼은 바뀌지 않는다.
+> **단 컬럼 추가는 예외다** — `db/schema.sql` 은 `ALTER TABLE … ADD COLUMN IF NOT EXISTS` 로
+> 살아 있는 볼륨에 컬럼을 붙인다(검색 계열 3개가 이 방식으로 들어갔다). 컬럼 **변경·삭제**만
+> 볼륨 재생성이 필요하다 — 볼륨을 지우면 보존 기록과 **유료 정책 재색인**이 함께 딸려온다
+> (`docs/engineering-notes.md` "스키마를 바꿨으면 볼륨째 지워야 한다 — 컬럼 추가만 예외다").
 >
 > **L2 도입으로 스키마가 바뀌었다** — `inquiry_attempts` 에 층별 판정 컬럼
 > (`l1_verdict`·`l1_reject_reasons`·`l2_verdict`·`l2_reject_reasons`·`claim_verdicts`·
