@@ -361,6 +361,13 @@ def search_policy_chunks(
     컷 위 후보가 둘뿐인 케이스(G04)가 기권해 케이스 하한을 깬다. 이 절단 순서는 조정
     가능한 인자가 아니라 **행동 계약**이다.
 
+    **정렬은 유사도 → 근거 ID 전순서다.** 코사인만으로 정렬하면 **동점의 순서가 DB 몫**이고,
+    동점이 `LIMIT top_k` 절단선에 걸리면 어느 행이 살아남는지가 흔들린다 — 그러면 채택 집합과
+    기권 게이트 통계량이 함께 흔들린다. 26조항 정확 스캔이라 실무상 안정적이었지만 그것은
+    관측이지 보장이 아니었다. 근거 ID 는 유일 제약이 걸려 있어 전순서를 만든다. 파이썬 쪽
+    합집합 병합도 같은 키(유사도 → 근거 ID)로 정렬한다 — 두 자리가 갈리면 재작성 켜짐/꺼짐이
+    다른 순서를 낸다.
+
     **질의 임베딩의 출처를 함께 받는다.** 저장된 벡터와 다른 공간이면 유사도를 계산하지
     않고 거부한다(fail-closed) — 이 확인을 호출자에게 맡기면 새 호출자가 생길 때마다 다시
     빠뜨릴 수 있고, 빠뜨린 결과는 오류가 아니라 정상 판정처럼 보인다.
@@ -379,7 +386,7 @@ def search_policy_chunks(
                    content, 1 - (embedding <=> %s) AS similarity
             FROM policy_chunks
             WHERE embedding IS NOT NULL
-            ORDER BY embedding <=> %s
+            ORDER BY embedding <=> %s, evidence_id
             LIMIT %s
             """,
             (vector, vector, top_k),

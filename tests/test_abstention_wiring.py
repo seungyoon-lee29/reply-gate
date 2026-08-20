@@ -106,10 +106,10 @@ def _adopt(
     cut: float = _CUT,
     top_k: int = _TOP_K,
 ) -> tuple[str, ...]:
-    accepted = adopt_policy_hits(
+    adoption = adopt_policy_hits(
         candidates=_ranked(scores), top_k=top_k, similarity_threshold=cut, gate=gate
     )
-    return tuple(hit.evidence_id for hit in accepted)
+    return tuple(hit.evidence_id for hit in adoption.hits)
 
 
 def _gate(*, tau: float = _TAU) -> AbstentionGate:
@@ -248,10 +248,13 @@ def test_측정된_후보가_두_건_미만이면_게이트는_열린_채_남는
 
 
 def test_후보가_아예_없으면_채택도_없고_게이트가_사유_없이_발동하지_않는다() -> None:
-    assert (
-        adopt_policy_hits(candidates=(), top_k=_TOP_K, similarity_threshold=_CUT, gate=_gate())
-        == ()
+    adoption = adopt_policy_hits(
+        candidates=(), top_k=_TOP_K, similarity_threshold=_CUT, gate=_gate()
     )
+
+    assert adoption.hits == ()
+    # 게이트가 아예 돌지 않았다 — 판정이 없는 것과 "판정했고 정의됐다"는 다른 상태다.
+    assert adoption.verdict is None
 
 
 def test_미정의_판정은_기권이_아니라_사유를_남긴다() -> None:
@@ -316,13 +319,13 @@ def _offline_grid() -> AbstentionGrid:
 def _runtime_accepted(hits: Sequence[PolicySearchHit]) -> tuple[str, ...]:
     """런타임 정책 경로 그대로 — 합집합 → 상위 `top_k` → 게이트 → 컷."""
     candidates = merge_policy_rankings(original=hits, rewritten=(), top_k=_TOP_K)
-    accepted = adopt_policy_hits(
+    adoption = adopt_policy_hits(
         candidates=candidates,
         top_k=_TOP_K,
         similarity_threshold=_CUT,
         gate=declared_settings().abstention_gate(),
     )
-    return tuple(hit.evidence_id for hit in accepted)
+    return tuple(hit.evidence_id for hit in adoption.hits)
 
 
 def test_런타임_채택_집합이_오프라인_격자와_케이스마다_같다() -> None:
@@ -438,7 +441,7 @@ def test_게이트를_끄면_컷을_먼저_걸던_예전_순서와_채택_집합
         top_k=_TOP_K,
         similarity_threshold=_CUT,
         gate=None,
-    )
+    ).hits
 
     assert [hit.evidence_id for hit in new_order] == [hit.evidence_id for hit in old_order]
     assert new_order  # 양성 대조

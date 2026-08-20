@@ -65,6 +65,8 @@ from reply_gate.policy_index import PolicySearchHit, search_policy_chunks
 from reply_gate.query_rewrite import rewrite_query
 from reply_gate.retrieval_strategies import (
     AbstentionGate,
+    AbstentionUndefined,
+    AbstentionVerdict,
     VectorHit,
     apply_abstention_gate,
     merge_rewritten_rankings,
@@ -93,6 +95,7 @@ __all__ = [
     "EvidenceCollection",
     "EvidenceCollector",
     "IntentResult",
+    "PolicyAdoption",
     "RetrievalWiringError",
     "SqlEvidenceSnapshot",
     "SqlFailure",
@@ -581,13 +584,39 @@ def merge_policy_rankings(
     return tuple(best[hit.evidence_id] for hit in merged[:top_k])
 
 
+@dataclass(frozen=True)
+class PolicyAdoption:
+    """근거 채택 1회의 결과 묶음 — 채택된 후보와 **기권 게이트가 남긴 판정**.
+
+    묶음인 이유가 있다. 판정은 값 대신 **사유**를 들고 올 수 있는데(통계량 미정의), 채택
+    결과를 후보 튜플 하나로 돌려주면 그 사유가 여기서 사라진다. 실제로 그랬다 — 원시연산이
+    사유를 담아 돌려주는데 채택 함수가 "기권했나" 한 칸만 읽고 나머지를 버려, 사유가 근거
+    묶음에도 처리 결과에도 평가 리포트에도 남지 않았다.
+    """
+
+    hits: tuple[PolicySearchHit, ...]
+    #: 기권 게이트 판정. 게이트가 꺼져 있거나 후보가 비어 **게이트가 돌지 않았으면** `None`
+    #: 이다 — "돌았고 통계량이 정의됐다"(`undefined_reason is None`)와는 다른 상태다.
+    verdict: AbstentionVerdict | None
+
+    @property
+    def abstained(self) -> bool:
+        """게이트가 발동해 채택 집합이 통째로 비었는가."""
+        return self.verdict is not None and self.verdict.abstains
+
+    @property
+    def undefined_reason(self) -> AbstentionUndefined | None:
+        """통계량이 미정의였던 사유. 게이트가 돌지 않았거나 정의됐으면 `None`."""
+        return None if self.verdict is None else self.verdict.undefined_reason
+
+
 def adopt_policy_hits(
     *,
     candidates: Sequence[PolicySearchHit],
     top_k: int,
     similarity_threshold: float,
     gate: AbstentionGate | None,
-) -> tuple[PolicySearchHit, ...]:
+) -> PolicyAdoption:
     """상위 `top_k` 후보에서 실제로 근거가 될 것을 고른다 — **질의 축 → 항목 축** 순서다.
 
     1. **질의 축(기권 게이트)**: 상위 `top_k` 점수 분포의 산포가 τ 미만이면 그 질의의 채택
@@ -600,18 +629,28 @@ def adopt_policy_hits(
     오프라인 격자와 같고, 그래서 두 경로가 같은 수를 낸다. 컷 뒤 슬라이스로 재면 컷 위
     후보가 둘뿐인 케이스(G04)의 산포가 τ 아래로 떨어져 정답 조항을 잃는다.
 
-    **통계량이 미정의면(측정된 후보 2건 미만) 게이트는 열린 채로 남는다.** 미정의를 0 으로
-    채우면 모든 양수 τ 에서 기권이 되어, 후보가 하나뿐인 질의가 근거 없이 인계된다.
-    원시연산(`retrieval_strategies.apply_abstention_gate`)이 값 대신 사유를 들고 오는 것이
-    그 계약이고 여기서 뒤집지 않는다.
+    **통계량이 미정의면 사유가 처분을 정한다 — 두 사유를 하나로 접지 않는다.**
+    ① **측정된 후보가 2건 미만**이면 게이트는 **열린 채로 남는다.** 미정의를 0 으로 채우거나
+    fail-closed 로 접으면 모든 양수 τ 에서 기권이 되어, 후보가 하나뿐인 질의가 근거 없이
+    인계된다 — 여기서 뒤집지 않는다. 그 자리는 항목 축(절대 하한)이 맡는다.
+    ② **1위 코사인이 0 이하**면 **기권한다.** 모든 후보가 절대 하한 아래라 채택 집합은
+    어차피 비므로 결과는 달라지지 않지만, 통계량을 신뢰할 수 없었다는 사실이 판정에 남는다.
+
+    **사유는 결과 묶음(`PolicyAdoption`)이 들고 나온다.** 여기서 `abstains` 한 칸만 읽고
+    버리면 사유가 근거 묶음에도 평가 리포트에도 실리지 않는다 — 실제로 그랬다.
     """
     if not candidates:
-        return ()
+        return PolicyAdoption(hits=(), verdict=None)
+    verdict: AbstentionVerdict | None = None
     if gate is not None:
         scores = truncate_for_gate([hit.similarity for hit in candidates], top_k=top_k)
-        if apply_abstention_gate(gate, scores).abstains:
-            return ()
-    return tuple(hit for hit in candidates if hit.similarity >= similarity_threshold)
+        verdict = apply_abstention_gate(gate, scores)
+        if verdict.abstains:
+            return PolicyAdoption(hits=(), verdict=verdict)
+    return PolicyAdoption(
+        hits=tuple(hit for hit in candidates if hit.similarity >= similarity_threshold),
+        verdict=verdict,
+    )
 
 
 def _policy_evidence(hit: PolicySearchHit) -> Evidence:
@@ -686,6 +725,12 @@ class EvidenceCollection:
     #: 검색 단계가 폴백한 사유. `None` 은 "폴백하지 않았다"이고, 재작성을 **시도하지 않은**
     #: 경우(스위치 꺼짐·`order` 단독 의도)도 `None` 이다 — 폴백은 시도한 것의 결과다.
     retrieval_fallback_reason: str | None = None
+    #: 기권 게이트의 **통계량이 미정의였던 사유**. 사유마다 처분이 다르므로(2건 미만은 열어
+    #: 두고, 1위 코사인 0 이하는 기권) 처분만으로는 어느 쪽이었는지 알 수 없다.
+    #: `None` 은 "사유가 없었다"이고 세 경우를 함께 덮는다 — 게이트 꺼짐 · 정책 검색이 아예
+    #: 돌지 않음 · 통계량이 정의됨. 평가 리포트는 이 값을 그대로 실어 "어느 분기를 몇 건이
+    #: 탔나"를 센다.
+    abstention_undefined_reason: AbstentionUndefined | None = None
 
     @property
     def escalated(self) -> bool:
@@ -706,6 +751,8 @@ class _Ledger:
     retrieval_input_tokens: int = 0
     retrieval_output_tokens: int = 0
     retrieval_fallback_reason: str | None = None
+    #: 기권 게이트의 통계량이 미정의였던 사유 — 처분(발동/열림)과 별개로 그대로 실어 나른다.
+    abstention_undefined_reason: AbstentionUndefined | None = None
     #: SQL 생성 루프에서 실제로 나간 전송 수. 전송 오류가 루프 중간에 터지면
     #: `LLMCallError.attempts` 가 이 값을 이어받아야 기록과 실제가 같아진다.
     sql_transport_attempts: int = 0
@@ -861,13 +908,16 @@ class EvidenceCollector:
             rewritten=rankings[1] if len(rankings) > 1 else (),
             top_k=self._settings.vector_top_k,
         )
-        hits = adopt_policy_hits(
+        adoption = adopt_policy_hits(
             candidates=candidates,
             top_k=self._settings.vector_top_k,
             similarity_threshold=self._settings.vector_similarity_threshold,
             gate=self._abstention_gate,
         )
-        ledger.evidence.extend(_policy_evidence(hit) for hit in hits)
+        # 사유를 여기서 버리면 근거 묶음에도 평가 리포트에도 남지 않는다 — 조용한 폴백을
+        # 금지하는 것과 같은 규칙이다(사유는 처분과 별개로 밖으로 나간다).
+        ledger.abstention_undefined_reason = adoption.undefined_reason
+        ledger.evidence.extend(_policy_evidence(hit) for hit in adoption.hits)
 
     def _rewrite(self, *, ledger: _Ledger, content: str) -> str | None:
         """검색용 질의를 얻는다. 스위치가 꺼져 있거나 폴백이면 `None`.
@@ -1079,6 +1129,7 @@ class EvidenceCollector:
             retrieval_input_tokens=ledger.retrieval_input_tokens,
             retrieval_output_tokens=ledger.retrieval_output_tokens,
             retrieval_fallback_reason=ledger.retrieval_fallback_reason,
+            abstention_undefined_reason=ledger.abstention_undefined_reason,
         )
 
 

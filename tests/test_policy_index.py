@@ -222,7 +222,7 @@ def test_검색은_컷_전_상위_top_k_후보를_그대로_돌려준다(
         hit.similarity >= 0.30
         for hit in adopt_policy_hits(
             candidates=hits, top_k=10, similarity_threshold=0.30, gate=None
-        )
+        ).hits
     )
 
 

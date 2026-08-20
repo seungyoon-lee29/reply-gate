@@ -23,6 +23,7 @@ from reply_gate.llm import GenerationClient
 __all__ = [
     "AbstentionGate",
     "AbstentionStatistic",
+    "AbstentionUndefined",
     "AbstentionVerdict",
     "Bm25Hit",
     "FusedHit",
@@ -39,6 +40,7 @@ __all__ = [
     "merge_rewritten_rankings",
     "reciprocal_rank_fusion",
     "truncate_for_gate",
+    "undefined_statistic_reason",
 ]
 
 _BM25_K1 = 1.2
@@ -124,19 +126,52 @@ class AbstentionGate:
             raise ValueError("기권 게이트 τ 는 유한한 실수여야 한다")
 
 
+class AbstentionUndefined(StrEnum):
+    """통계량이 정의되지 않는 사유 2종. **하나로 접지 않는다 — 처분이 반대다.**
+
+    한쪽으로 접으면 어느 쪽이든 잃는다. 전부 "발동"으로 접으면 후보가 하나뿐인 질의가
+    근거 없이 인계되고(미정의를 0 으로 채우는 것과 같은 결과다), 전부 "발동하지 않음"으로
+    접으면 모든 후보가 절대 하한 아래인 질의에서 통계량을 신뢰할 수 없었다는 사실이 판정
+    어디에도 남지 않는다. **fail-closed 를 기계적으로 적용하면 이 층에서는 정상 케이스가
+    죽는다** — 그래서 사유마다 처분을 따로 정한다.
+    """
+
+    #: 측정된 상위 점수가 2건 미만이라 산포를 잴 짝이 없다. **기권하지 않는다.**
+    INSUFFICIENT_SCORES = "measured_scores_below_two"
+    #: 1위 코사인이 0 이하라 비 기반 통계량의 분모가 없다. **기권한다.**
+    NONPOSITIVE_RANK1 = "rank1_cosine_not_positive"
+
+    @property
+    def abstains(self) -> bool:
+        """이 사유에서 게이트가 발동하는가.
+
+        1위 코사인이 0 이하면 모든 후보가 절대 하한 아래라 채택 집합은 어차피 빈다 —
+        발동시켜도 결과가 달라지지 않고, 통계량을 신뢰할 수 없었다는 사실이 판정에 드러난다.
+        측정 점수가 2건 미만인 쪽은 반대다: 발동시키면 후보가 하나뿐인 정상 질의가 근거
+        없이 인계된다. 그래서 그쪽은 항목 축(절대 하한)에 맡긴다.
+        """
+        return self is AbstentionUndefined.NONPOSITIVE_RANK1
+
+    @property
+    def message(self) -> str:
+        """`abstention_statistic` 이 예외에 싣는 사람이 읽는 문면."""
+        if self is AbstentionUndefined.INSUFFICIENT_SCORES:
+            return "통계량은 측정된 상위 2건 이상이 있어야 정의된다"
+        return "1위 코사인이 0 이하면 비 기반 통계량이 정의되지 않는다"
+
+
 @dataclass(frozen=True)
 class AbstentionVerdict:
     """게이트 판정 1건. 통계량이 정의되지 않으면 값 대신 **사유**를 들고 온다.
 
     미정의를 0 으로 채우면 모든 양수 τ 에서 기권이 되어 리포트가 거짓말을 한다. 그래서
-    미정의는 "발동하지 않음 + 사유"이고, 그 자리에 절대 하한만 남는다(폴백이지 인계가
-    아니다).
+    미정의는 값이 아니라 사유이고, **사유마다 처분이 다르다**(`AbstentionUndefined`).
     """
 
     statistic: AbstentionStatistic
     tau: float
     value: float | None
-    undefined_reason: str | None
+    undefined_reason: AbstentionUndefined | None
     abstains: bool
 
     @property
@@ -160,15 +195,28 @@ def truncate_for_gate(similarities: Sequence[float | None], *, top_k: int) -> tu
     return tuple(score for score in similarities[:top_k] if score is not None)
 
 
+def undefined_statistic_reason(scores: Sequence[float]) -> AbstentionUndefined | None:
+    """점수열이 통계량을 정의하지 못하는 **사유**. 정의되면 `None`.
+
+    입력은 점수뿐이다 — 정답도 케이스 정체성도 받지 않는다. 사유를 여기 한 곳에서
+    가르므로 계산(`abstention_statistic`)과 판정(`apply_abstention_gate`)이 같은 경계를 쓴다.
+    """
+    if len(scores) < 2:
+        return AbstentionUndefined.INSUFFICIENT_SCORES
+    if scores[0] <= 0.0:
+        return AbstentionUndefined.NONPOSITIVE_RANK1
+    return None
+
+
 def abstention_statistic(statistic: AbstentionStatistic, scores: Sequence[float]) -> float:
     """`top_k` 로 자른 점수열에서 통계량 하나를 계산한다.
 
-    입력은 점수뿐이다 — 정답도 케이스 정체성도 받지 않는다.
+    입력은 점수뿐이다 — 정답도 케이스 정체성도 받지 않는다. 정의되지 않는 입력은 값을
+    지어내지 않고 사유를 담아 죽는다 — 처분을 정하는 것은 계산이 아니라 판정의 몫이다.
     """
-    if len(scores) < 2:
-        raise ValueError("통계량은 측정된 상위 2건 이상이 있어야 정의된다")
-    if scores[0] <= 0.0:
-        raise ValueError("1위 코사인이 0 이하면 비 기반 통계량이 정의되지 않는다")
+    undefined = undefined_statistic_reason(scores)
+    if undefined is not None:
+        raise ValueError(undefined.message)
     first, last = scores[0], scores[-1]
     match statistic:
         case AbstentionStatistic.SPREAD:
@@ -188,17 +236,22 @@ def apply_abstention_gate(gate: AbstentionGate, scores: Sequence[float]) -> Abst
 
     점수는 건드리지 않는다. 게이트가 발동하면 **그 질의의 채택 집합 전체**가 비고, 항목별
     채택은 여전히 절대 하한이 자른다(결정 0009 의 절대 축 원칙 그대로).
+
+    **통계량이 정의되지 않으면 사유가 처분을 정한다**(`AbstentionUndefined`) — 두 사유를
+    하나로 접지 않는다. 접으면 어느 쪽으로 접든 하나는 틀린다: 전부 발동시키면 후보가
+    하나뿐인 정상 질의가 근거 없이 인계되고, 전부 열어 두면 1위 코사인이 0 이하인 질의에서
+    게이트가 무력했다는 사실이 판정에 남지 않는다.
     """
-    try:
-        value = abstention_statistic(gate.statistic, scores)
-    except ValueError as exc:
+    undefined = undefined_statistic_reason(scores)
+    if undefined is not None:
         return AbstentionVerdict(
             statistic=gate.statistic,
             tau=gate.tau,
             value=None,
-            undefined_reason=str(exc),
-            abstains=False,
+            undefined_reason=undefined,
+            abstains=undefined.abstains,
         )
+    value = abstention_statistic(gate.statistic, scores)
     return AbstentionVerdict(
         statistic=gate.statistic,
         tau=gate.tau,
