@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import ast
 import inspect
+import textwrap
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 
@@ -50,6 +52,36 @@ _검증되지_않은_조건 = (
 )
 
 
+# ── 배선을 읽는 헬퍼 — 문자열 스캔이 아니라 AST 다 ──────────────────────────
+#
+# 소스를 문자열로 훑어 가드를 켜고 끄면, 주석·docstring 에 이름이 스치기만 해도 가드가
+# 스스로 꺼진다(`tests/AGENTS.md` 불변식 7). AST 로 보면 주석은 애초에 없고 docstring 은
+# 호출이 아니다 — 실제로 **부르는** 것만 남는다.
+
+
+def _호출_이름들(tree: ast.AST) -> set[str]:
+    """AST 서브트리 안에서 실제로 호출되는 이름 전부(`f()` 의 `f`, `x.f()` 의 `f`)."""
+    이름: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                이름.add(func.attr)
+            elif isinstance(func, ast.Name):
+                이름.add(func.id)
+    return 이름
+
+
+def _모듈_호출_이름들(모듈: ModuleType) -> set[str]:
+    경로 = Path(inspect.getsourcefile(모듈) or "")
+    return _호출_이름들(ast.parse(경로.read_text(encoding="utf-8")))
+
+
+def _함수_호출_이름들(함수: Callable[..., object]) -> set[str]:
+    """메서드 소스는 클래스 안이라 들여쓰기가 남아 있다 — 떼어내야 파싱된다."""
+    return _호출_이름들(ast.parse(textwrap.dedent(inspect.getsource(함수))))
+
+
 # ── 양성: 현재 기본값 조립은 통과한다 ────────────────────────────────────────
 
 
@@ -70,8 +102,11 @@ def test_검증된_조건을_명시해도_통과한다() -> None:
     settings = declared_settings(
         embedding_model="text-embedding-3-small", embedding_dimensions=1536
     )
+    # **설정 객체를 단언식 밖에 둔다** — 실패 출력이 객체를 통째로 repr 한다
+    # (`tests/AGENTS.md` 불변식 9).
+    gate = settings.abstention_gate()
 
-    assert settings.abstention_gate() is not None
+    assert gate is not None
 
 
 def test_검증_목록이_현행_기본값을_담고_있다() -> None:
@@ -114,8 +149,8 @@ def test_수집기_조립이_그_자리에서_죽는다() -> None:
     with pytest.raises(AbstentionGateWiringError):
         settings.abstention_gate()
 
-    소스 = inspect.getsource(evidence.EvidenceCollector.__init__)
-    assert "abstention_gate()" in 소스, (
+    부르는_것 = _함수_호출_이름들(evidence.EvidenceCollector.__init__)
+    assert "abstention_gate" in 부르는_것, (
         "수집기가 게이트를 다른 경로로 얻으면 이 가드가 조립을 덮지 못한다"
     )
 
@@ -188,8 +223,9 @@ def test_게이트를_끄면_조립이_죽지_않는다() -> None:
         embedding_model="text-embedding-3-large",
         embedding_dimensions=3072,
     )
+    gate = settings.abstention_gate()  # 단언식 밖에서 먼저 뽑는다(불변식 9)
 
-    assert settings.abstention_gate() is None
+    assert gate is None
 
 
 def test_게이트를_끄지_않은_채로는_같은_조건이_죽는다() -> None:
@@ -207,19 +243,6 @@ def test_게이트를_끄지_않은_채로는_같은_조건이_죽는다() -> No
 # ── 오프라인 비교·격자 도구는 대상이 아니다 ────────────────────────────────
 
 
-def _호출_이름들(경로: Path) -> set[str]:
-    tree = ast.parse(경로.read_text(encoding="utf-8"))
-    이름: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            func = node.func
-            if isinstance(func, ast.Attribute):
-                이름.add(func.attr)
-            elif isinstance(func, ast.Name):
-                이름.add(func.id)
-    return 이름
-
-
 @pytest.mark.parametrize("모듈", [retrieval_eval, adoption_axis])
 def test_오프라인_도구는_설정_게이트를_얻지_않는다(모듈: ModuleType) -> None:
     """오프라인 비교·격자 도구는 τ 를 **명시 인자로** 받아 여러 임베딩 조건을 일부러 훑는다.
@@ -228,8 +251,21 @@ def test_오프라인_도구는_설정_게이트를_얻지_않는다(모듈: Mod
     불가능해지면 가드가 자기가 요구하는 명시적 경로를 스스로 막는 셈이다. 그래서 이 도구들은
     `AbstentionGate` 를 직접 조립하고 `Settings.abstention_gate()` 를 부르지 않는다.
     """
-    경로 = Path(inspect.getsourcefile(모듈) or "")
-    assert "abstention_gate" not in _호출_이름들(경로)
+    assert "abstention_gate" not in _모듈_호출_이름들(모듈)
+
+
+def test_설정_게이트를_얻는_모듈은_같은_헬퍼에_잡힌다() -> None:
+    """**음성 대조** — 위 검사는 *부재*만 단언하므로 헬퍼가 빈 집합을 돌려줘도 초록이다.
+
+    같은 헬퍼를 실제로 게이트를 얻는 모듈(`evidence.py`)에 걸어 `abstention_gate` 가
+    **나오는지** 본다. 나오지 않으면 위 검사는 아무것도 지키지 않는다는 뜻이다
+    (`tests/AGENTS.md` 불변식 3).
+    """
+    부르는_것 = _모듈_호출_이름들(evidence)
+
+    assert "abstention_gate" in 부르는_것
+    # 헬퍼가 "무엇이든 다 들어 있는 집합"을 돌려주는 것도 아님을 함께 못박는다.
+    assert "이런_이름의_호출은_없다" not in 부르는_것
 
 
 def test_오프라인_격자가_검증되지_않은_조건에서도_돈다() -> None:
