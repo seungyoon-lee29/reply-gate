@@ -72,6 +72,7 @@ from reply_gate.llm import (
     LLMCallError,
     LLMFormatError,
     accumulate_optional_ms,
+    accumulate_optional_tokens,
 )
 from reply_gate.order_ref import is_valid_order_no, normalize_order_no
 
@@ -280,6 +281,16 @@ class ProcessedInquiry:
     #: (docs/contracts.md "토큰 집계 경계"). 재작성을 쓰지 않은 문의는 0 이다.
     retrieval_input_tokens: int = 0
     retrieval_output_tokens: int = 0
+    #: 캐시 계열 토큰을 **계열별 한 쌍씩** 들고 있다. 두 계열이 같은 클라이언트를 지나므로
+    #: (재작성 클라이언트가 생성 클라이언트 그대로다) 한 쌍으로 묶으면 어느 계열의 캐시였는지
+    #: 되짚을 수 없다. **입력 칸에 접지 않는다** — 단가가 다른 값을 한 칸에 넣으면 달러 환산이
+    #: 그 차이를 볼 수 없고, OpenAI 는 적중분이 `input_tokens` 에 이미 포함돼 있어 더하면 같은
+    #: 토큰을 두 번 센다. 보고되지 않은 칸은 0 이 아니라 `None`(미측정)이다.
+    #: **DB 에도 HTTP 응답에도 싣지 않는다** — 평가 리포트까지만 간다.
+    generation_cache_creation_tokens: int | None = None
+    generation_cache_read_tokens: int | None = None
+    retrieval_cache_creation_tokens: int | None = None
+    retrieval_cache_read_tokens: int | None = None
     #: 검색 단계가 폴백한 사유. `None` 이면 폴백하지 않았다 — 인계 사유가 **아니다**.
     retrieval_fallback_reason: str | None = None
     #: 구간 아홉의 시간 합계(ms). 근거 수집 안쪽 여섯 + 시도별 셋을 합친 값이고,
@@ -342,6 +353,10 @@ class _Tally:
     #: 판정(L2) 토큰은 생성 합산과 **분리**해서 센다.
     judge_input_tokens: int = 0
     judge_output_tokens: int = 0
+    #: 생성 계열의 캐시 한 쌍. **0 에서 시작하지 않는다** — 시작값이 0 이면 한 번도 보고되지
+    #: 않은 실행이 "적중 0" 으로 신고된다. 검색 계열의 쌍은 근거 묶음이 들고 온다.
+    generation_cache_creation_tokens: int | None = None
+    generation_cache_read_tokens: int | None = None
     #: 시도별 구간을 문의 단위로 누적한 값. 시도 기록이 남지 않은 실패
     #: (초안 생성이 전송 오류로 죽은 경우)의 경과도 여기에 들어야 구간 합이 실제와 같다.
     draft_ms: float | None = None
@@ -442,6 +457,12 @@ class InquiryPipeline:
         )
         tally.input_tokens += collection.input_tokens
         tally.output_tokens += collection.output_tokens
+        tally.generation_cache_creation_tokens = accumulate_optional_tokens(
+            tally.generation_cache_creation_tokens, collection.generation_cache_creation_tokens
+        )
+        tally.generation_cache_read_tokens = accumulate_optional_tokens(
+            tally.generation_cache_read_tokens, collection.generation_cache_read_tokens
+        )
 
         if collection.escalation_reason is not None:
             # 초안 전 인계 — 초안 생성에 진입하지 않는다.
@@ -504,6 +525,12 @@ class InquiryPipeline:
                 # 넣지 않으면 초안 구간이 통째로 사라진다.
                 tally.input_tokens += exc.input_tokens
                 tally.output_tokens += exc.output_tokens
+                tally.generation_cache_creation_tokens = accumulate_optional_tokens(
+                    tally.generation_cache_creation_tokens, exc.cache_creation_input_tokens
+                )
+                tally.generation_cache_read_tokens = accumulate_optional_tokens(
+                    tally.generation_cache_read_tokens, exc.cache_read_input_tokens
+                )
                 tally.draft_ms = accumulate_optional_ms(tally.draft_ms, exc.elapsed_ms)
                 return self._LoopOutcome(
                     answer=None,
@@ -514,6 +541,12 @@ class InquiryPipeline:
 
             tally.input_tokens += generation.input_tokens
             tally.output_tokens += generation.output_tokens
+            tally.generation_cache_creation_tokens = accumulate_optional_tokens(
+                tally.generation_cache_creation_tokens, generation.cache_creation_input_tokens
+            )
+            tally.generation_cache_read_tokens = accumulate_optional_tokens(
+                tally.generation_cache_read_tokens, generation.cache_read_input_tokens
+            )
             tally.draft_ms = accumulate_optional_ms(tally.draft_ms, generation.elapsed_ms)
             attempt_draft_ms = generation.elapsed_ms
 
@@ -712,6 +745,12 @@ class InquiryPipeline:
             # 들고 있으므로 원장을 거치지 않고 그대로 옮긴다(초안 루프가 만들지 않는다).
             retrieval_input_tokens=collection.retrieval_input_tokens,
             retrieval_output_tokens=collection.retrieval_output_tokens,
+            # 캐시 칸도 계열별로 그대로 옮긴다 — 생성 쌍은 수집 + 초안 루프의 합이고,
+            # 검색 쌍은 수집기가 이미 갈라 들고 있다. 두 쌍을 하나로 합치지 않는다.
+            generation_cache_creation_tokens=tally.generation_cache_creation_tokens,
+            generation_cache_read_tokens=tally.generation_cache_read_tokens,
+            retrieval_cache_creation_tokens=collection.retrieval_cache_creation_tokens,
+            retrieval_cache_read_tokens=collection.retrieval_cache_read_tokens,
             retrieval_fallback_reason=collection.retrieval_fallback_reason,
             # 근거 수집 안쪽 여섯 + 루프가 잰 셋. 밖에서 수집 호출 하나를 감쌌다면
             # 여섯이 한 칸으로 접혔을 자리다.

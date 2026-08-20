@@ -94,6 +94,11 @@ class RewriteOutcome:
     #: 시간을 썼으므로 0 으로 접지 않는다(토큰과 같은 규칙). 재작성을 **시도하지 않은**
     #: 문의는 이 값을 만들지 않는다 — 그때 그 구간은 0 이 아니라 미측정이다.
     elapsed_ms: float = 0.0
+    #: 이 호출의 캐시 계열 토큰 — **검색 계열의 칸으로 간다.** 재작성은 생성과 같은
+    #: 클라이언트를 지나므로, 여기서 계열을 가르지 않으면 리포트에서 어느 계열의 캐시였는지
+    #: 되짚을 수 없다. 캐시 계열을 싣지 않은 응답에서는 0 이 아니라 `None`(미측정)이다.
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if (self.query is None) != (self.fallback_reason is not None):
@@ -148,6 +153,8 @@ def rewrite_query(
             output_tokens=exc.output_tokens,
             fallback_reason=f"구조화 출력 형식 불일치: {_truncated(exc.detail)}",
             elapsed_ms=exc.elapsed_ms,
+            cache_creation_input_tokens=exc.cache_creation_input_tokens,
+            cache_read_input_tokens=exc.cache_read_input_tokens,
         )
     except LLMCallError as exc:
         return RewriteOutcome(
@@ -156,6 +163,8 @@ def rewrite_query(
             output_tokens=exc.output_tokens,
             fallback_reason=f"전송 오류: {_truncated(exc.reason)}",
             elapsed_ms=exc.elapsed_ms,
+            cache_creation_input_tokens=exc.cache_creation_input_tokens,
+            cache_read_input_tokens=exc.cache_read_input_tokens,
         )
 
     rewritten = _extract_rewritten(completion.data)
@@ -166,6 +175,8 @@ def rewrite_query(
             output_tokens=completion.output_tokens,
             fallback_reason=f"rewritten 이 비어 있지 않은 문자열이 아니다: {completion.data!r}",
             elapsed_ms=completion.elapsed_ms,
+            cache_creation_input_tokens=completion.cache_creation_input_tokens,
+            cache_read_input_tokens=completion.cache_read_input_tokens,
         )
     return RewriteOutcome(
         query=rewritten,
@@ -173,4 +184,6 @@ def rewrite_query(
         output_tokens=completion.output_tokens,
         fallback_reason=None,
         elapsed_ms=completion.elapsed_ms,
+        cache_creation_input_tokens=completion.cache_creation_input_tokens,
+        cache_read_input_tokens=completion.cache_read_input_tokens,
     )

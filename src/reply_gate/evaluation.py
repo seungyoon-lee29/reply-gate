@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import reduce
@@ -534,6 +534,14 @@ class GoldenOutcome:
     #: 문의는 0 이고, 실패한 호출의 토큰도 실비용이므로 그대로 들어온다.
     retrieval_input_tokens: int = 0
     retrieval_output_tokens: int = 0
+    #: 캐시 계열 토큰 — **계열마다 (write, read) 한 쌍**이다. 두 계열이 같은 클라이언트를
+    #: 지나므로 한 쌍으로 묶으면 어느 계열의 캐시였는지 되짚을 수 없다. 입력 칸에 접지
+    #: 않는다(단가가 다르고, OpenAI 는 적중분이 입력 토큰에 이미 포함돼 있다).
+    #: 보고되지 않은 칸은 0 이 아니라 `None`(미측정)이다.
+    generation_cache_creation_tokens: int | None = None
+    generation_cache_read_tokens: int | None = None
+    retrieval_cache_creation_tokens: int | None = None
+    retrieval_cache_read_tokens: int | None = None
     #: 검색 단계가 폴백한 사유. 인계 사유가 아니다 — 폴백한 문의도 답변으로 끝날 수 있다.
     retrieval_fallback_reason: str | None = None
     #: 의도 해석이 고른 근거 소스(`policy`/`order`/`both`). **정책 검색이 실제로 돌았는지**를
@@ -665,6 +673,14 @@ class PipelineAgreement:
     #: 검색 계열도 같은 자격으로 분리해서 센다.
     retrieval_input_tokens_total: int = 0
     retrieval_output_tokens_total: int = 0
+    #: 캐시 계열 합계 — **계열마다 한 쌍**이다. 한 쌍으로 묶으면 두 계열 중 어느 쪽의
+    #: 캐시였는지 되짚을 수 없고, 이 절감의 증상은 **두 계열 모두**의 달러가 상한이라는
+    #: 것이라 한 쌍으로는 목적을 못 채운다. **한 건도 보고되지 않았으면 0 이 아니라
+    #: `None`(미측정)** 이다 — "캐시가 0 토큰 적중했다"와 "캐시를 잰 적이 없다"는 다르다.
+    generation_cache_creation_total: int | None = None
+    generation_cache_read_total: int | None = None
+    retrieval_cache_creation_total: int | None = None
+    retrieval_cache_read_total: int | None = None
     #: 검색 단계가 폴백한 문의 수. **조용한 폴백을 금지하는 집계**다
     #: (docs/business-rules.md "검색 단계 실패") — 0 이 정상이고, 커지면 재작성 층이
     #: 사실상 꺼진 실행을 정상 실측으로 읽게 된다.
@@ -712,6 +728,22 @@ class PipelineAgreement:
         if self.total == 0:
             return None
         return (self.retrieval_input_tokens_total + self.retrieval_output_tokens_total) / self.total
+
+    @property
+    def generation_cache_measured(self) -> bool:
+        """생성 계열의 캐시를 **잰** 실행인가. 안 잰 실행의 표기는 0 이 아니라 "미측정" 이다."""
+        return (
+            self.generation_cache_creation_total is not None
+            or self.generation_cache_read_total is not None
+        )
+
+    @property
+    def retrieval_cache_measured(self) -> bool:
+        """검색 계열의 캐시를 **잰** 실행인가 — 생성 계열과 따로 묻는다."""
+        return (
+            self.retrieval_cache_creation_total is not None
+            or self.retrieval_cache_read_total is not None
+        )
 
     @property
     def total_tokens_per_inquiry(self) -> float | None:
@@ -895,6 +927,10 @@ def evaluate_case(
         error=None,
         retrieval_input_tokens=processed.retrieval_input_tokens,
         retrieval_output_tokens=processed.retrieval_output_tokens,
+        generation_cache_creation_tokens=processed.generation_cache_creation_tokens,
+        generation_cache_read_tokens=processed.generation_cache_read_tokens,
+        retrieval_cache_creation_tokens=processed.retrieval_cache_creation_tokens,
+        retrieval_cache_read_tokens=processed.retrieval_cache_read_tokens,
         retrieval_fallback_reason=processed.retrieval_fallback_reason,
         intent=None if processed.intent is None else processed.intent.value,
         stage_durations=processed.stage_durations,
@@ -974,11 +1010,34 @@ def measure_pipeline_agreement(
         outcomes=tuple(outcomes),
         retrieval_input_tokens_total=sum(outcome.retrieval_input_tokens for outcome in outcomes),
         retrieval_output_tokens_total=sum(outcome.retrieval_output_tokens for outcome in outcomes),
+        # 캐시 계열은 `sum` 이 아니라 누적기로 접는다 — 미측정을 0 으로 만들지 않는다
+        # (판정 계열의 같은 자리와 같은 규칙).
+        generation_cache_creation_total=_fold_optional(
+            outcome.generation_cache_creation_tokens for outcome in outcomes
+        ),
+        generation_cache_read_total=_fold_optional(
+            outcome.generation_cache_read_tokens for outcome in outcomes
+        ),
+        retrieval_cache_creation_total=_fold_optional(
+            outcome.retrieval_cache_creation_tokens for outcome in outcomes
+        ),
+        retrieval_cache_read_total=_fold_optional(
+            outcome.retrieval_cache_read_tokens for outcome in outcomes
+        ),
         retrieval_fallback_total=sum(
             1 for outcome in outcomes if outcome.retrieval_fallback_reason is not None
         ),
         stage_durations=_aggregate_stage_durations(outcomes),
     )
+
+
+def _fold_optional(values: Iterable[int | None]) -> int | None:
+    """캐시 계열 합계 — **미측정(`None`)을 0 으로 접지 않는다.**
+
+    한 번이라도 측정값이 있으면 합계는 측정값이고, 끝까지 없으면 합계도 미측정이다.
+    `sum()` 을 쓰면 미측정이 0 이 되어 재지도 않은 축이 "적중 0" 으로 신고된다.
+    """
+    return reduce(accumulate_optional_tokens, values, cast(int | None, None))
 
 
 def _aggregate_stage_durations(outcomes: Sequence[GoldenOutcome]) -> tuple[SpanAggregate, ...]:
@@ -2216,6 +2275,8 @@ def _render_measurement_two(
             "| --- | ---: | ---: |",
             *_token_rows(pipeline, conditions),
             "",
+            *_generation_cache_token_lines(pipeline),
+            "",
             *_render_stage_durations(pipeline.stage_durations, conditions),
             "### 종결 분포",
             "",
@@ -2378,6 +2439,53 @@ def _render_failure_attribution(
         )
     lines.append("")
     return lines
+
+
+def _generation_cache_token_lines(pipeline: PipelineAgreement) -> list[str]:
+    """생성·검색 계열의 프롬프트 캐시 — **계열마다 한 줄, 입력 칸과 분리해서** 적는다.
+
+    두 계열은 같은 클라이언트를 지나므로 한 줄로 합치면 어느 계열의 캐시였는지 되짚을 수
+    없다. 그리고 이 줄이 없으면 달러 환산이 전부 정가를 곱해, 리포트의 비용이 **실제
+    청구액이 아니라 그 이상일 수 없는 값**(상한)이 된다.
+
+    **위 표의 '생성 입력'·'검색 입력'에서 이 값을 빼지 않았다.** OpenAI 응답에서 캐시
+    적중분은 입력 토큰 **안에** 들어 있다(Anthropic 판정 계열은 반대로 제외돼 있다).
+    빼면 옛 산출물과 정의가 갈리고, 합산에 더하면 같은 토큰을 두 번 센다.
+
+    **재지 않은 계열은 0 이 아니라 "미측정"** 이다(`scripts/AGENTS.md` 불변식 5).
+    """
+
+    def line(label: str, measured: bool, creation: int | None, read: int | None) -> str:
+        if not measured:
+            return (
+                f"- {label} 계열 프롬프트 캐시: **미측정** "
+                "(캐시 계열 토큰을 보고하지 않은 실행 — 0 이 아니다)"
+            )
+        return (
+            f"- {label} 계열 프롬프트 캐시({label} 입력 토큰과 별도 칸): "
+            f"write {_int_or_unmeasured(creation)} / read {_int_or_unmeasured(read)} "
+            f"— 위 '{label} 입력'은 **캐시 적중분을 포함한 총 입력**이다(빼지도 더하지도 않는다)"
+        )
+
+    return [
+        line(
+            "생성",
+            pipeline.generation_cache_measured,
+            pipeline.generation_cache_creation_total,
+            pipeline.generation_cache_read_total,
+        ),
+        line(
+            "검색",
+            pipeline.retrieval_cache_measured,
+            pipeline.retrieval_cache_creation_total,
+            pipeline.retrieval_cache_read_total,
+        ),
+    ]
+
+
+def _int_or_unmeasured(value: int | None) -> str:
+    """한쪽 칸만 보고된 계열의 나머지 칸 — 0 으로 채우지 않는다."""
+    return "미측정" if value is None else str(value)
 
 
 def _grand_total(pipeline: PipelineAgreement) -> int:
@@ -2731,6 +2839,13 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
             "judge_output_total": pipeline.judge_output_tokens_total,
             "retrieval_input_total": pipeline.retrieval_input_tokens_total,
             "retrieval_output_total": pipeline.retrieval_output_tokens_total,
+            #: 캐시 계열은 **계열마다 한 쌍**이고 입력 칸과 분리 표기한다. 위 두 입력 칸은
+            #: 캐시 적중분을 **포함한** 총 입력이므로(OpenAI 는 적중분이 입력 토큰 안에 있다)
+            #: 이 값을 합산에 다시 더하지 않는다. 재지 않은 실행은 0 이 아니라 `null` 이다.
+            "generation_cache_creation_total": pipeline.generation_cache_creation_total,
+            "generation_cache_read_total": pipeline.generation_cache_read_total,
+            "retrieval_cache_creation_total": pipeline.retrieval_cache_creation_total,
+            "retrieval_cache_read_total": pipeline.retrieval_cache_read_total,
             "generation_per_inquiry": pipeline.generation_tokens_per_inquiry,
             "embedding_per_inquiry": pipeline.embedding_tokens_per_inquiry,
             "judge_per_inquiry": pipeline.judge_tokens_per_inquiry,
@@ -2762,6 +2877,11 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
                 "judge_output_tokens": outcome.judge_output_tokens,
                 "retrieval_input_tokens": outcome.retrieval_input_tokens,
                 "retrieval_output_tokens": outcome.retrieval_output_tokens,
+                #: 케이스별 캐시 칸도 계열별이다. 미측정은 0 이 아니라 `null` 이다.
+                "generation_cache_creation_tokens": outcome.generation_cache_creation_tokens,
+                "generation_cache_read_tokens": outcome.generation_cache_read_tokens,
+                "retrieval_cache_creation_tokens": outcome.retrieval_cache_creation_tokens,
+                "retrieval_cache_read_tokens": outcome.retrieval_cache_read_tokens,
                 "retrieval_fallback_reason": outcome.retrieval_fallback_reason,
                 # 정책 검색이 돌았는지를 산출물에서 바로 읽게 한다 — 역추론 금지.
                 "intent": outcome.intent,
@@ -3087,3 +3207,7 @@ class _StubCompletion:
     #: 비결정론이 되어 `--stub-llm` 실행이 재현되지 않는다(대역 결정론은 이 저장소의
     #: 계약이고 `tests/test_testing_doubles.py` 가 지킨다).
     elapsed_ms: float = 0.0
+    #: 대역은 캐시를 재지 않는다 — 0 이 아니라 **미측정**이다. 모양을 맞추지 않으면 캐시
+    #: 칸을 읽는 자리에서 대역만 터진다(경과 칸이 이미 겪은 사고다).
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None

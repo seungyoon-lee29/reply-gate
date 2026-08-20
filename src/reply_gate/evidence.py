@@ -61,6 +61,7 @@ from reply_gate.llm import (
     LLMCallError,
     LLMFormatError,
     accumulate_optional_ms,
+    accumulate_optional_tokens,
 )
 from reply_gate.order_ref import is_valid_order_no, normalize_order_no
 from reply_gate.policy_index import PolicySearchHit, search_policy_chunks
@@ -371,6 +372,11 @@ class IntentResult:
     #: 토큰·전송 수와 같은 자리에서 누적한다. 전송 오류로 죽으면 `LLMCallError.elapsed_ms`
     #: 가 같은 값을 들고 위로 올라간다.
     elapsed_ms: float = 0.0
+    #: 캐시 계열 토큰 — **생성 계열의 칸**이고 입력 토큰에 접지 않는다. 형식 재시도로 버린
+    #: 시도의 몫도 실비용이라 함께 누적한다. 한 번도 보고되지 않았으면 0 이 아니라
+    #: `None`(미측정)이다.
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
 
 
 def _parse_intent(data: object) -> IntentSource | None:
@@ -395,6 +401,10 @@ def classify_intent(
     """필요한 근거 소스를 분류한다. 형식 불일치는 **코드가 1회만** 재시도한다."""
     input_tokens = 0
     output_tokens = 0
+    # 캐시 계열도 토큰과 같은 규칙으로 누적한다. **다만 0 에서 시작하지 않는다** — 시작값이
+    # 0 이면 한 번도 보고되지 않은 실행이 "적중 0" 으로 신고된다.
+    cache_creation: int | None = None
+    cache_read: int | None = None
     # 실제로 나간 전송 수 — 토큰과 같은 이유로 버리지 않는다(`judge.Judge.judge` 와 같은 형태).
     sent = 0
     # 경과도 같은 자격이다. 마지막 시도만 재면 형식 실패로 버린 호출의 시간이 사라진다.
@@ -421,6 +431,10 @@ def classify_intent(
         except LLMFormatError as exc:
             input_tokens += exc.input_tokens
             output_tokens += exc.output_tokens
+            cache_creation = accumulate_optional_tokens(
+                cache_creation, exc.cache_creation_input_tokens
+            )
+            cache_read = accumulate_optional_tokens(cache_read, exc.cache_read_input_tokens)
             sent += exc.transport_attempts
             elapsed_ms += exc.elapsed_ms
             error = exc.detail
@@ -437,11 +451,21 @@ def classify_intent(
                 cause=exc.cause,
                 input_tokens=input_tokens + exc.input_tokens,
                 output_tokens=output_tokens + exc.output_tokens,
+                cache_creation_input_tokens=accumulate_optional_tokens(
+                    cache_creation, exc.cache_creation_input_tokens
+                ),
+                cache_read_input_tokens=accumulate_optional_tokens(
+                    cache_read, exc.cache_read_input_tokens
+                ),
                 elapsed_ms=elapsed_ms + exc.elapsed_ms,
             ) from exc
 
         input_tokens += completion.input_tokens
         output_tokens += completion.output_tokens
+        cache_creation = accumulate_optional_tokens(
+            cache_creation, completion.cache_creation_input_tokens
+        )
+        cache_read = accumulate_optional_tokens(cache_read, completion.cache_read_input_tokens)
         sent += completion.transport_attempts
         elapsed_ms += completion.elapsed_ms
         source = _parse_intent(completion.data)
@@ -453,6 +477,8 @@ def classify_intent(
                 error=None,
                 attempts=attempt,
                 elapsed_ms=elapsed_ms,
+                cache_creation_input_tokens=cache_creation,
+                cache_read_input_tokens=cache_read,
             )
         error = f"source 는 policy·order·both 중 하나여야 한다 (받은 산출: {completion.data!r})"
         previous_output = repr(completion.data)
@@ -464,6 +490,8 @@ def classify_intent(
         error=error,
         attempts=INTENT_MAX_ATTEMPTS,
         elapsed_ms=elapsed_ms,
+        cache_creation_input_tokens=cache_creation,
+        cache_read_input_tokens=cache_read,
     )
 
 
@@ -488,6 +516,10 @@ class SqlGenerationResult:
     transport_attempts: int = 1
     #: 이 1회 호출에 흐른 벽시계(ms). 재시도 루프가 조회문 생성 구간으로 누적한다.
     elapsed_ms: float = 0.0
+    #: 이 1회 호출의 캐시 계열 토큰 — **생성 계열의 칸**이다. 재시도 루프가 토큰과 같은
+    #: 자격으로 누적하고, 보고되지 않았으면 0 이 아니라 `None`(미측정)이다.
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
 
 
 def _extract_sql(data: object) -> str | None:
@@ -536,6 +568,8 @@ def generate_sql(
             error=f"구조화 출력 형식 불일치: {exc.detail}",
             transport_attempts=exc.transport_attempts,
             elapsed_ms=exc.elapsed_ms,
+            cache_creation_input_tokens=exc.cache_creation_input_tokens,
+            cache_read_input_tokens=exc.cache_read_input_tokens,
         )
 
     sql = _extract_sql(completion.data)
@@ -546,6 +580,8 @@ def generate_sql(
         error=None if sql is not None else "유효한 SQL 문자열을 얻지 못했다",
         transport_attempts=completion.transport_attempts,
         elapsed_ms=completion.elapsed_ms,
+        cache_creation_input_tokens=completion.cache_creation_input_tokens,
+        cache_read_input_tokens=completion.cache_read_input_tokens,
     )
 
 
@@ -840,6 +876,14 @@ class EvidenceCollection:
     #: 이므로 그대로 센다.
     retrieval_input_tokens: int = 0
     retrieval_output_tokens: int = 0
+    #: 캐시 계열 토큰을 **계열별로** 들고 나온다 — 생성 한 쌍, 검색 한 쌍. 두 계열이 같은
+    #: 클라이언트를 지나므로(재작성 클라이언트가 생성 클라이언트 그대로다) 한 쌍으로 묶으면
+    #: 어느 계열의 캐시였는지 되짚을 수 없다. **계열 자체는 늘어나지 않는다** — 늘어나는
+    #: 것은 계열마다의 칸이다. 보고되지 않은 칸은 0 이 아니라 `None`(미측정)이다.
+    generation_cache_creation_tokens: int | None = None
+    generation_cache_read_tokens: int | None = None
+    retrieval_cache_creation_tokens: int | None = None
+    retrieval_cache_read_tokens: int | None = None
     #: 검색 단계가 폴백한 사유. `None` 은 "폴백하지 않았다"이고, 재작성을 **시도하지 않은**
     #: 경우(스위치 꺼짐·`order` 단독 의도)도 `None` 이다 — 폴백은 시도한 것의 결과다.
     retrieval_fallback_reason: str | None = None
@@ -873,6 +917,13 @@ class _Ledger:
     #: 검색 단계 생성 호출의 토큰 — 생성 합산과 분리된 계열이다.
     retrieval_input_tokens: int = 0
     retrieval_output_tokens: int = 0
+    #: 캐시 계열도 같은 경계로 가른다 — 계열마다 (write, read) 한 쌍이다.
+    #: **0 에서 시작하지 않는다**: 시작값이 0 이면 한 번도 보고되지 않은 실행이 "적중 0"
+    #: 으로 신고된다.
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    retrieval_cache_creation_input_tokens: int | None = None
+    retrieval_cache_read_input_tokens: int | None = None
     retrieval_fallback_reason: str | None = None
     #: 기권 게이트의 통계량이 미정의였던 사유 — 처분(발동/열림)과 별개로 그대로 실어 나른다.
     abstention_undefined_reason: AbstentionUndefined | None = None
@@ -951,6 +1002,12 @@ class EvidenceCollector:
             ledger.spans.add(INTENT_STAGE, classification.elapsed_ms)
             ledger.input_tokens += classification.input_tokens
             ledger.output_tokens += classification.output_tokens
+            ledger.cache_creation_input_tokens = accumulate_optional_tokens(
+                ledger.cache_creation_input_tokens, classification.cache_creation_input_tokens
+            )
+            ledger.cache_read_input_tokens = accumulate_optional_tokens(
+                ledger.cache_read_input_tokens, classification.cache_read_input_tokens
+            )
             if classification.source is None:
                 return self._finish(
                     ledger,
@@ -983,6 +1040,13 @@ class EvidenceCollector:
             # 버리면 같은 거절이 어느 단계에서 났느냐에 따라 실비용 기록이 갈린다.
             ledger.input_tokens += exc.input_tokens
             ledger.output_tokens += exc.output_tokens
+            # 캐시 계열도 같은 자격이다 — 200 으로 온 응답의 적중분은 이미 과금됐다.
+            ledger.cache_creation_input_tokens = accumulate_optional_tokens(
+                ledger.cache_creation_input_tokens, exc.cache_creation_input_tokens
+            )
+            ledger.cache_read_input_tokens = accumulate_optional_tokens(
+                ledger.cache_read_input_tokens, exc.cache_read_input_tokens
+            )
             return self._finish(
                 ledger,
                 intent=intent,
@@ -1086,6 +1150,13 @@ class EvidenceCollector:
         ledger.spans.add(QUERY_REWRITE_STAGE, outcome.elapsed_ms)
         ledger.retrieval_input_tokens += outcome.input_tokens
         ledger.retrieval_output_tokens += outcome.output_tokens
+        # 검색 계열의 칸이다 — 같은 클라이언트를 지나도 생성 칸에 섞지 않는다.
+        ledger.retrieval_cache_creation_input_tokens = accumulate_optional_tokens(
+            ledger.retrieval_cache_creation_input_tokens, outcome.cache_creation_input_tokens
+        )
+        ledger.retrieval_cache_read_input_tokens = accumulate_optional_tokens(
+            ledger.retrieval_cache_read_input_tokens, outcome.cache_read_input_tokens
+        )
         if outcome.fallback_reason is not None:
             ledger.retrieval_fallback_reason = outcome.fallback_reason
         return outcome.query
@@ -1167,10 +1238,18 @@ class EvidenceCollector:
                     cause=exc.cause,
                     input_tokens=exc.input_tokens,
                     output_tokens=exc.output_tokens,
+                    cache_creation_input_tokens=exc.cache_creation_input_tokens,
+                    cache_read_input_tokens=exc.cache_read_input_tokens,
                     elapsed_ms=exc.elapsed_ms,
                 ) from exc
             ledger.input_tokens += generation.input_tokens
             ledger.output_tokens += generation.output_tokens
+            ledger.cache_creation_input_tokens = accumulate_optional_tokens(
+                ledger.cache_creation_input_tokens, generation.cache_creation_input_tokens
+            )
+            ledger.cache_read_input_tokens = accumulate_optional_tokens(
+                ledger.cache_read_input_tokens, generation.cache_read_input_tokens
+            )
             ledger.sql_transport_attempts += generation.transport_attempts
             ledger.spans.add(SQL_GENERATION_STAGE, generation.elapsed_ms)
 
@@ -1289,6 +1368,10 @@ class EvidenceCollector:
             embedding_tokens=ledger.embedding_tokens,
             retrieval_input_tokens=ledger.retrieval_input_tokens,
             retrieval_output_tokens=ledger.retrieval_output_tokens,
+            generation_cache_creation_tokens=ledger.cache_creation_input_tokens,
+            generation_cache_read_tokens=ledger.cache_read_input_tokens,
+            retrieval_cache_creation_tokens=ledger.retrieval_cache_creation_input_tokens,
+            retrieval_cache_read_tokens=ledger.retrieval_cache_read_input_tokens,
             retrieval_fallback_reason=ledger.retrieval_fallback_reason,
             abstention_undefined_reason=ledger.abstention_undefined_reason,
             stage_durations=ledger.spans.snapshot(),

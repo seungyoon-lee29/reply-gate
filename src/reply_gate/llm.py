@@ -65,10 +65,14 @@ MAX_ATTEMPTS = 2
 def _optional_token_count(usage: object, field: str) -> int | None:
     """캐시 계열 토큰 1개 — **없으면 0 이 아니라 `None`(해당 없음/미측정)이다.**
 
-    프롬프트 캐싱을 쓰지 않는 provider(OpenAI 생성 계열)와 캐시 계열 필드를 싣지 않는
-    응답에는 이 값이 아예 없다. 그때 0 으로 접으면 "캐시가 0 토큰 적중했다"(측정했고 0)와
-    "캐시를 잰 적이 없다"(미측정)가 같은 값이 되어, 리포트가 재지도 않은 축을 잰 것처럼
-    적는다 — 미실행·미측정을 0 으로 채우지 않는 규칙과 같은 자리다.
+    캐시 계열 필드를 싣지 않는 응답(내역 묶음이 없거나 그 칸이 비어 있는 응답)에는 이 값이
+    아예 없다. 그때 0 으로 접으면 "캐시가 0 토큰 적중했다"(측정했고 0)와 "캐시를 잰 적이
+    없다"(미측정)가 같은 값이 되어, 리포트가 재지도 않은 축을 잰 것처럼 적는다 —
+    미실행·미측정을 0 으로 채우지 않는 규칙과 같은 자리다.
+
+    `usage` 자리에 `None` 이 와도 그대로 미측정이다 — provider 마다 이 값이 담긴 묶음의
+    위치가 달라(OpenAI 는 `input_tokens_details` 안, Anthropic 은 `usage` 바로 아래) 호출자가
+    한 겹 더 들어간 뒤 부르는 경우가 있다.
     """
     value = getattr(usage, field, None)
     if value is None:
@@ -235,11 +239,14 @@ class JsonCompletion:
     #: 호출만 재면 래퍼 재시도 1회가 통째로 사라진다. 대역이 직접 만드는 산출에서는 0.0
     #: 이고, 그것은 "재지 않았다"가 아니라 **밖으로 나간 시간이 없다**는 뜻이다.
     elapsed_ms: float = 0.0
-    #: 캐시에 **쓴** 토큰(약 1.25배 단가). 캐싱을 쓰지 않는 provider·응답에서는 `None`
-    #: (해당 없음)이고 **0 이 아니다** — 재지 않은 축을 0 으로 신고하지 않기 위해서다.
+    #: 캐시에 **쓴** 토큰. 캐시 계열을 싣지 않는 응답에서는 `None`(해당 없음/미측정)이고
+    #: **0 이 아니다** — 재지 않은 축을 0 으로 신고하지 않기 위해서다.
     cache_creation_input_tokens: int | None = None
-    #: 캐시에서 **읽은** 토큰(약 0.1배 단가). 켜짐 조건에서 `input_tokens` 는 이 값을
-    #: **제외한** 비캐시 입력이므로, 둘을 뭉뚱그리면 적중이 "입력 토큰 감소"로 위장한다.
+    #: 캐시에서 **읽은** 토큰(적중분). **`input_tokens` 와의 포함 관계는 provider 마다
+    #: 반대다** — Anthropic 은 `input_tokens` 가 이 값을 **제외한** 비캐시 입력이고, OpenAI 는
+    #: 이 값이 `input_tokens` 에 **포함**돼 있다. 어느 쪽이든 둘을 뭉뚱그리면 안 된다:
+    #: 앞은 적중이 "입력 토큰 감소"로 위장하고, 뒤는 같은 토큰을 두 번 세게 된다.
+    #: 단가가 다르므로 칸을 가르고, 곱하는 단가는 계열별로 단가 문서가 정한다.
     cache_read_input_tokens: int | None = None
 
 
@@ -410,6 +417,22 @@ def _is_openai_api_error(exc: Exception) -> bool:
     return isinstance(exc, openai.APIError)
 
 
+def _openai_cache_tokens(usage: object) -> tuple[int | None, int | None]:
+    """OpenAI 응답의 (캐시 write, 캐시 read) — **없으면 0 이 아니라 `None`(미측정)** 이다.
+
+    두 값은 `usage.input_tokens_details` 안에 있고 그 묶음은 **입력 토큰의 내역**이다.
+    즉 여기서 읽는 값은 `input_tokens` 에 **이미 포함**돼 있다 — Anthropic 이 캐시 적중분을
+    `input_tokens` 에서 **제외**하는 것과 포함 관계가 반대다. 그래서 이 값을 입력 칸에서
+    빼거나 더하지 않는다: 빼면 옛 산출물과 정의가 갈리고, 더하면 같은 토큰을 두 번 센다.
+    별도 칸으로만 싣고, 어느 쪽 단가를 곱할지는 단가 문서가 계열별로 정한다.
+    """
+    details = getattr(usage, "input_tokens_details", None)
+    return (
+        _optional_token_count(details, "cache_write_tokens"),
+        _optional_token_count(details, "cached_tokens"),
+    )
+
+
 def _refusal_text(response: Response) -> str | None:
     """안전 분류기 거절이면 그 사유를, 아니면 None."""
     for item in getattr(response, "output", []) or []:
@@ -492,6 +515,10 @@ class OpenAIGenerationClient:
         usage = getattr(response, "usage", None)
         input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
         output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+        # **캐시 계열은 `input_tokens` 의 내역 안에 있다.** 이 두 줄이 없으면 적중분이
+        # 어디에도 남지 않아 달러 환산이 전부 정가를 곱하고, 그 값은 실제 청구액이 아니라
+        # 그 이상일 수 없는 값(상한)이 된다. 판정 계열이 이미 같은 배선을 갖고 있다.
+        cache_creation, cache_read = _openai_cache_tokens(usage)
 
         # 안전 분류기가 거절하면 사용 가능한 산출이 없으므로 실패다.
         # 응답은 200 으로 왔으므로 **토큰은 이미 과금됐다** — 실패에 실어 보낸다.
@@ -504,6 +531,8 @@ class OpenAIGenerationClient:
                 attempts=sent,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                cache_creation_input_tokens=cache_creation,
+                cache_read_input_tokens=cache_read,
                 # 거절도 시간을 썼다 — 토큰과 같은 자격으로 올려보낸다.
                 elapsed_ms=elapsed,
             )
@@ -516,6 +545,8 @@ class OpenAIGenerationClient:
             output_tokens=output_tokens,
             transport_attempts=sent,
             elapsed_ms=elapsed,
+            cache_creation_input_tokens=cache_creation,
+            cache_read_input_tokens=cache_read,
         )
 
 
