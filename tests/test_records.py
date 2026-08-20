@@ -38,7 +38,13 @@ from reply_gate.evidence import (
     SqlFailure,
     SqlFailureKind,
 )
-from reply_gate.pipeline import AttemptRecord, ProcessedInquiry, new_inquiry_id
+from reply_gate.pipeline import (
+    AttemptDurations,
+    AttemptRecord,
+    ProcessedInquiry,
+    StageDurations,
+    new_inquiry_id,
+)
 from reply_gate.records import load_inquiry, save_inquiry
 from tests.test_pipeline import (
     citing_draft,
@@ -50,6 +56,18 @@ from tests.test_pipeline import (
 )
 
 pytestmark = pytest.mark.db
+
+
+def _without_durations(processed: ProcessedInquiry) -> ProcessedInquiry:
+    """구간 시간을 벗긴 사본 — **계측은 DB 를 지나지 않는다**는 계약이 그 이유다."""
+    return replace(
+        processed,
+        stage_durations=StageDurations(),
+        attempts=tuple(
+            replace(attempt, durations=AttemptDurations()) for attempt in processed.attempts
+        ),
+    )
+
 
 POLICY_ID = policy_evidence_id(document_slug="refund", article="2.1")
 EXECUTED_SQL = "SELECT order_no, status FROM orders WHERE order_no = 'ORD-20260315-0001'"
@@ -619,6 +637,17 @@ def test_실제_SQL_근거의_ID_가_저장_시_CHECK_를_통과한다(
 
     # 파이프라인이 실은 층별 판정(`l1_result`/`l2_result`)까지 벗기지 않고 통째로 대조한다 —
     # 이 단언이 녹색이라는 것이 층별 내역의 왕복이 실제로 성립한다는 증거다.
-    assert loaded == processed
+    #
+    # **단계별 구간 시간은 예외다.** 계측은 결과 객체와 평가 리포트까지만 가고 처리 기록
+    # 스키마는 무변경이라(볼륨 재생성과 정책 재색인에 과금이 든다), 복원된 기록의 구간은
+    # 0 이 아니라 **미측정**으로 돌아온다. 그것을 여기서 확인하고 나머지를 통째로 대조한다.
+    assert loaded is not None
+    assert loaded.stage_durations == StageDurations()
+    assert [attempt.durations for attempt in loaded.attempts] == [
+        AttemptDurations() for _ in loaded.attempts
+    ]
+    assert _without_durations(loaded) == _without_durations(processed)
+    # 실행 쪽은 실제로 쟀다 — 양성 대조가 없으면 위 단언이 "둘 다 비었다"로 통과한다.
+    assert processed.stage_durations.measured_total_ms is not None
     assert processed.attempts[0].l1_result is not None
     assert processed.sql_snapshots[0].evidence_id == f"sql:{processed.inquiry_id}:1"

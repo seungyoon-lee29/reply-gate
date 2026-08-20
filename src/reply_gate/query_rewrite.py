@@ -90,6 +90,10 @@ class RewriteOutcome:
     input_tokens: int
     output_tokens: int
     fallback_reason: str | None
+    #: 이 호출에 흐른 벽시계(ms) — **질의 재작성 구간의 시간**이다. 폴백으로 끝난 호출도
+    #: 시간을 썼으므로 0 으로 접지 않는다(토큰과 같은 규칙). 재작성을 **시도하지 않은**
+    #: 문의는 이 값을 만들지 않는다 — 그때 그 구간은 0 이 아니라 미측정이다.
+    elapsed_ms: float = 0.0
 
     def __post_init__(self) -> None:
         if (self.query is None) != (self.fallback_reason is not None):
@@ -143,6 +147,7 @@ def rewrite_query(
             input_tokens=exc.input_tokens,
             output_tokens=exc.output_tokens,
             fallback_reason=f"구조화 출력 형식 불일치: {_truncated(exc.detail)}",
+            elapsed_ms=exc.elapsed_ms,
         )
     except LLMCallError as exc:
         return RewriteOutcome(
@@ -150,6 +155,7 @@ def rewrite_query(
             input_tokens=exc.input_tokens,
             output_tokens=exc.output_tokens,
             fallback_reason=f"전송 오류: {_truncated(exc.reason)}",
+            elapsed_ms=exc.elapsed_ms,
         )
 
     rewritten = _extract_rewritten(completion.data)
@@ -159,10 +165,12 @@ def rewrite_query(
             input_tokens=completion.input_tokens,
             output_tokens=completion.output_tokens,
             fallback_reason=f"rewritten 이 비어 있지 않은 문자열이 아니다: {completion.data!r}",
+            elapsed_ms=completion.elapsed_ms,
         )
     return RewriteOutcome(
         query=rewritten,
         input_tokens=completion.input_tokens,
         output_tokens=completion.output_tokens,
         fallback_reason=None,
+        elapsed_ms=completion.elapsed_ms,
     )

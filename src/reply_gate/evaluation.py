@@ -57,9 +57,11 @@ from reply_gate.judge import L2_REJECT_REASONS
 from reply_gate.llm import LLMCallError, LLMFormatError, accumulate_optional_tokens
 from reply_gate.pipeline import (
     L2_JUDGE_STAGE,
+    AttemptDurations,
     Judging,
     ProcessedInquiry,
     ReceiptError,
+    StageDurations,
     accept_inquiry,
     new_inquiry_id,
 )
@@ -103,6 +105,7 @@ __all__ = [
     "ReportStemError",
     "RunConditions",
     "SkippedMeasurement",
+    "SpanAggregate",
     "StubGenerationClient",
     "TargetAssessment",
     "assess_targets",
@@ -122,6 +125,9 @@ __all__ = [
 ]
 
 _ROOT: Final = Path(__file__).resolve().parents[2]
+
+#: 구간 이름 아홉. **자료형에서 유도한다** — 목록을 여기에 다시 적으면 한쪽만 늘어난다.
+SPAN_NAMES: Final[tuple[str, ...]] = tuple(StageDurations().as_mapping())
 
 #: 저장소의 골든셋(30건) — 허용 결과 집합 라벨이 붙은 ground truth.
 DEFAULT_GOLDEN_SET_PATH: Final = _ROOT / "data" / "golden_set.jsonl"
@@ -534,6 +540,12 @@ class GoldenOutcome:
     #: 이 값이 들고 있다 — 지금까지는 검색 토큰 0 + `sql:` 단독 채택으로 역추론해야 했다
     #: (docs/tracking/findings.md 20번 ①). 의도 해석이 무너진 문의는 `None`(미상)이다.
     intent: str | None = None
+    #: 이 케이스의 구간 아홉 시간(ms). 돌지 않은 구간은 0 이 아니라 미측정이다.
+    #: 접수 거부처럼 파이프라인에 진입조차 못한 케이스는 아홉 칸 전부 미측정이다.
+    stage_durations: StageDurations = field(default_factory=StageDurations)
+    #: 시도별 구간(초안 생성·게이트 판정·L2 판정). 재생성이 돌면 2건이 쌓이고, 합계는
+    #: `stage_durations` 가 들고 있다 — **합계와 시도별 값을 함께** 알 수 있어야 한다.
+    attempt_durations: tuple[AttemptDurations, ...] = ()
 
     @property
     def rejected_at_least_once(self) -> bool:
@@ -564,6 +576,60 @@ class GoldenOutcome:
             self.escalation_reason is EscalationReason.LLM_CALL_FAILED
             and self.failed_stage == L2_JUDGE_STAGE
         )
+
+
+@dataclass(frozen=True)
+class SpanAggregate:
+    """구간 하나의 세트 집계 — **미측정은 분모에서 뺀다.**
+
+    0 을 섞어 평균 내면 그 구간이 실제보다 빨라 보인다. 그래서 분모는 전체 케이스 수가
+    아니라 **그 구간이 실제로 돈 케이스 수**(`measured_cases`)이고, 돌지 않은 건수는
+    `unmeasured_cases` 로 따로 적어 사람이 분모를 눈으로 확인할 수 있게 둔다.
+
+    한 케이스도 재지 않은 구간의 값은 0 이 아니라 `None`(미측정)이다.
+    """
+
+    span: str
+    measured_cases: int
+    unmeasured_cases: int
+    total_ms: float | None
+    mean_ms: float | None
+    p50_ms: float | None
+    p95_ms: float | None
+
+
+def _span_aggregate(span: str, values: Sequence[float | None]) -> SpanAggregate:
+    """구간 하나를 집계한다. **미측정(`None`)은 분모에도 분자에도 들어가지 않는다.**"""
+    measured = [value for value in values if value is not None]
+    if not measured:
+        return SpanAggregate(
+            span=span,
+            measured_cases=0,
+            unmeasured_cases=len(values),
+            total_ms=None,
+            mean_ms=None,
+            p50_ms=None,
+            p95_ms=None,
+        )
+    total = sum(measured)
+    return SpanAggregate(
+        span=span,
+        measured_cases=len(measured),
+        unmeasured_cases=len(values) - len(measured),
+        total_ms=total,
+        mean_ms=total / len(measured),
+        p50_ms=_percentile_ms(measured, 50),
+        p95_ms=_percentile_ms(measured, 95),
+    )
+
+
+def _percentile_ms(values: Sequence[float], percent: int) -> float | None:
+    """nearest-rank 백분위 — 정수 지연(`_percentile`)과 **같은 규칙**의 실수판이다."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, min(len(ordered), _ceil_div(percent * len(ordered), 100)))
+    return ordered[rank - 1]
 
 
 @dataclass(frozen=True)
@@ -603,6 +669,9 @@ class PipelineAgreement:
     #: (docs/business-rules.md "검색 단계 실패") — 0 이 정상이고, 커지면 재작성 층이
     #: 사실상 꺼진 실행을 정상 실측으로 읽게 된다.
     retrieval_fallback_total: int = 0
+    #: 구간 아홉의 세트 집계. **미측정 케이스는 각 구간의 분모에서 빠진다.**
+    #: 순서는 `evidence.SPAN_NAMES`(파이프라인 실행 순서)와 같다.
+    stage_durations: tuple[SpanAggregate, ...] = ()
 
     @property
     def match_rate(self) -> float | None:
@@ -828,6 +897,8 @@ def evaluate_case(
         retrieval_output_tokens=processed.retrieval_output_tokens,
         retrieval_fallback_reason=processed.retrieval_fallback_reason,
         intent=None if processed.intent is None else processed.intent.value,
+        stage_durations=processed.stage_durations,
+        attempt_durations=tuple(attempt.durations for attempt in processed.attempts),
     )
 
 
@@ -906,6 +977,15 @@ def measure_pipeline_agreement(
         retrieval_fallback_total=sum(
             1 for outcome in outcomes if outcome.retrieval_fallback_reason is not None
         ),
+        stage_durations=_aggregate_stage_durations(outcomes),
+    )
+
+
+def _aggregate_stage_durations(outcomes: Sequence[GoldenOutcome]) -> tuple[SpanAggregate, ...]:
+    """구간 아홉을 세트 단위로 집계한다 — 순서는 구간 이름의 정본 순서 그대로다."""
+    per_case = [outcome.stage_durations.as_mapping() for outcome in outcomes]
+    return tuple(
+        _span_aggregate(span, [values[span] for values in per_case]) for span in SPAN_NAMES
     )
 
 
@@ -989,6 +1069,10 @@ class L2Outcome:
     #: 캐시를 재지 않은 실행에서는 0 이 아니라 `None`(해당 없음/미측정)이다.
     cache_creation_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None
+    #: 판정 호출에 흐른 벽시계(ms) — **형식 재시도와 전송 재시도를 포함한 합산**이다.
+    #: 판정하지 못한 픽스처도 시간은 썼으므로 실패 경로에서도 값이 실린다. 값을 채우지
+    #: 않고 조립한 결과에서는 0 이 아니라 `None`(미측정)이고, 집계 분모에서 빠진다.
+    elapsed_ms: float | None = None
 
     @property
     def judged(self) -> bool:
@@ -1028,6 +1112,9 @@ class JudgeAccuracy:
     #: "캐시가 0 토큰 적중했다"와 "캐시를 잰 적이 없다"는 다른 상태다.
     cache_creation_tokens_total: int | None = None
     cache_read_tokens_total: int | None = None
+    #: 판정 호출 지연의 세트 집계. 지금까지 측정 3 은 지연을 **아예 기록하지 않았다**.
+    #: 미측정 픽스처는 분모에서 빠지고, 한 건도 재지 않았으면 `measured_cases` 가 0 이다.
+    judge_latency: SpanAggregate | None = None
 
     @property
     def judged_total(self) -> int:
@@ -1217,6 +1304,8 @@ def evaluate_judge_fixture(*, fixture: JudgeFixture, judge: Judging) -> L2Outcom
             # 실행됐으나 실패한 호출의 캐시 write 도 실비용이다 — 0 으로 접지 않는다.
             cache_creation_input_tokens=exc.cache_creation_input_tokens,
             cache_read_input_tokens=exc.cache_read_input_tokens,
+            # 판정하지 못한 픽스처도 시간은 썼다 — 토큰과 같은 규칙이다.
+            elapsed_ms=exc.elapsed_ms,
         )
 
     result = outcome.result
@@ -1248,6 +1337,7 @@ def evaluate_judge_fixture(*, fixture: JudgeFixture, judge: Judging) -> L2Outcom
         error=None,
         cache_creation_input_tokens=outcome.cache_creation_input_tokens,
         cache_read_input_tokens=outcome.cache_read_input_tokens,
+        elapsed_ms=outcome.elapsed_ms,
     )
 
 
@@ -1310,6 +1400,8 @@ def measure_judge_accuracy(
             (outcome.cache_read_input_tokens for outcome in outcomes),
             cast(int | None, None),
         ),
+        # 판정 실패한 픽스처의 경과도 분모에 든다 — 그 호출도 판정 층이 쓴 시간이다.
+        judge_latency=_span_aggregate(L2_JUDGE_STAGE, [outcome.elapsed_ms for outcome in outcomes]),
     )
 
 
@@ -1830,6 +1922,61 @@ def _count(value: int | None) -> str:
     return "미실행" if value is None else f"{value}건"
 
 
+def _ms(value: float | None) -> str:
+    """구간 시간 한 칸 — **미측정은 0 이 아니라 "미측정"** 이라고 적는다.
+
+    사람이 읽는 줄과 리포트 JSON 이 **같은 값을 적어야 한다**는 것이 계약이다
+    (커밋된 리포트에서 두 표면이 갈린 전례가 있다). 두 표면이 같은 원본에서 나오고,
+    이 함수가 그 원본을 문자열로 옮기는 유일한 자리다.
+    """
+    return "미측정" if value is None else f"{value:.1f}"
+
+
+def _render_stage_durations(
+    aggregates: Sequence[SpanAggregate], conditions: RunConditions
+) -> list[str]:
+    """단계별 지연 표 — **미측정 케이스는 각 구간의 분모에서 빠진다.**
+
+    구간 아홉을 밖으로 나가는 호출 여섯(의도 분류·질의 재작성·질의 임베딩·조회문 생성·
+    초안 생성·L2 판정)과 코드만 도는 셋(벡터 검색·조회 실행·게이트 판정)으로 가른 것은
+    "어느 단계가 몇 초인지"를 그 경계로 말할 수 있게 하기 위해서다.
+    """
+    lines = [
+        "### 단계별 지연 (구간 아홉)",
+        "",
+        "밖으로 나가는 호출 여섯(의도 분류 · 질의 재작성 · 질의 임베딩 · 조회문 생성 ·",
+        "초안 생성 · L2 판정)과 코드만 도는 셋(벡터 검색 · 조회 실행 · 게이트 판정)이다.",
+        "한 구간의 시간은 그 구간의 **총 벽시계**이고 재시도·형식 실패·예외로 죽은 호출을",
+        "포함한다. **미측정은 0 이 아니다** — 돌지 않은 구간은 분모에서 빠진다(0 을 섞어",
+        "평균 내면 그 구간이 실제보다 빨라 보인다). 재생성이 돈 문의는 초안·게이트·판정",
+        "구간이 시도별로 쌓이고, 시도별 값은 리포트 JSON 의 `attempt_durations` 에 있다.",
+        "",
+    ]
+    if not conditions.measurement2_is_real:
+        lines.extend(
+            [
+                "> **대역 실행에서는 밖으로 나가는 호출 여섯이 0 에 수렴한다** — 대역은",
+                "> 프로세스 밖으로 나가지 않으므로 그 구간이 실제로 0 인 것이지 재지 않은",
+                "> 것이 아니다(미측정은 `미측정` 으로 적힌다). 코드만 도는 셋(벡터 검색 ·",
+                "> 조회 실행 · 게이트 판정)은 대역 실행에서도 실제 값이다.",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "| 구간 | 측정 케이스 | 미측정 | 합계 ms | 평균 ms | p50 ms | p95 ms |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    lines.extend(
+        f"| `{item.span}` | {item.measured_cases} | {item.unmeasured_cases} | "
+        f"{_ms(item.total_ms)} | {_ms(item.mean_ms)} | {_ms(item.p50_ms)} | {_ms(item.p95_ms)} |"
+        for item in aggregates
+    )
+    lines.append("")
+    return lines
+
+
 _LIMITS: Final = """\
 ## 한계 (과장하지 않는다)
 
@@ -2069,6 +2216,7 @@ def _render_measurement_two(
             "| --- | ---: | ---: |",
             *_token_rows(pipeline, conditions),
             "",
+            *_render_stage_durations(pipeline.stage_durations, conditions),
             "### 종결 분포",
             "",
             f"- 최종 상태: {_counts(pipeline.status_counts)}",
@@ -2245,6 +2393,23 @@ def _grand_total(pipeline: PipelineAgreement) -> int:
     )
 
 
+def _judge_latency_lines(accuracy: JudgeAccuracy) -> list[str]:
+    """판정 호출 지연 — 픽스처 측정도 이제 지연을 기록한다.
+
+    **판정하지 못한 픽스처의 경과도 분모에 든다**(그 호출도 판정 층이 쓴 시간이다).
+    한 건도 재지 않은 실행은 0 이 아니라 "미측정"이다.
+    """
+    latency = accuracy.judge_latency
+    if latency is None or latency.measured_cases == 0:
+        return ["- 판정 호출 지연: **미측정** (경과를 기록하지 않은 실행 — 0 이 아니다)"]
+    return [
+        f"- 판정 호출 지연: 평균 {_ms(latency.mean_ms)} ms / "
+        f"p50 {_ms(latency.p50_ms)} ms / p95 {_ms(latency.p95_ms)} ms "
+        f"(측정 {latency.measured_cases}건 / 미측정 {latency.unmeasured_cases}건 — "
+        "재시도와 판정 실패 호출을 포함한 총 벽시계다)"
+    ]
+
+
 def _cache_token_lines(accuracy: JudgeAccuracy) -> list[str]:
     """판정 프롬프트 캐시 계열 — **판정 입력 토큰과 분리해서** 적는다.
 
@@ -2334,6 +2499,7 @@ def _render_measurement_three(
             f"- 판정 토큰: 입력 {accuracy.input_tokens_total} / "
             f"출력 {accuracy.output_tokens_total} "
             f"(픽스처당 {_num(accuracy.tokens_per_fixture)})",
+            *_judge_latency_lines(accuracy),
             *_cache_token_lines(accuracy),
             "",
             "### 사유 2종별 내역",
@@ -2519,6 +2685,19 @@ def _failure_attribution_json(
     }
 
 
+def _span_aggregate_json(item: SpanAggregate) -> dict[str, Any]:
+    """구간 집계 한 줄. **미측정은 0 이 아니라 `null`** 이고 분모는 측정 케이스 수다."""
+    return {
+        "span": item.span,
+        "measured_cases": item.measured_cases,
+        "unmeasured_cases": item.unmeasured_cases,
+        "total_ms": item.total_ms,
+        "mean_ms": item.mean_ms,
+        "p50_ms": item.p50_ms,
+        "p95_ms": item.p95_ms,
+    }
+
+
 def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> dict[str, Any]:
     if isinstance(pipeline, SkippedMeasurement):
         return {"executed": False, "skip_reason": pipeline.reason}
@@ -2540,6 +2719,10 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
         "latency_p95_ms": pipeline.latency_p95_ms,
         #: 검색 단계가 폴백한 문의 수. 인계가 아니라 "재작성 없이 원문으로 돌았다"이다.
         "retrieval_fallback_total": pipeline.retrieval_fallback_total,
+        #: 구간 아홉의 세트 집계. **미측정 케이스는 그 구간의 분모에서 빠지고**,
+        #: 한 건도 재지 않은 구간의 값은 0 이 아니라 `null` 이다. 사람이 읽는 줄
+        #: ("단계별 지연" 표)과 **같은 값**이며 같은 원본에서 나온다.
+        "stage_durations": [_span_aggregate_json(item) for item in pipeline.stage_durations],
         "tokens": {
             "generation_input_total": pipeline.input_tokens_total,
             "generation_output_total": pipeline.output_tokens_total,
@@ -2582,6 +2765,17 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
                 "retrieval_fallback_reason": outcome.retrieval_fallback_reason,
                 # 정책 검색이 돌았는지를 산출물에서 바로 읽게 한다 — 역추론 금지.
                 "intent": outcome.intent,
+                #: 케이스별 구간 시간(ms). 키는 아홉이 항상 있고 미측정은 `null` 이다.
+                "stage_durations": outcome.stage_durations.as_mapping(),
+                #: 시도별 구간. 재생성이 돌면 2건이고, 합계는 위 `stage_durations` 다.
+                "attempt_durations": [
+                    {
+                        "draft_ms": item.draft_ms,
+                        "gate_ms": item.gate_ms,
+                        "l2_judge_ms": item.l2_judge_ms,
+                    }
+                    for item in outcome.attempt_durations
+                ],
                 "matched": outcome.matched,
                 "mismatches": list(outcome.mismatches),
                 "error": outcome.error,
@@ -2635,6 +2829,11 @@ def _measurement_three_json(
             "cache_creation_total": accuracy.cache_creation_tokens_total,
             "cache_read_total": accuracy.cache_read_tokens_total,
         },
+        #: 판정 호출 지연의 세트 집계 — 사람이 읽는 줄과 같은 원본이다. 판정에 실패한
+        #: 픽스처의 경과도 분모에 들고, 한 건도 재지 않았으면 `measured_cases` 가 0 이다.
+        "judge_latency": (
+            None if accuracy.judge_latency is None else _span_aggregate_json(accuracy.judge_latency)
+        ),
         "reason_breakdown": [
             {
                 "reason": item.reason.value,
@@ -2664,6 +2863,8 @@ def _measurement_three_json(
                 "output_tokens": outcome.output_tokens,
                 "cache_creation_input_tokens": outcome.cache_creation_input_tokens,
                 "cache_read_input_tokens": outcome.cache_read_input_tokens,
+                #: 판정 호출에 흐른 벽시계(ms). 판정하지 못한 픽스처도 시간은 썼다.
+                "elapsed_ms": outcome.elapsed_ms,
                 "matched": outcome.reasons_matched,
                 "error": outcome.error,
             }
@@ -2881,3 +3082,8 @@ class _StubCompletion:
     input_tokens: int
     output_tokens: int
     transport_attempts: int = 1
+    #: 대역은 **밖으로 나가지 않으므로 이 값이 0.0 이다** — "재지 않았다"가 아니라
+    #: "밖으로 나간 시간이 0"이라는 측정값이다. 여기서 실제 시계를 재면 대역 산출이
+    #: 비결정론이 되어 `--stub-llm` 실행이 재현되지 않는다(대역 결정론은 이 저장소의
+    #: 계약이고 `tests/test_testing_doubles.py` 가 지킨다).
+    elapsed_ms: float = 0.0

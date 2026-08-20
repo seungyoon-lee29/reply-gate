@@ -7,6 +7,10 @@ docs/standards.md "재시도 상한" 중 **전송 오류 1회 재시도**만 담
 (의도 해석은 1회 재시도, 초안 생성은 재시도 없이 L1 으로 넘김, SQL 생성은 SQL 실패 경로).
 따라서 형식 오류는 `LLMFormatError` 로 올려보내고 호출자가 정책을 적용한다.
 
+**밖으로 나가는 호출의 경과 시간(`elapsed_ms`)을 재서 산출·예외에 함께 싣는다.** 재는 자리는
+전송 재시도 루프의 **바깥**이라 재시도로 날아간 시간이 그 구간에 그대로 든다. 규칙은 토큰과
+같다 — 실행됐으나 실패한 호출의 시간도 그 구간이 쓴 시간이므로 0 으로 접지 않는다.
+
 주의: OpenAI·Anthropic SDK 모두 전송 오류·429·5xx 를 기본 2회 자동 재시도한다. 중첩되면
 docs/standards.md "재시도 상한"의
 "1회 재시도"가 실제로는 최대 6회 전송 시도가 되어 지연·처리 기록이 어긋나므로,
@@ -29,6 +33,7 @@ import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from importlib import import_module
+from time import perf_counter
 from typing import Any, Protocol, cast
 
 import anthropic
@@ -49,6 +54,7 @@ __all__ = [
     "OpenAIEmbeddingClient",
     "OpenAIGenerationClient",
     "OptionalEmbeddingDependencyError",
+    "accumulate_optional_ms",
     "accumulate_optional_tokens",
 ]
 
@@ -79,6 +85,23 @@ def accumulate_optional_tokens(total: int | None, value: int | None) -> int | No
     if value is None:
         return total
     return value if total is None else total + value
+
+
+def accumulate_optional_ms(total: float | None, value: float | None) -> float | None:
+    """구간 시간 누적 — 토큰과 **같은 규칙**이다: 미측정(`None`)을 0 으로 접지 않는다.
+
+    돌지 않은 구간(재작성을 쓰지 않은 문의의 재작성 구간, L2 가 돌지 않은 시도의 판정
+    구간)은 "0 밀리초"가 아니라 **미측정**이다. 0 으로 채우면 집계 평균이 그 구간을 실제
+    보다 빠르게 적고, 리포트가 재지도 않은 축을 잰 것처럼 보인다.
+    """
+    if value is None:
+        return total
+    return value if total is None else total + value
+
+
+def _elapsed_ms(started: float) -> float:
+    """시작 시각(`perf_counter`)부터 지금까지의 벽시계 밀리초."""
+    return max((perf_counter() - started) * 1000.0, 0.0)
 
 
 def _pin_transport_policy[C](client: C, *, timeout: float) -> C:
@@ -122,6 +145,12 @@ class LLMCallError(RuntimeError):
     캐시 계열(`cache_creation_input_tokens`/`cache_read_input_tokens`)은 같은 규칙을 따르되
     **기본값이 0 이 아니라 `None`(해당 없음/미측정)** 이다 — 캐싱을 쓰지 않는 경로에서 0 을
     싣으면 재지 않은 축이 측정값으로 신고된다.
+
+    `elapsed_ms` 는 **이 실패까지 실제로 흐른 벽시계**(밀리초)이고 토큰과 같은 자격이다:
+    예외로 죽은 호출도 시간을 썼고, 재시도한 시도의 시간도 그 구간이 쓴 시간이다. 성공한
+    마지막 호출만 재면 래퍼 재시도 1회가 통째로 사라져, 이 저장소가 토큰 축에서 이미 겪은
+    사고(전송 3회를 `attempts=2` 로 신고)를 지연 축에서 반복한다. 형식 루프를 도는 호출자는
+    토큰·전송 수와 **같은 줄에서** 이 값을 누적한다.
     """
 
     def __init__(
@@ -135,6 +164,7 @@ class LLMCallError(RuntimeError):
         output_tokens: int = 0,
         cache_creation_input_tokens: int | None = None,
         cache_read_input_tokens: int | None = None,
+        elapsed_ms: float = 0.0,
     ) -> None:
         super().__init__(f"LLM 호출 실패 (stage={stage}, reason={reason}, attempts={attempts})")
         self.stage = stage
@@ -145,6 +175,7 @@ class LLMCallError(RuntimeError):
         self.output_tokens = output_tokens
         self.cache_creation_input_tokens = cache_creation_input_tokens
         self.cache_read_input_tokens = cache_read_input_tokens
+        self.elapsed_ms = elapsed_ms
 
 
 class LLMFormatError(ValueError):
@@ -157,6 +188,8 @@ class LLMFormatError(ValueError):
     `transport_attempts` 는 이 형식 오류가 나오기까지 **실제로 나간 전송 수**다. 형식 루프를
     도는 호출자(판정·의도 해석)가 토큰과 **같은 이유로** 누적해야 하는 값이다 — 앞선 시도의
     비용을 세면서 그 시도가 있었다는 사실을 세지 않으면 기록과 실제가 갈린다.
+
+    `elapsed_ms` 도 같은 자격이다 — 형식이 어긋나 버려진 산출도 그만큼 시간을 썼다.
     """
 
     def __init__(
@@ -170,6 +203,7 @@ class LLMFormatError(ValueError):
         transport_attempts: int = 1,
         cache_creation_input_tokens: int | None = None,
         cache_read_input_tokens: int | None = None,
+        elapsed_ms: float = 0.0,
     ) -> None:
         super().__init__(f"구조화 출력 형식 불일치 (stage={stage}): {detail}")
         self.stage = stage
@@ -181,6 +215,7 @@ class LLMFormatError(ValueError):
         #: 캐시 계열은 **0 이 아니라 `None`** 이 미측정이다 (`LLMCallError` 와 같은 규칙).
         self.cache_creation_input_tokens = cache_creation_input_tokens
         self.cache_read_input_tokens = cache_read_input_tokens
+        self.elapsed_ms = elapsed_ms
 
 
 @dataclass(frozen=True)
@@ -196,6 +231,10 @@ class JsonCompletion:
     input_tokens: int
     output_tokens: int
     transport_attempts: int = 1
+    #: 이 산출을 얻기까지 흐른 **벽시계 밀리초 — 전송 재시도를 포함한다.** 성공한 마지막
+    #: 호출만 재면 래퍼 재시도 1회가 통째로 사라진다. 대역이 직접 만드는 산출에서는 0.0
+    #: 이고, 그것은 "재지 않았다"가 아니라 **밖으로 나간 시간이 없다**는 뜻이다.
+    elapsed_ms: float = 0.0
     #: 캐시에 **쓴** 토큰(약 1.25배 단가). 캐싱을 쓰지 않는 provider·응답에서는 `None`
     #: (해당 없음)이고 **0 이 아니다** — 재지 않은 축을 0 으로 신고하지 않기 위해서다.
     cache_creation_input_tokens: int | None = None
@@ -206,10 +245,12 @@ class JsonCompletion:
 
 @dataclass(frozen=True)
 class EmbeddingResult:
-    """임베딩 벡터 목록 + 사용 토큰 수."""
+    """임베딩 벡터 목록 + 사용 토큰 수 + 호출에 흐른 벽시계(전송 재시도 포함)."""
 
     vectors: list[list[float]]
     total_tokens: int
+    #: 질의 임베딩 구간의 시간. 부를 것이 없어 즉시 돌아온 호출은 0.0 이다(측정값이다).
+    elapsed_ms: float = 0.0
 
 
 class GenerationClient(Protocol):
@@ -260,30 +301,46 @@ def _call_with_one_retry[T](
     call: Callable[[], T],
     is_transport_error: Callable[[Exception], bool],
     is_api_error: Callable[[Exception], bool],
-) -> tuple[T, int]:
-    """전송 오류면 1회 재시도, 재실패하면 `LLMCallError`. 결과와 **실제 전송 수**를 돌려준다.
+) -> tuple[T, int, float]:
+    """전송 오류면 1회 재시도, 재실패하면 `LLMCallError`.
+
+    결과와 함께 **실제 전송 수**와 **재시도를 포함한 경과 벽시계(ms)** 를 돌려준다.
 
     전송 오류가 아닌 API 오류(4xx 등)는 재시도해도 결과가 같으므로 즉시 실패시킨다.
     두 경우 모두 호출자에게는 `LLMCallError` 로 보여 인계 사유가 `llm_call_failed` 로 통일된다.
 
     전송 수를 **세어서** 돌려주는 이유: 이 값을 상수(`MAX_ATTEMPTS`)로 되읽으면 "몇 번 돌았나"가
     아니라 "몇 번까지 돌 수 있나"를 신고하게 된다. 호출자가 형식 루프를 돌면 그 차이가 누적된다.
+
+    **경과도 같은 이유로 루프 **바깥**에서 잰다.** 성공한 마지막 `call()` 만 재면 재시도로
+    날아간 시간이 통째로 사라져, 토큰 축에서 이미 겪은 사고(전송 3회를 2회로 신고)를 지연
+    축에서 반복한다. 실패로 끝나는 두 경로도 그때까지 흐른 시간을 예외에 실어 올린다.
     """
+    started = perf_counter()
     last: Exception | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            return call(), attempt
+            result = call()
         except Exception as exc:
             if is_transport_error(exc):
                 last = exc
                 continue
             if is_api_error(exc):
                 raise LLMCallError(
-                    stage=stage, reason="api_error", attempts=attempt, cause=exc
+                    stage=stage,
+                    reason="api_error",
+                    attempts=attempt,
+                    cause=exc,
+                    elapsed_ms=_elapsed_ms(started),
                 ) from exc
             raise
+        return result, attempt, _elapsed_ms(started)
     raise LLMCallError(
-        stage=stage, reason="transport_error", attempts=MAX_ATTEMPTS, cause=last
+        stage=stage,
+        reason="transport_error",
+        attempts=MAX_ATTEMPTS,
+        cause=last,
+        elapsed_ms=_elapsed_ms(started),
     ) from last
 
 
@@ -294,13 +351,14 @@ def _parse_json_completion(
     input_tokens: int,
     output_tokens: int,
     transport_attempts: int = 1,
+    elapsed_ms: float = 0.0,
     cache_creation_input_tokens: int | None = None,
     cache_read_input_tokens: int | None = None,
 ) -> JsonCompletion:
     """구조화 출력 원문을 파싱한다 — 빈 응답·비 JSON 은 `LLMFormatError` (양 래퍼 공통).
 
-    성공하든 형식 오류든 **실제 전송 수를 그대로 실어 보낸다** — 형식 루프를 도는 호출자가
-    토큰과 같은 자격으로 누적한다.
+    성공하든 형식 오류든 **실제 전송 수와 경과를 그대로 실어 보낸다** — 형식 루프를 도는
+    호출자가 토큰과 같은 자격으로 누적한다.
     """
     if not text.strip():
         raise LLMFormatError(
@@ -312,6 +370,7 @@ def _parse_json_completion(
             transport_attempts=transport_attempts,
             cache_creation_input_tokens=cache_creation_input_tokens,
             cache_read_input_tokens=cache_read_input_tokens,
+            elapsed_ms=elapsed_ms,
         )
     try:
         data = json.loads(text)
@@ -325,12 +384,14 @@ def _parse_json_completion(
             transport_attempts=transport_attempts,
             cache_creation_input_tokens=cache_creation_input_tokens,
             cache_read_input_tokens=cache_read_input_tokens,
+            elapsed_ms=elapsed_ms,
         ) from exc
     return JsonCompletion(
         data=data,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         transport_attempts=transport_attempts,
+        elapsed_ms=elapsed_ms,
         cache_creation_input_tokens=cache_creation_input_tokens,
         cache_read_input_tokens=cache_read_input_tokens,
     )
@@ -421,7 +482,7 @@ class OpenAIGenerationClient:
             # `**request` 로 넘기면 오버로드 추론이 풀려 Any 가 되므로 반환 타입을 고정한다.
             return cast(Response, self._client.responses.create(**request))
 
-        response, sent = _call_with_one_retry(
+        response, sent, elapsed = _call_with_one_retry(
             stage=stage,
             call=_call,
             is_transport_error=_is_openai_transport_error,
@@ -443,6 +504,8 @@ class OpenAIGenerationClient:
                 attempts=sent,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                # 거절도 시간을 썼다 — 토큰과 같은 자격으로 올려보낸다.
+                elapsed_ms=elapsed,
             )
 
         text = response.output_text or ""
@@ -452,6 +515,7 @@ class OpenAIGenerationClient:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             transport_attempts=sent,
+            elapsed_ms=elapsed,
         )
 
 
@@ -555,7 +619,7 @@ class AnthropicGenerationClient:
             # `**request` 로 넘기면 오버로드 추론이 풀려 Any 가 되므로 반환 타입을 고정한다.
             return cast(Message, self._client.messages.create(**request))
 
-        response, sent = _call_with_one_retry(
+        response, sent, elapsed = _call_with_one_retry(
             stage=stage,
             call=_call,
             is_transport_error=_is_anthropic_transport_error,
@@ -584,6 +648,7 @@ class AnthropicGenerationClient:
                 output_tokens=output_tokens,
                 cache_creation_input_tokens=cache_creation,
                 cache_read_input_tokens=cache_read,
+                elapsed_ms=elapsed,
             )
 
         # adaptive thinking 이 켜져 있으면 text 블록 앞에 thinking 블록이 올 수 있다 —
@@ -602,6 +667,7 @@ class AnthropicGenerationClient:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             transport_attempts=sent,
+            elapsed_ms=elapsed,
             cache_creation_input_tokens=cache_creation,
             cache_read_input_tokens=cache_read,
         )
@@ -648,7 +714,7 @@ class OpenAIEmbeddingClient:
                 dimensions=self._dimensions,
             )
 
-        response, _ = _call_with_one_retry(
+        response, _sent, elapsed = _call_with_one_retry(
             stage=stage,
             call=_call,
             is_transport_error=_is_openai_transport_error,
@@ -658,6 +724,7 @@ class OpenAIEmbeddingClient:
         return EmbeddingResult(
             vectors=[list(item.embedding) for item in ordered],
             total_tokens=response.usage.total_tokens,
+            elapsed_ms=elapsed,
         )
 
 
@@ -705,6 +772,7 @@ class BgeM3EmbeddingClient:
         del stage
         if not texts:
             return EmbeddingResult(vectors=[], total_tokens=0)
+        started = perf_counter()
         encoded = self._model.encode(list(texts), normalize_embeddings=True)
         tolist = getattr(encoded, "tolist", None)
         raw = tolist() if callable(tolist) else encoded
@@ -718,4 +786,5 @@ class BgeM3EmbeddingClient:
                 raise ValueError("BGE-M3 임베딩 값은 숫자여야 한다")
             vectors.append([float(value) for value in vector])
         # 로컬 추론은 provider 토큰 과금이 없으므로 기존 EmbeddingResult 계약에서 0이다.
-        return EmbeddingResult(vectors=vectors, total_tokens=0)
+        # **시간은 0 이 아니다** — 과금이 없다는 것과 시간을 쓰지 않았다는 것은 다르다.
+        return EmbeddingResult(vectors=vectors, total_tokens=0, elapsed_ms=_elapsed_ms(started))

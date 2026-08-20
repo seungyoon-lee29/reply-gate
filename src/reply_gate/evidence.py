@@ -37,9 +37,10 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from decimal import Decimal
 from enum import StrEnum
+from time import perf_counter
 from typing import Any, Final
 
 import psycopg
@@ -59,10 +60,11 @@ from reply_gate.llm import (
     GenerationClient,
     LLMCallError,
     LLMFormatError,
+    accumulate_optional_ms,
 )
 from reply_gate.order_ref import is_valid_order_no, normalize_order_no
 from reply_gate.policy_index import PolicySearchHit, search_policy_chunks
-from reply_gate.query_rewrite import rewrite_query
+from reply_gate.query_rewrite import QUERY_REWRITE_STAGE, rewrite_query
 from reply_gate.retrieval_strategies import (
     AbstentionGate,
     AbstentionUndefined,
@@ -88,6 +90,10 @@ __all__ = [
     "INTENT_STAGE",
     "INTENT_SYSTEM_PROMPT",
     "ORDER_EXISTS_SQL",
+    "SPAN_GATE",
+    "SPAN_NAMES",
+    "SPAN_POLICY_SEARCH",
+    "SPAN_SQL_EXECUTION",
     "SQL_GENERATION_STAGE",
     "SQL_JSON_SCHEMA",
     "SQL_MAX_ATTEMPTS",
@@ -101,6 +107,7 @@ __all__ = [
     "SqlFailure",
     "SqlFailureKind",
     "SqlGenerationResult",
+    "StageDurations",
     "adopt_policy_hits",
     "build_intent_user_prompt",
     "build_sql_user_prompt",
@@ -141,6 +148,102 @@ SQL_MAX_ATTEMPTS: Final = 2
 
 #: 표시용 `content` 에 싣는 SQL 결과 행 수. 원문 대조용 `evidence_text` 는 자르지 않는다.
 CONTENT_ROW_LIMIT: Final = 10
+
+
+# ── 단계별 지연 구간 아홉 ───────────────────────────────────────────────────
+#
+# 구간을 가르는 기준은 둘이다.
+#
+# * **밖으로 나가는 호출별로 가른다** — 의도 분류 · 질의 재작성 · 질의 임베딩 ·
+#   조회문 생성 · 초안 생성 · L2 판정. 이 여섯은 **호출 래퍼가 잰 값**(`elapsed_ms`)이
+#   산출·예외에 실려 올라오고, 호출자는 토큰과 같은 자리에서 그것을 누적한다. 재시도·형식
+#   실패·예외로 죽은 시도의 시간이 전부 그 구간에 든다.
+# * **코드만 도는 구간도 따로 둔다** — 벡터 검색 · 조회 실행 · 게이트 판정. 이 셋은 밖으로
+#   나가지 않으므로 래퍼가 볼 수 없고, **그 구간을 부르는 쪽이 벽시계로 잰다.**
+#   게이트 판정이 여기 있는 것은 사고가 아니다: L1 게이트 모듈은 시간에 의존하지 않는 것이
+#   하드 게이트라(`docs/standards.md` 하드 게이트 1) 계측을 이유로 그 경계를 넘지 않는다.
+#
+# 여섯 중 넷(의도 분류·재작성·임베딩·조회문 생성)이 이 모듈 안쪽이고, 벡터 검색·조회 실행도
+# 여기 있다 — **아홉 중 여섯이 근거 수집 안쪽**이다. 파이프라인이 근거 수집 호출 하나를
+# 바깥에서 감싸면 그 여섯이 한 칸으로 접힌다. 그래서 계측이 이 모듈 안까지 들어오고,
+# 결과 묶음(`EvidenceCollection`)이 구간 시간을 함께 들고 나온다.
+
+#: 코드만 도는 구간 셋의 이름. **밖으로 나가는 구간 여섯은 단계 이름을 그대로 쓴다**
+#: (`INTENT_STAGE`·`QUERY_REWRITE_STAGE`·`INQUIRY_EMBEDDING_STAGE`·`SQL_GENERATION_STAGE`·
+#: `draft.DRAFT_STAGE`·`pipeline.L2_JUDGE_STAGE`) — 이름을 두 벌로 두면 한쪽만 바뀐다.
+SPAN_POLICY_SEARCH: Final = "policy_search"
+SPAN_SQL_EXECUTION: Final = "sql_execution"
+SPAN_GATE: Final = "gate"
+
+
+@dataclass(frozen=True)
+class StageDurations:
+    """구간별 벽시계(밀리초). **`None` 은 미측정이고 0 과 다르다.**
+
+    돌지 않은 구간(재작성을 쓰지 않은 문의의 재작성 구간, L2 가 돌지 않은 시도의 판정
+    구간, 정책 검색이 아예 돌지 않은 주문 문의의 검색 구간)은 0 이 아니라 미측정이다.
+    0 으로 찍으면 리포트가 거짓말을 한다 — "0 초 만에 검색했다"가 되고, 세트 집계의 평균이
+    그 구간을 실제보다 빠르게 적는다. 집계는 미측정을 **분모에서 뺀다.**
+
+    필드 이름은 구간 이름 + `_ms` 이고, **구간 이름의 정본은 이 자료형이다**
+    (`SPAN_NAMES` 가 여기서 유도된다) — 목록을 손으로 두 벌 관리하지 않는다.
+    """
+
+    intent_ms: float | None = None
+    query_rewrite_ms: float | None = None
+    inquiry_embedding_ms: float | None = None
+    policy_search_ms: float | None = None
+    sql_generation_ms: float | None = None
+    sql_execution_ms: float | None = None
+    draft_ms: float | None = None
+    gate_ms: float | None = None
+    l2_judge_ms: float | None = None
+
+    def as_mapping(self) -> dict[str, float | None]:
+        """구간 이름 → 값. 미측정 구간의 키도 **사라지지 않는다**(값이 `None` 이다)."""
+        return {name: getattr(self, f"{name}_ms") for name in SPAN_NAMES}
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, float | None]) -> StageDurations:
+        return cls(**{f"{name}_ms": values.get(name) for name in SPAN_NAMES})
+
+    def merged(self, other: StageDurations) -> StageDurations:
+        """두 묶음을 구간별로 누적한다 — **미측정을 0 으로 접지 않는다.**"""
+        mine, theirs = self.as_mapping(), other.as_mapping()
+        return StageDurations.from_mapping(
+            {name: accumulate_optional_ms(mine[name], theirs[name]) for name in SPAN_NAMES}
+        )
+
+    @property
+    def measured_total_ms(self) -> float | None:
+        """측정된 구간의 합. 하나도 재지 않았으면 0 이 아니라 `None` 이다.
+
+        이 값은 전체 처리 시간(`pipeline.ProcessedInquiry.latency_ms`)을 **넘을 수 없다** —
+        구간은 전부 처리 창 안쪽에서 재고 서로 겹치지 않는다.
+        """
+        total: float | None = None
+        for value in self.as_mapping().values():
+            total = accumulate_optional_ms(total, value)
+        return total
+
+
+#: 구간 이름 아홉. **`StageDurations` 의 칸에서 유도한다** — 두 벌로 두면 한쪽만 늘어난다.
+SPAN_NAMES: Final[tuple[str, ...]] = tuple(
+    field.name.removesuffix("_ms") for field in fields(StageDurations)
+)
+
+
+@dataclass
+class _SpanLedger:
+    """수집 도중 쌓이는 구간 시간. 미측정은 `None` 으로 남는다."""
+
+    values: dict[str, float | None] = field(default_factory=lambda: dict.fromkeys(SPAN_NAMES, None))
+
+    def add(self, span: str, elapsed_ms: float | None) -> None:
+        self.values[span] = accumulate_optional_ms(self.values[span], elapsed_ms)
+
+    def snapshot(self) -> StageDurations:
+        return StageDurations.from_mapping(self.values)
 
 
 # ── 구조화 출력 스키마 ──────────────────────────────────────────────────────
@@ -264,6 +367,10 @@ class IntentResult:
     output_tokens: int
     error: str | None
     attempts: int
+    #: 의도 분류 구간의 시간(ms) — **형식 재시도와 전송 재시도를 포함한 합산**이다.
+    #: 토큰·전송 수와 같은 자리에서 누적한다. 전송 오류로 죽으면 `LLMCallError.elapsed_ms`
+    #: 가 같은 값을 들고 위로 올라간다.
+    elapsed_ms: float = 0.0
 
 
 def _parse_intent(data: object) -> IntentSource | None:
@@ -290,6 +397,8 @@ def classify_intent(
     output_tokens = 0
     # 실제로 나간 전송 수 — 토큰과 같은 이유로 버리지 않는다(`judge.Judge.judge` 와 같은 형태).
     sent = 0
+    # 경과도 같은 자격이다. 마지막 시도만 재면 형식 실패로 버린 호출의 시간이 사라진다.
+    elapsed_ms = 0.0
     error: str | None = None
     previous_output: str | None = None
 
@@ -313,6 +422,7 @@ def classify_intent(
             input_tokens += exc.input_tokens
             output_tokens += exc.output_tokens
             sent += exc.transport_attempts
+            elapsed_ms += exc.elapsed_ms
             error = exc.detail
             previous_output = exc.raw_text or None
             continue
@@ -327,11 +437,13 @@ def classify_intent(
                 cause=exc.cause,
                 input_tokens=input_tokens + exc.input_tokens,
                 output_tokens=output_tokens + exc.output_tokens,
+                elapsed_ms=elapsed_ms + exc.elapsed_ms,
             ) from exc
 
         input_tokens += completion.input_tokens
         output_tokens += completion.output_tokens
         sent += completion.transport_attempts
+        elapsed_ms += completion.elapsed_ms
         source = _parse_intent(completion.data)
         if source is not None:
             return IntentResult(
@@ -340,6 +452,7 @@ def classify_intent(
                 output_tokens=output_tokens,
                 error=None,
                 attempts=attempt,
+                elapsed_ms=elapsed_ms,
             )
         error = f"source 는 policy·order·both 중 하나여야 한다 (받은 산출: {completion.data!r})"
         previous_output = repr(completion.data)
@@ -350,6 +463,7 @@ def classify_intent(
         output_tokens=output_tokens,
         error=error,
         attempts=INTENT_MAX_ATTEMPTS,
+        elapsed_ms=elapsed_ms,
     )
 
 
@@ -372,6 +486,8 @@ class SqlGenerationResult:
     #: 이 1회 호출에서 실제로 나간 전송 수. 형식 오류로 SQL 을 못 얻어도 전송은 나갔다 —
     #: 재시도 루프가 토큰과 같은 자격으로 누적한다.
     transport_attempts: int = 1
+    #: 이 1회 호출에 흐른 벽시계(ms). 재시도 루프가 조회문 생성 구간으로 누적한다.
+    elapsed_ms: float = 0.0
 
 
 def _extract_sql(data: object) -> str | None:
@@ -419,6 +535,7 @@ def generate_sql(
             output_tokens=exc.output_tokens,
             error=f"구조화 출력 형식 불일치: {exc.detail}",
             transport_attempts=exc.transport_attempts,
+            elapsed_ms=exc.elapsed_ms,
         )
 
     sql = _extract_sql(completion.data)
@@ -428,6 +545,7 @@ def generate_sql(
         output_tokens=completion.output_tokens,
         error=None if sql is not None else "유효한 SQL 문자열을 얻지 못했다",
         transport_attempts=completion.transport_attempts,
+        elapsed_ms=completion.elapsed_ms,
     )
 
 
@@ -731,6 +849,11 @@ class EvidenceCollection:
     #: 돌지 않음 · 통계량이 정의됨. 평가 리포트는 이 값을 그대로 실어 "어느 분기를 몇 건이
     #: 탔나"를 센다.
     abstention_undefined_reason: AbstentionUndefined | None = None
+    #: **근거 수집 안쪽 여섯 구간의 시간.** 파이프라인이 이 호출 하나를 바깥에서 감싸면
+    #: 여섯이 한 칸으로 접히므로, 묶음이 구간 시간을 함께 들고 나온다. 돌지 않은 구간은
+    #: 0 이 아니라 미측정(`None`)이다. 초안·게이트·판정 세 칸은 여기서 늘 미측정이고
+    #: 파이프라인이 채운다.
+    stage_durations: StageDurations = field(default_factory=StageDurations)
 
     @property
     def escalated(self) -> bool:
@@ -756,6 +879,8 @@ class _Ledger:
     #: SQL 생성 루프에서 실제로 나간 전송 수. 전송 오류가 루프 중간에 터지면
     #: `LLMCallError.attempts` 가 이 값을 이어받아야 기록과 실제가 같아진다.
     sql_transport_attempts: int = 0
+    #: 구간별 벽시계. 인계로 끝나도 그때까지 잰 구간은 그대로 결과에 실린다.
+    spans: _SpanLedger = field(default_factory=_SpanLedger)
 
 
 # ── 수집기 ──────────────────────────────────────────────────────────────────
@@ -811,12 +936,19 @@ class EvidenceCollector:
         intent: IntentSource | None = None
 
         try:
-            classification = classify_intent(
-                client=self._client,
-                inquiry=content,
-                order_no=order_no,
-                effort=self._settings.generation_effort,
-            )
+            try:
+                classification = classify_intent(
+                    client=self._client,
+                    inquiry=content,
+                    order_no=order_no,
+                    effort=self._settings.generation_effort,
+                )
+            except LLMCallError as exc:
+                # 예외로 죽은 호출의 경과도 토큰과 같은 자격으로 구간에 든다. 여기서
+                # 원장에 넣지 않으면 아래 공통 처리기가 "어느 구간이 죽었나"를 알 수 없다.
+                ledger.spans.add(INTENT_STAGE, exc.elapsed_ms)
+                raise
+            ledger.spans.add(INTENT_STAGE, classification.elapsed_ms)
             ledger.input_tokens += classification.input_tokens
             ledger.output_tokens += classification.output_tokens
             if classification.source is None:
@@ -886,23 +1018,34 @@ class EvidenceCollector:
         if rewritten is not None and rewritten != content:
             queries.append(rewritten)
 
-        embedding = self._embedder.embed(stage=INQUIRY_EMBEDDING_STAGE, texts=queries)
+        try:
+            embedding = self._embedder.embed(stage=INQUIRY_EMBEDDING_STAGE, texts=queries)
+        except LLMCallError as exc:
+            ledger.spans.add(INQUIRY_EMBEDDING_STAGE, exc.elapsed_ms)
+            raise
+        ledger.spans.add(INQUIRY_EMBEDDING_STAGE, embedding.elapsed_ms)
         ledger.embedding_tokens += embedding.total_tokens
         if not embedding.vectors:
             return
 
-        rankings = [
-            search_policy_chunks(
-                conn=conn,
-                query_vector=vector,
-                top_k=self._settings.vector_top_k,
-                embedding_model=self._embedder.model,
-                embedding_dimensions=self._embedder.dimensions,
-            )
-            # 임베딩 대역이 질의 수보다 적게 돌려주는 경우까지 여기서 감당한다 —
-            # 없는 벡터로 검색하지 않고, 있는 만큼만 합친다.
-            for vector in embedding.vectors[: len(queries)]
-        ]
+        # 벡터 검색은 밖으로 나가지 않는 구간이라 래퍼가 볼 수 없다 — **부르는 쪽이 잰다.**
+        # 질의가 둘이면(원문·재작성) 두 번의 왕복이 한 구간으로 합산된다.
+        search_started = perf_counter()
+        try:
+            rankings = [
+                search_policy_chunks(
+                    conn=conn,
+                    query_vector=vector,
+                    top_k=self._settings.vector_top_k,
+                    embedding_model=self._embedder.model,
+                    embedding_dimensions=self._embedder.dimensions,
+                )
+                # 임베딩 대역이 질의 수보다 적게 돌려주는 경우까지 여기서 감당한다 —
+                # 없는 벡터로 검색하지 않고, 있는 만큼만 합친다.
+                for vector in embedding.vectors[: len(queries)]
+            ]
+        finally:
+            ledger.spans.add(SPAN_POLICY_SEARCH, _span_ms(search_started))
         candidates = merge_policy_rankings(
             original=rankings[0],
             rewritten=rankings[1] if len(rankings) > 1 else (),
@@ -938,6 +1081,9 @@ class EvidenceCollector:
             inquiry=content,
             effort=self._settings.generation_effort,
         )
+        # 재작성을 **시도한** 문의만 이 구간을 갖는다. 스위치가 꺼졌거나 `order` 단독이라
+        # 시도조차 하지 않은 문의는 0 이 아니라 미측정으로 남는다.
+        ledger.spans.add(QUERY_REWRITE_STAGE, outcome.elapsed_ms)
         ledger.retrieval_input_tokens += outcome.input_tokens
         ledger.retrieval_output_tokens += outcome.output_tokens
         if outcome.fallback_reason is not None:
@@ -965,7 +1111,14 @@ class EvidenceCollector:
         if not is_valid_order_no(normalized):
             return EscalationReason.MISSING_ORDER_REF
 
-        if not order_exists(conn=readonly_conn, order_no=normalized):
+        # 존재성 선검사도 코드가 부르는 DB 왕복이라 **조회 실행 구간**에 든다 — 근거가
+        # 되지 않는 쿼리라고 시간이 0 인 것은 아니다.
+        exists_started = perf_counter()
+        try:
+            present = order_exists(conn=readonly_conn, order_no=normalized)
+        finally:
+            ledger.spans.add(SPAN_SQL_EXECUTION, _span_ms(exists_started))
+        if not present:
             # text-to-SQL 에 진입하지 않는다 — 없는 주문에 SQL 을 생성시킬 이유가 없다.
             return EscalationReason.ORDER_NOT_FOUND
 
@@ -1005,7 +1158,8 @@ class EvidenceCollector:
             except LLMCallError as exc:
                 # 앞선 시도에서 이미 나간 전송을 이어 센다 — 토큰을 원장에 누적하면서
                 # 횟수만 버리면 "1회 재시도"라고 적힌 기록이 실제와 갈린다
-                # (`classify_intent`·`judge.Judge.judge` 와 같은 형태).
+                # (`classify_intent`·`judge.Judge.judge` 와 같은 형태). 경과도 같다.
+                ledger.spans.add(SQL_GENERATION_STAGE, exc.elapsed_ms)
                 raise LLMCallError(
                     stage=exc.stage,
                     reason=exc.reason,
@@ -1013,10 +1167,12 @@ class EvidenceCollector:
                     cause=exc.cause,
                     input_tokens=exc.input_tokens,
                     output_tokens=exc.output_tokens,
+                    elapsed_ms=exc.elapsed_ms,
                 ) from exc
             ledger.input_tokens += generation.input_tokens
             ledger.output_tokens += generation.output_tokens
             ledger.sql_transport_attempts += generation.transport_attempts
+            ledger.spans.add(SQL_GENERATION_STAGE, generation.elapsed_ms)
 
             if generation.sql is None:
                 previous_sql = None
@@ -1048,6 +1204,9 @@ class EvidenceCollector:
                 )
                 continue
 
+            # 실행에 실패한 시도의 경과도 같은 구간에 든다 — `finally` 로 재는 이유가
+            # 그것이다(`continue` 로 빠져나가도 이 줄은 돈다). 토큰과 같은 규칙이다.
+            execute_started = perf_counter()
             try:
                 rows = execute_validated_query(conn=readonly_conn, query=query)
             except psycopg.Error as exc:
@@ -1063,6 +1222,8 @@ class EvidenceCollector:
                     )
                 )
                 continue
+            finally:
+                ledger.spans.add(SPAN_SQL_EXECUTION, _span_ms(execute_started))
 
             if rows:
                 self._adopt_sql_evidence(
@@ -1130,7 +1291,13 @@ class EvidenceCollector:
             retrieval_output_tokens=ledger.retrieval_output_tokens,
             retrieval_fallback_reason=ledger.retrieval_fallback_reason,
             abstention_undefined_reason=ledger.abstention_undefined_reason,
+            stage_durations=ledger.spans.snapshot(),
         )
+
+
+def _span_ms(started: float) -> float:
+    """코드만 도는 구간의 벽시계(ms). 밖으로 나가는 구간은 호출 래퍼가 재서 실어 올린다."""
+    return max((perf_counter() - started) * 1000.0, 0.0)
 
 
 def _first_line(exc: BaseException) -> str:
