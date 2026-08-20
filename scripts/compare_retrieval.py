@@ -182,6 +182,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.chunking_grid:
         return _run_chunking(args, parser=parser)
+    rejected = _reject_ignored(
+        args, parser=parser, ignored=_STRATEGY_IGNORED, mode="전략 사다리 비교는 "
+    )
+    if rejected is not None:
+        return rejected
     if args.embedding_axis and not args.live:
         print(
             "검색 비교 실행 실패: --embedding-axis 는 실제 모델을 호출하므로 --live 가 필요하다",
@@ -283,6 +288,31 @@ _CHUNKING_IGNORED: Final = (
     ("--no-abstention-grid", "no_abstention_grid"),
 )
 
+#: 전략 사다리 경로가 **읽지 않는** 인자 — `_CHUNKING_IGNORED` 의 대칭이다.
+#: 한쪽에만 검사를 두면 반대 방향이 그대로 샌다: `--min-containment 0.99` 를 청킹 격자
+#: 없이 주면 exit 0 으로 통과하면서 산출물에 흔적이 하나도 남지 않았다.
+_STRATEGY_IGNORED: Final = (("--min-containment", "min_containment"),)
+
+
+def _reject_ignored(
+    args: argparse.Namespace,
+    *,
+    parser: argparse.ArgumentParser,
+    ignored: tuple[tuple[str, str], ...],
+    mode: str,
+) -> int | None:
+    """기본값과 다르게 준 미소비 인자를 거부한다. 거부하지 않으면 `None`."""
+    given = [name for name, dest in ignored if getattr(args, dest) != parser.get_default(dest)]
+    if not given:
+        return None
+    print(
+        f"검색 비교 실행 실패: {mode}"
+        f"{' · '.join(given)} 를 읽지 않는다 — 조용히 버리면 리포트 조건이 "
+        "실제 실행과 갈린다",
+        file=sys.stderr,
+    )
+    return 2
+
 
 def _run_chunking(args: argparse.Namespace, *, parser: argparse.ArgumentParser) -> int:
     """청킹 축은 다른 축과 섞이지 않는다 — 변수는 청킹 하나뿐이어야 비교가 성립한다."""
@@ -305,17 +335,11 @@ def _run_chunking(args: argparse.Namespace, *, parser: argparse.ArgumentParser) 
         )
         return 2
 
-    ignored = [
-        name for name, dest in _CHUNKING_IGNORED if getattr(args, dest) != parser.get_default(dest)
-    ]
-    if ignored:
-        print(
-            "검색 비교 실행 실패: --chunking-grid 는 "
-            f"{' · '.join(ignored)} 를 읽지 않는다 — 조용히 버리면 리포트 조건이 "
-            "실제 실행과 갈린다",
-            file=sys.stderr,
-        )
-        return 2
+    rejected = _reject_ignored(
+        args, parser=parser, ignored=_CHUNKING_IGNORED, mode="--chunking-grid 는 "
+    )
+    if rejected is not None:
+        return rejected
     try:
         paths = run_chunking_comparison(
             live=bool(args.live),

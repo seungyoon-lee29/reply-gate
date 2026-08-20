@@ -1637,6 +1637,22 @@ def _block_outbound_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "create_connection", _blocked)
 
 
+def _policy_index_provenance() -> list[tuple[str, int, int]]:
+    """적재된 정책 벡터의 출처 분포 — `(모델, 차원, 건수)`.
+
+    `--stub-llm` 실행 전후로 각각 재서 대조한다. 값이 달라졌다는 것은 대역 색인이 공유
+    DB 에 **커밋됐다**는 뜻이고, 그 순간 다음 라이브 실측의 검색이 대역 벡터를 읽는다.
+    """
+    from reply_gate.db import connect
+
+    with connect() as conn:
+        rows = conn.execute(
+            "select embedding_model, embedding_dimensions, count(*) as n "
+            "from policy_chunks group by 1, 2 order by 1, 2"
+        ).fetchall()
+    return [(str(r["embedding_model"]), int(r["embedding_dimensions"]), int(r["n"])) for r in rows]
+
+
 def test_stub_llm_은_L2_켜짐에서도_산출물을_낸다(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2223,7 +2239,17 @@ def test_stub_llm_진입점이_실제_DB_에서_판정_대역까지_배선한다
     monkeypatch.setattr(evaluate, "get_settings", lambda: settings)
     _block_outbound_sockets(monkeypatch)
 
+    # **대역 색인이 공유 DB 에 커밋되면 안 된다.** `--stub-llm` 이 실제 임베딩 26건을 대역으로
+    # 덮어쓴 사고가 보고됐고(`docs/engineering-notes.md` "병렬 작업이 정책 색인을 덮어쓸 수
+    # 있다"), 지금 그것을 막는 것은 `scripts/evaluate.py` 의 `app_conn.rollback()` 한 줄뿐이다.
+    # `with connect(...)` 로 바꾸는 리팩터링 한 번이면 전체 녹색인 채로 색인이 오염된다.
+    before = _policy_index_provenance()
+
     assert evaluate.main(["--stub-llm", "--out-dir", str(tmp_path)]) == 0
+
+    assert _policy_index_provenance() == before, (
+        "`--stub-llm` 이 공유 DB 의 정책 색인을 대역으로 덮었다 — 롤백이 풀렸다"
+    )
 
     payload = json.loads((tmp_path / "evaluation.json").read_text(encoding="utf-8"))
     agreement = payload["measurement_2_pipeline_agreement"]

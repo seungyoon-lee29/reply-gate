@@ -32,8 +32,14 @@ reports/*
 !reports/evaluation-live.json
 !reports/evaluation-live-*.md
 !reports/evaluation-live-*.json
-!reports/retrieval-*.md
-!reports/retrieval-*.json
+# 검색 계열도 **대역과 라이브를 이름이 이미 가른다**(`retrieval-{strategies,chunking}-{stub|live}-…`).
+# `retrieval-*` 로 열어 두면 `--stub-embedding` 한 번이 대역 산출물을 추적 후보로 만들고,
+# 커밋되는 순간 protect-live-reports 훅의 잠금 범위에까지 들어간다. 평가 계열은
+# `evaluation.resolve_report_stem` 이 코드로 막지만 검색 계열에는 그 가드가 없다.
+!reports/retrieval-strategies-live-*.md
+!reports/retrieval-strategies-live-*.json
+!reports/retrieval-chunking-live-*.md
+!reports/retrieval-chunking-live-*.json
 
 # 에디터·OS
 .DS_Store
