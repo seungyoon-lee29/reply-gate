@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import fields, replace
 from typing import Any, cast
 
@@ -28,8 +29,9 @@ import psycopg
 import pytest
 from psycopg.rows import DictRow
 
-from reply_gate import llm
+from reply_gate import evidence, llm
 from reply_gate.api import AttemptOut, InquiryResponse, MetricsOut
+from reply_gate.config import Settings
 from reply_gate.contracts import (
     EscalationReason,
     Evidence,
@@ -51,15 +53,17 @@ from reply_gate.evaluation import (
     report_to_json,
 )
 from reply_gate.evidence import (
+    INQUIRY_EMBEDDING_STAGE,
     INTENT_STAGE,
     SPAN_NAMES,
     SQL_GENERATION_STAGE,
     EvidenceCollector,
+    SqlFailureKind,
     StageDurations,
     classify_intent,
 )
-from reply_gate.judge import JUDGE_STAGE
-from reply_gate.llm import JsonCompletion, LLMCallError, LLMFormatError
+from reply_gate.judge import JUDGE_STAGE, Judge
+from reply_gate.llm import EmbeddingResult, JsonCompletion, LLMCallError, LLMFormatError
 from reply_gate.pipeline import (
     AttemptDurations,
     AttemptRecord,
@@ -79,6 +83,13 @@ from tests.test_evaluation import (
     _processed,
     _report,
 )
+from tests.test_evidence import INQUIRY as EVIDENCE_INQUIRY
+from tests.test_evidence import INQUIRY_ID as EVIDENCE_INQUIRY_ID
+from tests.test_evidence import MISSING_ORDER_NO as EVIDENCE_MISSING_ORDER_NO
+from tests.test_evidence import _client as _evidence_client
+from tests.test_evidence import _collector as _evidence_collector
+from tests.test_judge import DOMESTIC, _all_pass_payload, _RecordingClient
+from tests.test_judge import _draft as _judge_draft
 from tests.test_llm_client import _connection_error, _generation_client, _response
 from tests.test_pipeline import (
     POLICY_EVIDENCE,
@@ -120,6 +131,12 @@ class _Clock:
 
 def _completion(data: Any, *, elapsed_ms: float) -> JsonCompletion:
     return JsonCompletion(data=data, input_tokens=1, output_tokens=1, elapsed_ms=elapsed_ms)
+
+
+def _first_order_no(ro_conn: psycopg.Connection[DictRow]) -> str:
+    row = ro_conn.execute("SELECT order_no FROM orders ORDER BY order_no LIMIT 1").fetchone()
+    assert row is not None, "시딩된 주문이 있어야 한다"
+    return str(row["order_no"])
 
 
 class _QueuedClient:
@@ -455,11 +472,7 @@ def test_주문_경로는_조회문_생성과_조회_실행_구간을_잰다(
     app_conn: psycopg.Connection[DictRow],
     ro_conn: psycopg.Connection[DictRow],
 ) -> None:
-    order_no = str(
-        (ro_conn.execute("SELECT order_no FROM orders ORDER BY order_no LIMIT 1").fetchone() or {})[
-            "order_no"
-        ]
-    )
+    order_no = _first_order_no(ro_conn)
     client = scripted_client(
         {
             INTENT_STAGE: [intent_completion("order")],
@@ -502,6 +515,39 @@ def _agreement_with(durations: list[StageDurations]) -> Any:
         app_conn=cast(psycopg.Connection[DictRow], None),
         readonly_conn=cast(psycopg.Connection[DictRow], None),
     )
+
+
+#: 구간 표의 제목. **가드가 보는 표면을 이 절 하나로 좁힌다.**
+_STAGE_SECTION_TITLE = "### 단계별 지연 (구간 아홉)"
+
+
+def _stage_duration_rows(markdown: str) -> dict[str, str]:
+    """구간 표의 `구간 이름 → 나머지 셀` 을 읽는다 — **그 절 블록 안에서만** 훑는다.
+
+    문서 전체를 훑으면 조건 지문 표의 행(구간 이름을 백틱으로 감싼 첫 칸이 같은 모양이다)에도
+    매치된다. dict 컴프리헨션이라 "뒤에 오는 행이 이긴다"는 **렌더 순서 우연**에 기대게 되고, 절
+    순서가 바뀌면 조용히 다른 셀을 비교하거나 실패한다. 이 저장소가 이미 배운 규칙이 그것
+    이다 — 같은 사고의 다음 변종은 늘 **가드가 안 보는 표면**으로 들어오고, 반대로 가드가
+    너무 넓은 표면을 보면 우연히 맞는다.
+
+    잘라내는 기준은 제목이고, 끝은 다음 절 제목이다. 블록을 못 찾으면 빈 결과를 돌려주므로
+    호출부의 `assert rows` 가 그대로 문다.
+    """
+    block = re.search(
+        rf"^{re.escape(_STAGE_SECTION_TITLE)}$\n(?P<body>.*?)(?=^\#{{2,3}} )",
+        markdown,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if block is None:
+        return {}
+    return {
+        match.group("span"): match.group("cells")
+        for match in re.finditer(
+            r"^\| `(?P<span>[a-z_0-9]+)` \|(?P<cells>.*)\|$",
+            block.group("body"),
+            flags=re.MULTILINE,
+        )
+    }
 
 
 def _aggregate(agreement: Any, span: str) -> SpanAggregate:
@@ -556,12 +602,7 @@ def test_리포트_JSON_과_사람이_읽는_줄이_같은_값을_적는다() ->
     markdown = render_markdown(report)
     payload = report_to_json(report)["measurement_2_pipeline_agreement"]["stage_durations"]
 
-    rows = {
-        match.group("span"): match.group("cells")
-        for match in re.finditer(
-            r"^\| `(?P<span>[a-z_0-9]+)` \|(?P<cells>.*)\|$", markdown, flags=re.MULTILINE
-        )
-    }
+    rows = _stage_duration_rows(markdown)
     assert rows, "구간 표가 비면 이 검사는 아무것도 지키지 않는다"
     for item in payload:
         assert item["span"] in rows, f"{item['span']} 구간이 사람이 읽는 줄에 없다"
@@ -569,6 +610,35 @@ def test_리포트_JSON_과_사람이_읽는_줄이_같은_값을_적는다() ->
         assert cells[0] == str(item["measured_cases"])
         assert cells[1] == str(item["unmeasured_cases"])
         assert cells[3] == ("미측정" if item["mean_ms"] is None else f"{item['mean_ms']:.1f}")
+
+
+def test_구간_표_대조는_그_절_블록만_본다() -> None:
+    """가드가 보는 표면을 좁힌 것이 **실제로 일을 한다**는 증명.
+
+    조건 지문 표도 구간 이름을 백틱으로 감싼 첫 칸을 갖는다(`query_rewrite` · `top_k` 등).
+    문서 전체를 훑으면 그 행들이 함께 걸려, dict 컴프리헨션이 "뒤에 오는 행이 이긴다"는
+    **렌더 순서 우연**으로 통과한다 — 절 순서가 바뀌면 조용히 다른 셀을 비교한다.
+    """
+    report = _report(pipeline=_agreement_with([StageDurations(intent_ms=10.0)]))
+    markdown = render_markdown(report)
+
+    narrowed = _stage_duration_rows(markdown)
+    whole_document = {
+        match.group("span")
+        for match in re.finditer(
+            r"^\| `(?P<span>[a-z_0-9]+)` \|.*\|$", markdown, flags=re.MULTILINE
+        )
+    }
+
+    assert set(narrowed) == set(SPAN_NAMES)
+    # 좁히기가 없으면 조건 지문 표의 행이 함께 걸린다 — 이 차집합이 비면 좁히기가
+    # 아무것도 하지 않는다는 뜻이므로, 그때는 이 검사가 스스로 실패해야 한다.
+    assert whole_document - set(SPAN_NAMES)
+
+
+def test_구간_표_블록을_못_찾으면_대조가_비어_실패한다() -> None:
+    """음성 대조 — 잘라내기가 빗나가면 `assert rows` 가 물도록 빈 결과를 돌려준다."""
+    assert _stage_duration_rows("## 다른 리포트\n\n| `intent` | 1 | 0 |\n") == {}
 
 
 def test_구간_이름_목록은_자료형에서_유도되고_비면_실패한다() -> None:
@@ -745,3 +815,227 @@ def test_질의_재작성_단계_이름은_구간_이름과_같은_자리를_가
     assert QUERY_REWRITE_STAGE in SPAN_NAMES
     assert INTENT_STAGE in SPAN_NAMES
     assert SQL_GENERATION_STAGE in SPAN_NAMES
+
+
+# ── 10. 예외·`finally` 경로의 구간 적재 — 지우면 실패해야 한다 ──────────────
+#
+# 뮤테이션 검사가 이 절을 만들게 했다. 아래 일곱 자리는 **코드는 옳은데 지워도 스위트가
+# 초록**이었다 — 전부 예외 경로이거나 `finally` 라 정상 흐름 검사가 지나가지 않는 자리다.
+# 명세의 행동 계약이 "예외로 죽은 호출의 경과 시간도 토큰과 같은 자격으로 올려보낸다"를
+# 명시하므로, 한 줄만 지워도 아무도 모르는 상태로 두지 않는다. 이 계측 위에서 유료 실측을
+# 산다는 것이 그 규율의 이유다.
+
+
+def _judge_client(outcomes: list[Any]) -> Judge:
+    return Judge(client=cast(llm.GenerationClient, _RecordingClient(outcomes)))
+
+
+def test_판정_구간은_형식_재시도로_버려진_시도의_경과를_합산한다() -> None:
+    """`judge.py` 의 형식 루프 누적 — 마지막 시도만 재면 버려진 호출의 시간이 사라진다."""
+    draft = _judge_draft(("국내 배송은 3일 이내입니다.", (DOMESTIC.id,)))
+    judge = _judge_client(
+        [
+            LLMFormatError(stage=JUDGE_STAGE, detail="빈 응답", raw_text="", elapsed_ms=5.0),
+            JsonCompletion(
+                data=_all_pass_payload(draft),
+                input_tokens=1,
+                output_tokens=1,
+                elapsed_ms=7.0,
+            ),
+        ]
+    )
+
+    outcome = judge.judge(draft=draft, evidence=[DOMESTIC])
+
+    assert outcome.result.verdict is Verdict.PASS
+    assert outcome.elapsed_ms == pytest.approx(12.0)
+
+
+def test_판정이_전송_오류로_죽어도_앞선_형식_시도의_경과가_따라_올라온다() -> None:
+    """토큰 축의 "전송 3회를 2회로 신고" 와 정확히 같은 실패 모양을 지연 축에서 막는다.
+
+    다시 던지는 예외에 **누적분**을 싣지 않고 마지막 예외의 값만 실으면, 형식 실패로
+    버려진 1차의 시간이 통째로 사라지는데 종결 기록은 멀쩡해 보인다.
+    """
+    draft = _judge_draft(("국내 배송은 3일 이내입니다.", (DOMESTIC.id,)))
+    judge = _judge_client(
+        [
+            LLMFormatError(stage=JUDGE_STAGE, detail="빈 응답", raw_text="", elapsed_ms=5.0),
+            LLMCallError(stage=JUDGE_STAGE, reason="transport_error", attempts=2, elapsed_ms=9.0),
+        ]
+    )
+
+    with pytest.raises(LLMCallError) as caught:
+        judge.judge(draft=draft, evidence=[DOMESTIC])
+
+    assert caught.value.elapsed_ms == pytest.approx(14.0)
+
+
+def test_의도_분류가_예외로_죽은_문의도_그_구간을_남긴다() -> None:
+    """근거 수집이 인계로 끝나도 **어느 구간이 죽었는지**가 산출물에 남아야 한다."""
+    client = _evidence_client(
+        {
+            INTENT_STAGE: [
+                LLMCallError(
+                    stage=INTENT_STAGE, reason="transport_error", attempts=2, elapsed_ms=31.0
+                )
+            ]
+        }
+    )
+
+    result = _evidence_collector(client).collect(
+        inquiry_id=EVIDENCE_INQUIRY_ID,
+        content=EVIDENCE_INQUIRY,
+        order_no=None,
+        app_conn=cast(psycopg.Connection[DictRow], None),
+        readonly_conn=cast(psycopg.Connection[DictRow], None),
+    )
+
+    assert result.escalation_reason is EscalationReason.LLM_CALL_FAILED
+    assert result.failed_stage == INTENT_STAGE
+    assert result.stage_durations.intent_ms == pytest.approx(31.0)
+
+
+class _FailingEmbeddingClient:
+    """질의 임베딩이 전송 오류로 죽는 대역 — 경과를 예외에 실어 올린다."""
+
+    def __init__(self, error: LLMCallError) -> None:
+        self._error = error
+
+    @property
+    def model(self) -> str:
+        return "stub:failing"
+
+    @property
+    def dimensions(self) -> int:
+        return 1536
+
+    def embed(self, *, stage: str, texts: Sequence[str]) -> EmbeddingResult:
+        del stage, texts
+        raise self._error
+
+
+def test_질의_임베딩이_예외로_죽은_문의도_그_구간을_남긴다() -> None:
+    client = _evidence_client({INTENT_STAGE: [intent_completion("policy")]})
+    collector = EvidenceCollector(
+        generation_client=cast(llm.GenerationClient, client),
+        embedding_client=_FailingEmbeddingClient(
+            LLMCallError(
+                stage=INQUIRY_EMBEDDING_STAGE,
+                reason="transport_error",
+                attempts=2,
+                elapsed_ms=23.0,
+            )
+        ),
+        settings=Settings(vector_top_k=5, vector_similarity_threshold=0.0, sql_max_rows=50),
+        rewrite_client=cast(llm.GenerationClient, client),
+    )
+
+    result = collector.collect(
+        inquiry_id=EVIDENCE_INQUIRY_ID,
+        content=EVIDENCE_INQUIRY,
+        order_no=None,
+        app_conn=cast(psycopg.Connection[DictRow], None),
+        readonly_conn=cast(psycopg.Connection[DictRow], None),
+    )
+
+    assert result.escalation_reason is EscalationReason.LLM_CALL_FAILED
+    assert result.failed_stage == INQUIRY_EMBEDDING_STAGE
+    assert result.stage_durations.inquiry_embedding_ms == pytest.approx(23.0)
+
+
+@pytest.mark.db
+def test_조회문_생성이_예외로_죽은_문의도_그_구간을_남긴다(
+    app_conn: psycopg.Connection[DictRow], ro_conn: psycopg.Connection[DictRow]
+) -> None:
+    order_no = _first_order_no(ro_conn)
+    client = _evidence_client(
+        {
+            INTENT_STAGE: [intent_completion("order")],
+            SQL_GENERATION_STAGE: [
+                LLMCallError(
+                    stage=SQL_GENERATION_STAGE,
+                    reason="transport_error",
+                    attempts=2,
+                    elapsed_ms=44.0,
+                )
+            ],
+        }
+    )
+
+    result = _evidence_collector(client).collect(
+        inquiry_id=EVIDENCE_INQUIRY_ID,
+        content=EVIDENCE_INQUIRY,
+        order_no=order_no,
+        app_conn=app_conn,
+        readonly_conn=ro_conn,
+    )
+
+    assert result.escalation_reason is EscalationReason.LLM_CALL_FAILED
+    assert result.failed_stage == SQL_GENERATION_STAGE
+    assert result.stage_durations.sql_generation_ms == pytest.approx(44.0)
+
+
+@pytest.mark.db
+def test_주문이_없는_문의도_존재성_선검사의_조회_실행_구간을_남긴다(
+    app_conn: psycopg.Connection[DictRow],
+    ro_conn: psycopg.Connection[DictRow],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """선검사는 근거가 되지 않지만 **코드가 부르는 DB 왕복**이고 시간을 쓴다.
+
+    빼면 `order_not_found` 로 끝난 문의의 DB 시간이 아홉 구간 어디에도 잡히지 않는다.
+    시계를 목으로 고정해 값까지 못박는다 — 실제 벽시계로 재면 CI 가 흔들린다.
+    """
+    monkeypatch.setattr(evidence, "perf_counter", _Clock([0.0, 0.002]))
+    client = _evidence_client({INTENT_STAGE: [intent_completion("order")]})
+
+    result = _evidence_collector(client).collect(
+        inquiry_id=EVIDENCE_INQUIRY_ID,
+        content=EVIDENCE_INQUIRY,
+        order_no=EVIDENCE_MISSING_ORDER_NO,
+        app_conn=app_conn,
+        readonly_conn=ro_conn,
+    )
+
+    assert result.escalation_reason is EscalationReason.ORDER_NOT_FOUND
+    assert result.stage_durations.sql_execution_ms == pytest.approx(2.0)
+
+
+@pytest.mark.db
+def test_실행에_실패한_조회의_경과도_조회_실행_구간에_든다(
+    app_conn: psycopg.Connection[DictRow],
+    ro_conn: psycopg.Connection[DictRow],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`finally` 로 재는 이유 — 성공 경로에서만 재면 실패한 조회의 시간이 사라진다.
+
+    시계 대본은 (선검사 1.0 · 실패한 1차 4.0 · 성공한 2차 8.0) 이고 합은 13.0 이다.
+    `finally` 를 성공 경로로 옮기면 1차의 창이 통째로 빠져 다른 값이 나온다.
+    """
+    monkeypatch.setattr(evidence, "perf_counter", _Clock([0.0, 0.001, 0.100, 0.104, 0.200, 0.208]))
+    order_no = _first_order_no(ro_conn)
+    broken = f"SELECT order_no FROM orders WHERE order_no = '{order_no}' AND quantity = 'abc'"
+    good = f"SELECT order_no, status FROM orders WHERE order_no = '{order_no}'"
+    client = _evidence_client(
+        {
+            INTENT_STAGE: [intent_completion("order")],
+            SQL_GENERATION_STAGE: [
+                _completion({"sql": broken}, elapsed_ms=0.0),
+                _completion({"sql": good}, elapsed_ms=0.0),
+            ],
+        }
+    )
+
+    result = _evidence_collector(client).collect(
+        inquiry_id=EVIDENCE_INQUIRY_ID,
+        content=EVIDENCE_INQUIRY,
+        order_no=order_no,
+        app_conn=app_conn,
+        readonly_conn=ro_conn,
+    )
+
+    # 양성 대조 — 1차가 실제로 실행 단계에서 죽어야 이 검사가 무언가를 지킨다.
+    assert result.sql_failures[0].kind is SqlFailureKind.EXECUTION_ERROR
+    assert result.escalation_reason is None
+    assert result.stage_durations.sql_execution_ms == pytest.approx(13.0)
