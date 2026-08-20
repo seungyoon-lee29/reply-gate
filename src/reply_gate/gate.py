@@ -29,6 +29,7 @@ __all__ = [
     "REASON_ORDER",
     "PiiPattern",
     "evaluate_draft",
+    "fold_for_detection",
     "normalize_digits",
     "normalize_email",
     "normalize_phone",
