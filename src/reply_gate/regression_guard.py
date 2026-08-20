@@ -819,12 +819,9 @@ def compare_run_sets(
             "않고 근거 부분 손실을 판정하지 않는다(라벨 변경은 회귀가 아니라 조건 차이다)."
         )
     if not baseline_evidence_known:
-        unknown.append(
-            "기준선 산출물에 귀인 절이 없다(미산출) — 근거 부분 손실을 판정하지 않는다. "
-            "새 필드는 새 실행부터이므로 기준선을 다시 등재하기 전까지 이 겹은 비어 있다."
-        )
+        unknown.append(_attribution_unknown_note(baseline, side="기준선 산출물"))
     if not candidate_evidence_known:
-        unknown.append("이번 실측에 귀인 절이 없다(미산출) — 근거 부분 손실을 판정하지 않는다.")
+        unknown.append(_attribution_unknown_note(candidate, side="이번 실측"))
     for case_id in sorted(set(baseline.case_ids()) | set(candidate.case_ids())):
         baseline_seen = [run.cases[case_id] for run in baseline.runs if case_id in run.cases]
         candidate_seen = [run.cases[case_id] for run in candidate.runs if case_id in run.cases]
@@ -969,6 +966,27 @@ JUDGING_FINGERPRINT_FIELDS: Final[frozenset[str]] = frozenset(
 )
 
 
+def _attribution_unknown_note(run_set: RunSet, *, side: str) -> str:
+    """귀인 절이 없어 근거 부분 손실을 판정하지 못할 때의 사유 문장.
+
+    **"절이 통째로 없다"와 "절은 있고 미산출 사유가 실려 있다"는 다른 상태다.** 산출물이
+    사유를 들고 있는데도 "옛 산출물이라 필드가 없다"고 적으면 가드가 없는 사실을 보고한다
+    — 실제로 `reports/evaluation-live-l2-{16,17,18,23,24}.md` 가 측정 2 를 `--measurements`
+    로 고르지 않은 실행을 두고 그렇게 적었다. `RunSummary.attribution_reason` 이 그 자리를
+    위해 파싱돼 있었는데 아무도 읽지 않았다.
+    """
+    reasons = sorted({run.attribution_reason for run in run_set.runs if run.attribution_reason})
+    if reasons:
+        return (
+            f"{side}의 귀인 절이 미산출이다 — 근거 부분 손실을 판정하지 않는다. "
+            f"사유: {' · '.join(reasons)}"
+        )
+    return (
+        f"{side}에 귀인 절이 없다(미산출) — 근거 부분 손실을 판정하지 않는다. "
+        "새 필드는 새 실행부터이므로 기준선을 다시 등재하기 전까지 이 겹은 비어 있다."
+    )
+
+
 def _labels_comparable(*, baseline: RunSet, candidate: RunSet) -> bool:
     """두 세트의 검색 정답 라벨 판이 같다고 말할 수 있는가.
 
@@ -998,7 +1016,18 @@ def _measurement3_note(*, baseline: RunSet, candidate: RunSet) -> str:
         "발동시키면 안 되기 때문이다."
     )
     values = f"기준선 {_rate(before)} / 이번 {_rate(after)}"
-    if before is None or after is None:
+    # **미실행과 미상은 다르다.** 둘 다 값이 없지만, 전자는 그 산출물에 측정 3 절이 없다는
+    # 뜻이고 후자는 실행했는데 값을 못 냈거나 세트 안에서 흔들렸다는 뜻이다. 한 문장으로
+    # 뭉치면 리포트가 "미상"이라고 적으면서 실제로는 아예 안 돌린 세트를 가리킨다 —
+    # 귀인 절에서 이미 같은 사고를 한 번 냈다(`_attribution_unknown_note`).
+    unrun = tuple(
+        side
+        for side, runs in (("기준선", baseline.runs), ("이번 실측", candidate.runs))
+        if not all(run.measurement3_executed for run in runs)
+    )
+    if unrun:
+        state = f"{' · '.join(unrun)} 에 측정 3 을 실행하지 않은 산출물이 있어 대조하지 않았다"
+    elif before is None or after is None:
         state = "한쪽이 미상이거나 세트 안에서 흔들려 대조하지 않았다"
     elif before == after:
         state = "두 세트의 값이 같다"

@@ -30,6 +30,7 @@ __all__ = [
     "JudgeResult",
     "RejectReason",
     "Verdict",
+    "is_policy_evidence_id",
     "policy_evidence_id",
     "sql_evidence_id",
 ]

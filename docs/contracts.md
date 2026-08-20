@@ -43,8 +43,8 @@ HTTP 엔드포인트 4개가 외부 표면의 전부다. 인증은 없다.
   "answer": null,
   "claims": [],
   "citations": [ { "id": "policy:support:4-1", "source": "policy", "content": "조항 텍스트 또는 쿼리+결과 요약" },
-                 { "id": "policy:shipping:1-2", "source": "policy", "content": "조항 텍스트" },
-                 { "id": "policy:shipping:3-1", "source": "policy", "content": "조항 텍스트" } ],
+                 { "id": "policy:shipping:1-3", "source": "policy", "content": "조항 텍스트" },
+                 { "id": "policy:shipping:1-4", "source": "policy", "content": "조항 텍스트" } ],
   "attempts": [
     { "verdict": "reject", "reject_reasons": ["missing_citation"],
       "l1": { "verdict": "reject", "reject_reasons": ["missing_citation"] },
@@ -55,8 +55,8 @@ HTTP 엔드포인트 4개가 외부 표면의 전부다. 인증은 없다.
               "reject_reasons": ["unsupported_claim"],
               "claim_judgments": [ { "claim_text": "답변 문장 1개", "verdict": "reject",
                                      "explanation": "인용 조항이 이 주제를 다루지 않는다" } ],
-              "contradictions": [ { "evidence_id_a": "policy:shipping:1-2",
-                                    "evidence_id_b": "policy:shipping:3-1",
+              "contradictions": [ { "evidence_id_a": "policy:shipping:1-3",
+                                    "evidence_id_b": "policy:shipping:1-4",
                                     "explanation": "같은 사안에 다른 기준을 말한다" } ] } }
   ],
   "escalation_reason": "rejected_twice",

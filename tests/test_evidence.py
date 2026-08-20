@@ -17,6 +17,7 @@ from psycopg.rows import DictRow
 from reply_gate.config import Settings
 from reply_gate.contracts import (
     EscalationReason,
+    Evidence,
     EvidenceSource,
     IntentSource,
     RejectReason,
@@ -609,6 +610,83 @@ def test_출력_별칭_이름에_심은_PII도_allowlist_근거가_되지_않는
 
     assert "010-9999-9999" in content
     assert "010-9999-9999" not in evidence_text
+
+
+@pytest.mark.parametrize(
+    ("표기", "value"),
+    [
+        pytest.param(
+            "전각",
+            "\uff10\uff11\uff10-\uff19\uff19\uff19\uff19-\uff18\uff18\uff18\uff18",
+            id="전각_숫자",
+        ),
+        pytest.param("제로폭", "010-9999\u200b-8888", id="제로폭_삽입"),
+        pytest.param("호환_하이픈", "010\uff0d9999\uff0d8888", id="전각_하이픈"),
+    ],
+)
+def test_접어야_PII가_되는_계산_결과도_evidence_text에서_배제한다(표기: str, value: str) -> None:
+    """게이트와 **같은 접기**를 걸고 걸러야 allowlist 가 오염되지 않는다.
+
+    접기 전으로 보면 이 값들은 정규식에 안 걸려 계산 컬럼인데도 `evidence_text` 로 넘어간다.
+    게이트는 근거를 접어서 대조하므로 그 순간 반각 `01099998888` 이 allowlist 에 오른다.
+    """
+    _, evidence_text = _sql_evidence_texts(
+        sql=f"SELECT '{value}' AS customer_phone FROM orders",
+        rows=({"customer_phone": value},),
+        pii_safe_output_columns=(),
+    )
+
+    assert evidence_text == "1) ", (표기, evidence_text)
+
+
+def test_접기_우회_근거는_지어낸_반각_번호의_출처가_되지_않는다() -> None:
+    """두 층을 실제로 이어 붙인 대조 — 27-1 이 뚫렸던 경로 그대로다.
+
+    초안은 ASCII `010-9999-8888` 로 고정하고 **근거 표기만** 전각으로 바꾼다. 근거 렌더가
+    접기 전으로 거르면 전각 값이 `evidence_text` 에 남고, 게이트가 그것을 접어 초안의
+    반각 번호와 일치시켜 `pass` 를 낸다 — 지어낸 번호가 통과한다.
+    """
+    fabricated = "010-9999-8888"
+    fullwidth = "\uff10\uff11\uff10-\uff19\uff19\uff19\uff19-\uff18\uff18\uff18\uff18"
+    _, evidence_text = _sql_evidence_texts(
+        sql=f"SELECT '{fullwidth}' AS customer_phone FROM orders",
+        rows=({"customer_phone": fullwidth},),
+        pii_safe_output_columns=(),
+    )
+    evidence = Evidence(
+        id="sql:1",
+        source=EvidenceSource.SQL,
+        content="표시용",
+        evidence_text=evidence_text,
+    )
+
+    result = evaluate_draft(
+        raw_draft={
+            "claims": [{"text": f"연락처는 {fabricated} 입니다", "citation_ids": ["sql:1"]}]
+        },
+        evidences=(evidence,),
+    )
+
+    assert result.verdict is Verdict.REJECT
+    assert RejectReason.PII_DETECTED in result.reject_reasons
+
+
+def test_직접_컬럼_provenance는_접기와_무관하게_정상_에코를_보존한다() -> None:
+    """접기는 **탐지에만** 건다 — 승인된 컬럼의 값은 문면 그대로 남아야 한다."""
+    _, evidence_text = _sql_evidence_texts(
+        sql="SELECT customer_phone FROM orders",
+        rows=(
+            {
+                "customer_phone": "\uff10\uff11\uff10-\uff11\uff12\uff13\uff14-\uff15\uff16\uff17\uff18"
+            },
+        ),
+        pii_safe_output_columns=("customer_phone",),
+    )
+
+    assert (
+        evidence_text
+        == "1) customer_phone=\uff10\uff11\uff10-\uff11\uff12\uff13\uff14-\uff15\uff16\uff17\uff18"
+    )
 
 
 def test_SQL_계산_결과가_비PII면_L2용_evidence_text에_계속_남긴다() -> None:

@@ -533,15 +533,60 @@ def test_같은_사유는_중복되지_않는다() -> None:
 # ── LLM 호출 0회 보증 ────────────────────────────────────────────────────────
 
 
-def test_게이트는_LLM_네트워크_시간_난수_모듈을_import_하지_않는다() -> None:
-    """L1 은 LLM 호출 0회이고 100% 재현 가능해야 한다 — 구조로 못박는다."""
-    source = pathlib.Path(gate.__file__).read_text(encoding="utf-8")
-    imported: set[str] = set()
+def _gate_imports(source: str) -> tuple[set[str], set[str]]:
+    """`(최상위 패키지 이름, 이 패키지 안에서 부른 모듈 전체 경로)`.
+
+    **최상위 이름만 모으면 안 된다.** `from reply_gate.llm import JudgeClient` 는 최상위가
+    `reply_gate` 라 금지 집합에 걸리지 않는데, `llm.py` 는 최상위에서 `anthropic`·`openai`
+    를 부른다 — 게이트가 그 한 줄로 LLM 에 닿는다. 그래서 자기 패키지 안쪽은 **전체 경로**
+    로 따로 모아 불변식 1(잎 노드)로 검사한다. `ast.walk` 라 함수 안의 지연 import 도 본다.
+    """
+    top: set[str] = set()
+    internal: set[str] = set()
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
-            imported.update(alias.name.split(".")[0] for alias in node.names)
+            for alias in node.names:
+                top.add(alias.name.split(".")[0])
+                if alias.name.split(".")[0] == _PACKAGE:
+                    internal.add(alias.name)
         elif isinstance(node, ast.ImportFrom) and node.module is not None:
-            imported.add(node.module.split(".")[0])
+            top.add(node.module.split(".")[0])
+            if node.module.split(".")[0] == _PACKAGE:
+                internal.add(node.module)
+    return top, internal
+
+
+_PACKAGE = "reply_gate"
+#: 불변식 1 — `gate.py` 는 잎 노드다. 이 패키지에서 부를 수 있는 것은 계약 하나뿐이다.
+_ALLOWED_INTERNAL_IMPORTS = {"reply_gate.contracts"}
+
+
+def test_게이트는_자기_패키지에서_계약_외의_모듈을_import_하지_않는다() -> None:
+    """불변식 1(잎 노드) — 여기가 열리면 하드 게이트 1 이 한 줄로 깨진다.
+
+    `from reply_gate.llm import …` 한 줄이면 게이트가 LLM SDK 에 닿는데, 최상위 이름만
+    보는 검사는 그것을 `reply_gate` 로 읽어 통과시킨다. 실제로 그 구멍이 있었다.
+    """
+    _top, internal = _gate_imports(pathlib.Path(gate.__file__).read_text(encoding="utf-8"))
+    assert internal, "검사 대상이 비면 이 가드는 아무것도 지키지 않는다"
+    assert internal <= _ALLOWED_INTERNAL_IMPORTS
+
+
+def test_잎_노드_검사가_패키지_내부_우회를_실제로_잡는다() -> None:
+    """음성 대조 — 검사기가 무언가를 잡는다는 것을 같은 파일이 증명한다."""
+    _top, internal = _gate_imports(
+        "from reply_gate.contracts import Claim\n"
+        "def f():\n"
+        "    from reply_gate.llm import JudgeClient\n"
+        "    return JudgeClient\n"
+    )
+    assert internal == {"reply_gate.contracts", "reply_gate.llm"}
+    assert not (internal <= _ALLOWED_INTERNAL_IMPORTS)
+
+
+def test_게이트는_LLM_네트워크_시간_난수_모듈을_import_하지_않는다() -> None:
+    """L1 은 LLM 호출 0회이고 100% 재현 가능해야 한다 — 구조로 못박는다."""
+    imported, _internal = _gate_imports(pathlib.Path(gate.__file__).read_text(encoding="utf-8"))
 
     forbidden = {
         "anthropic",

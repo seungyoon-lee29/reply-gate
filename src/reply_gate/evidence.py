@@ -53,7 +53,7 @@ from reply_gate.contracts import (
     IntentSource,
     sql_evidence_id,
 )
-from reply_gate.gate import DEFAULT_PII_PATTERNS
+from reply_gate.gate import DEFAULT_PII_PATTERNS, fold_for_detection
 from reply_gate.llm import (
     EmbeddingClient,
     GenerationClient,
@@ -511,7 +511,18 @@ def _sql_evidence_texts(
     safe_names = frozenset(pii_safe_output_columns)
 
     def _pii_shaped(text: str) -> bool:
-        return any(pattern.regex.search(text) for pattern in DEFAULT_PII_PATTERNS)
+        """탐지 전용 — 게이트와 **같은 접기**를 걸고 본다. 렌더는 원문을 유지한다.
+
+        게이트(`_normalized_matches`)는 접은 뒤 대조하는데 여기서 접기 전으로 걸러내면,
+        전각 숫자·제로폭 삽입처럼 **접기 전엔 PII 가 아니고 접은 뒤엔 PII 인** 계산 컬럼
+        값이 `evidence_text` 로 살아남는다. 게이트가 그것을 접어 반각 번호로 만드는 순간
+        지어낸 번호가 allowlist 근거가 된다. 두 층의 기준은 같아야 한다.
+
+        접기는 판정에만 쓰고 값을 갈아 끼우지 않는다 — 근거 문면을 바꾸면 정상 에코 계약과
+        L2 근거가 함께 흔들린다.
+        """
+        folded = fold_for_detection(text)
+        return any(pattern.regex.search(folded) for pattern in DEFAULT_PII_PATTERNS)
 
     evidence_rows = tuple(
         {
@@ -868,7 +879,7 @@ class EvidenceCollector:
 
         **폴백은 인계가 아니다**(docs/business-rules.md "검색 단계 실패"). 다만 조용히
         지나가지도 않는다 — 사유와 실비용 토큰이 원장에 남아 처리 기록·평가 리포트로
-        흘러간다(하드 게이트 4).
+        흘러간다(docs/business-rules.md "조용한 폴백은 금지한다").
         """
         if not self._settings.query_rewrite_enabled:
             return None

@@ -33,8 +33,10 @@ self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
 있고, text-to-SQL 이 실수로 앱 계정 커넥션을 집을 수 없다. 커넥션을 여는 곳은 `api.py` 와
 실행 스크립트뿐이다.
 
-`gate.py` 는 `contracts.py` 만 부르는 잎 노드이고, `contracts.py`·`llm.py`·`order_ref.py`·
-`config.py` 는 이 패키지의 어떤 모듈도 부르지 않는다. `judge.py` 는 `contracts.py`·`llm.py`
+`gate.py` 는 `contracts.py` 만 부르는 잎 노드이고, `contracts.py`·`llm.py`·`order_ref.py` 는
+이 패키지의 어떤 모듈도 부르지 않는다. `config.py` 가 `retrieval_strategies.py` 를 부르는 것은
+**자료형 때문**이다 — 채택 축 구성이 쓰는 `AbstentionGate`·`AbstentionStatistic` 의 정의가
+거기 있다. `judge.py` 는 `contracts.py`·`llm.py`
 만 부르고 **`gate.py` 를 부르지 않는다** — 두 층은 서로를 모르고, 층을 결합하는 것은
 `pipeline.py` 뿐이다.
 
@@ -44,7 +46,7 @@ self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
 
 | 모듈 | 역할 | 의존 |
 |---|---|---|
-| `api.py` | HTTP 표면 4개, 응답 스키마 조립, 웹 폼 서빙, **커넥션 2개 개방** | config, contracts, db, llm, pipeline, records |
+| `api.py` | HTTP 표면 4개, 응답 스키마 조립, 웹 폼 서빙, **커넥션 2개 개방** | config, contracts, db, llm, pipeline, policy_index, records |
 | `pipeline.py` | 접수 검증 → 근거 수집 → 초안 → L1 → L2 → 종결. **재생성 상한과 층 결합을 강제하는 곳** | config, contracts, draft, evidence, gate, judge, llm, order_ref |
 | `evidence.py` | 의도 분류(LLM) · 질의 재작성 조율 · 정책 검색 · **근거 채택(기권 게이트 → 절대 하한)** · 주문 존재성 선검사 · text-to-SQL 조율 | config, contracts, gate, llm, order_ref, policy_index, query_rewrite, retrieval_strategies, sql_guard |
 | `sql_guard.py` | 생성된 SQL 을 실행 전에 파싱·검증. 화이트리스트·주문 범위·함수·잠금절 | order_ref |
@@ -63,9 +65,9 @@ self-judging bias 를 구조로 막기 위해서다(`tracking/decisions/0004`).
 | `retrieval_eval.py` | 오프라인 검색 비교 하네스 — 전략 사다리·컷 스윕·기권 게이트 격자·청킹 격자 | adoption_axis, config, evaluation, llm, policy_index, retrieval_labels, retrieval_strategies, testing |
 | `adoption_axis.py` | 채택 축 손계산 — 커밋된 검색 산출물만 읽는 오프라인 채점자 | (없음) |
 | `regression_guard.py` | 회귀 판정 — 이중 기준선 대조(승격=구속 / 직전 라이브=경보), 조건 지문, 비악화 두 겹 | (없음 — 입력은 리포트 JSON 그대로다) |
-| `evaluation.py` | 측정 1(픽스처)·측정 2(골든셋)·측정 3(판정 픽스처) 산출, 리포트 생성 | contracts, gate, judge, llm, pipeline, regression_guard |
+| `evaluation.py` | 측정 1(픽스처)·측정 2(골든셋)·측정 3(판정 픽스처) 산출, 리포트 생성 | contracts, gate, judge, llm, pipeline, query_rewrite, regression_guard, retrieval_labels |
 | `testing.py` | 결정론 대역 — 어휘 임베딩·판정(`StubJudge`)·대역 파이프라인 조립기 | config, contracts, draft, evidence, judge, llm, pipeline |
-| `config.py` | 환경 변수 설정, DSN 조립, **채택 축 구성(컷·`top_k`·기권 게이트)** 소유 | (없음) |
+| `config.py` | 환경 변수 설정, DSN 조립, **채택 축 구성(컷·`top_k`·기권 게이트)** 소유 | retrieval_strategies |
 
 `records.py` 가 `pipeline`·`evidence` 를 부르는 것은 **자료형 때문**이다 — 저장 대상인
 `ProcessedInquiry`·근거 스냅샷의 정의가 거기 있다. 반대 방향(파이프라인이 저장을 부르는 것)은
