@@ -123,10 +123,10 @@
 |---|---|---|
 | `generation_input/output` | 의도 해석 + SQL 생성 + 초안 생성 | `gpt-5.6-terra` $2.00 / $12.00 |
 | `generation_cache_read` | 위 호출들의 캐시 적중분 — **`generation_input` 안에 포함** | `gpt-5.6-terra` 캐시된 입력 $0.20 |
-| `generation_cache_creation` | 위 호출들의 캐시 기록분 | **출처 미확인** (출처 표에 열이 없다) |
+| `generation_cache_creation` | 위 호출들의 캐시 기록분 — **`generation_input` 안에 포함** | **출처 미확인** (출처 표에 열이 없다) |
 | `retrieval_input/output` | 검색 단계의 질의 재작성 | `gpt-5.6-terra` $2.00 / $12.00 |
 | `retrieval_cache_read` | 재작성 호출의 캐시 적중분 — **`retrieval_input` 안에 포함** | `gpt-5.6-terra` 캐시된 입력 $0.20 |
-| `retrieval_cache_creation` | 재작성 호출의 캐시 기록분 | **출처 미확인** (같은 이유) |
+| `retrieval_cache_creation` | 재작성 호출의 캐시 기록분 — **`retrieval_input` 안에 포함** | **출처 미확인** (같은 이유) |
 | `embedding_total` | 문의·재작성 질의 임베딩 | `text-embedding-3-small` $0.02 |
 | `judge_input/output` | L2 판정 | 그 세트의 `judge_model` 지문 값 |
 | `cache_creation_total` / `cache_read_total` (측정 3) | L2 판정의 캐시 write/read — **`judge_input` 밖** | 그 세트 `judge_model` 의 캐시 단가 |
@@ -398,5 +398,8 @@ L1 을 통과해 판정을 부른 시도다.
   닫는 것은 남아 있다.**
 - **캐시 write 단가.** OpenAI 출처 표에 그 열이 없어 `*_cache_creation` 행이 "출처 미확인"
   이다(1절). 토큰은 실측이고 달러만 비어 있다 — 벤더가 노출하면 기준일과 함께 채운다.
+  ⚠ **채울 때 더하지 마라.** OpenAI 의 write 토큰도 `input_tokens` 의 내역이라 위 환산식이
+  이미 정가로 세고 있다 — 별도 항으로 더하면 같은 토큰을 두 번 센다. 별도 단가가 생기면
+  `(입력 − 캐시 read − 캐시 write)` 로 **빼낸 뒤** 곱해야 한다.
 - **파생 비율 재계산.** 2·4절의 점유율·배수·절감률은 아직 **옛 상한**에서 계산된 값이다.
   캐시를 반영한 새 실측이 나오면 재계산하거나 조건을 붙인다("상한과 실측을 가른다" 규칙 2).
