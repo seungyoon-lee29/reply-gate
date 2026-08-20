@@ -456,6 +456,7 @@ def _fingerprint(settings: Settings) -> dict[str, str]:
     args = argparse.Namespace(
         golden_set=_ROOT / "data" / "golden_set.jsonl",
         judge_fixtures=_ROOT / "data" / "judge_fixtures.jsonl",
+        l1_fixtures=_ROOT / "data" / "l1_fixtures.jsonl",
         stub_llm=False,
     )
     return evaluate._condition_fingerprint(args=args, settings=settings, run_settings=settings)

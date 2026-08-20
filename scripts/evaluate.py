@@ -606,6 +606,7 @@ def main(argv: list[str] | None = None) -> int:
 
     judge_accuracy: JudgeAccuracy | SkippedMeasurement
     measurement3_is_real = False
+    measurement3_aborted = False
     if judge_skip is not None:
         print(f"측정 3 — 미실행: {judge_skip}")
         judge_accuracy = SkippedMeasurement(reason=judge_skip)
@@ -622,6 +623,7 @@ def main(argv: list[str] | None = None) -> int:
             aborted = f"측정 3 이 중단됐다: {type(error).__name__}: {error}"
             print(f"측정 3 — 중단: {aborted}")
             judge_accuracy = SkippedMeasurement(reason=aborted)
+            measurement3_aborted = True
             interrupted = interrupted or isinstance(error, KeyboardInterrupt)
         else:
             measurement3_is_real = True
@@ -681,6 +683,14 @@ def main(argv: list[str] | None = None) -> int:
         # 선언된 실험 변인은 **실행이 명시**한다 — 코드가 추측하지 않는다. 선언되지 않은
         # 지문 불일치는 "대조 불가"로 남고, 그것이 조용한 조건 드리프트를 잡는 자리다.
         declared_experiment_fields=tuple(args.declare_experiment or ()),
+        # **중단은 기계가 읽는 조건에도 남는다.** 위 세 설명 문자열의 꼬리표와 같은 변수를
+        # 읽는다 — 같은 사실을 두 경로로 만들면 언젠가 갈린다. 선검사에 걸려 처음부터 안 돈
+        # 측정은 여기 들지 않는다(그건 `measurement_scope` 가 든다).
+        aborted_measurements=tuple(
+            name
+            for name, hit in (("측정 2", measurement2_aborted), ("측정 3", measurement3_aborted))
+            if hit
+        ),
     )
     report: EvaluationReport = build_report(
         conditions=conditions,
@@ -803,6 +813,9 @@ def _condition_fingerprint(
         "judge_effort": run_settings.judge_effort or "기본값",
         "judge_prompt_version": text_digest(JUDGE_SYSTEM_PROMPT, prefix="judge-"),
         "judge_fixture_version": content_digest(args.judge_fixtures, prefix="fixture-") or "미상",
+        # **L1 채점표의 판.** 측정 1 의 분모가 여기서 정해진다 — 픽스처가 늘거나 줄면 같은
+        # 코드가 다른 검출률·오탐률을 내고, 지문에 없으면 그 차이가 회귀로 읽힌다.
+        "l1_fixture_version": content_digest(args.l1_fixtures, prefix="l1fixture-") or "미상",
         # 판정 프롬프트 캐싱. **하드코딩으로 두면 캐싱을 켜도 지문이 거짓말을 한다** —
         # 판정자를 조립하는 것과 같은 설정(`run_settings`)에서 읽는다.
         "judge_prompt_caching": "on" if run_settings.judge_prompt_caching_enabled else "off",
