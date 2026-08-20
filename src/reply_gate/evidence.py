@@ -53,7 +53,7 @@ from reply_gate.contracts import (
     IntentSource,
     sql_evidence_id,
 )
-from reply_gate.gate import DEFAULT_PII_PATTERNS, fold_for_detection
+from reply_gate.gate import pii_shaped
 from reply_gate.llm import (
     EmbeddingClient,
     GenerationClient,
@@ -506,29 +506,24 @@ def _sql_evidence_texts(
     `SELECT status AS "010-9999-9999"` 처럼 이름 자리에 값을 심을 수 있고, 이름이
     `key=value` 로 렌더되는 순간 allowlist 근거가 된다. 스키마 컬럼 이름은 PII 패턴에
     걸리지 않으므로, 걸리는 이름은 별칭이라는 뜻이다.
+
+    **"개인정보 모양"의 정의는 게이트가 단독 소유한다**(`gate.pii_shaped`). 이 필터는
+    그것을 부르기만 한다 — 패턴 집합도 접기도 여기서 다시 정의하지 않는다.
     """
     header = f"실행 쿼리: {sql}\n결과 {len(rows)}건"
     safe_names = frozenset(pii_safe_output_columns)
 
-    def _pii_shaped(text: str) -> bool:
-        """탐지 전용 — 게이트와 **같은 접기**를 걸고 본다. 렌더는 원문을 유지한다.
-
-        게이트(`_normalized_matches`)는 접은 뒤 대조하는데 여기서 접기 전으로 걸러내면,
-        전각 숫자·제로폭 삽입처럼 **접기 전엔 PII 가 아니고 접은 뒤엔 PII 인** 계산 컬럼
-        값이 `evidence_text` 로 살아남는다. 게이트가 그것을 접어 반각 번호로 만드는 순간
-        지어낸 번호가 allowlist 근거가 된다. 두 층의 기준은 같아야 한다.
-
-        접기는 판정에만 쓰고 값을 갈아 끼우지 않는다 — 근거 문면을 바꾸면 정상 에코 계약과
-        L2 근거가 함께 흔들린다.
-        """
-        folded = fold_for_detection(text)
-        return any(pattern.regex.search(folded) for pattern in DEFAULT_PII_PATTERNS)
-
+    # 판정은 **게이트의 것을 그대로 가져다 쓴다** — 패턴 집합도 접기도 여기서 다시 정의하지
+    # 않는다. 층마다 자기 정의를 두면 한쪽만 넓혀져 기준이 갈리고, 접기 전으로 걸러내던 때가
+    # 정확히 그 모양이었다: 전각 숫자·제로폭 삽입처럼 **접기 전엔 PII 가 아니고 접은 뒤엔
+    # PII 인** 계산 컬럼 값이 `evidence_text` 로 살아남아, 게이트가 그것을 접는 순간 지어낸
+    # 번호가 allowlist 근거가 됐다. 접기는 판정에만 걸고 렌더는 원문을 유지한다 — 근거 문면을
+    # 바꾸면 정상 에코 계약과 L2 근거가 함께 흔들린다.
     evidence_rows = tuple(
         {
             key: value
             for key, value in row.items()
-            if not _pii_shaped(key) and (key in safe_names or not _pii_shaped(_render_value(value)))
+            if not pii_shaped(key) and (key in safe_names or not pii_shaped(_render_value(value)))
         }
         for row in rows
     )
