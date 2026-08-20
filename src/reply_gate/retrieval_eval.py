@@ -124,7 +124,6 @@ __all__ = [
     "UnmeasuredStage",
     "build_policy_sources",
     "chunk_policy_sources",
-    "evaluate_retrieval",
     "evaluate_strategy_ladder",
     "load_rewritten_queries",
     "map_units_to_clauses",
@@ -1878,69 +1877,6 @@ def _macro_f1(precision: float | None, recall: float | None) -> float | None:
     if precision + recall == 0.0:
         return 0.0
     return 2 * precision * recall / (precision + recall)
-
-
-def evaluate_retrieval(
-    *,
-    documents: Sequence[PolicyDocument],
-    cases: Sequence[GoldenCase],
-    labels: Sequence[RetrievalLabel],
-    embedder: EmbeddingClient,
-    config: RetrievalEvalConfig,
-    cache_dir: Path,
-) -> RetrievalEvaluation:
-    """정책·문의 로더 산출을 DB 없이 벡터화하고, 검색 완료 뒤 독립 라벨로 채점한다."""
-    queries = tuple(RetrievalQuery(case_id=case.id, text=case.content) for case in cases)
-    policy_texts = tuple(
-        (chunk.evidence_id, chunk.embedding_text)
-        for document in documents
-        for chunk in document.chunks
-    )
-    # 이 호출은 라벨을 받지 않는다. 검색 전략이 정답을 보지 않는 경계다.
-    retrieved = retrieve_cases(
-        queries=queries,
-        policy_texts=policy_texts,
-        embedder=embedder,
-        config=config,
-        cache_dir=cache_dir,
-    )
-    labels_tuple = tuple(labels)
-    score = score_retrieval(retrieved, labels_tuple, top_k=config.top_k, cutoff=config.cutoff)
-    sweep: list[CutoffSweepPoint] = []
-    for cutoff in config.cutoff_sweep:
-        aggregate = score_retrieval(
-            retrieved, labels_tuple, top_k=config.top_k, cutoff=cutoff
-        ).aggregate
-        sweep.append(
-            CutoffSweepPoint(
-                cutoff=cutoff,
-                accepted_precision=aggregate.accepted_precision,
-                accepted_recall=aggregate.accepted_recall,
-                macro_f1=_macro_f1(aggregate.accepted_precision, aggregate.accepted_recall),
-                precision_case_count=aggregate.precision_case_count,
-                recall_case_count=aggregate.recall_case_count,
-            )
-        )
-    eligible = [point for point in sweep if point.macro_f1 is not None]
-    best = (
-        max(
-            eligible,
-            key=lambda point: (
-                cast(float, point.macro_f1),
-                cast(float, point.accepted_precision),
-                cast(float, point.accepted_recall),
-                point.cutoff,
-            ),
-        )
-        if eligible
-        else None
-    )
-    return RetrievalEvaluation(
-        config=config,
-        score=score,
-        sweep=tuple(sweep),
-        best_cutoff=None if best is None else best.cutoff,
-    )
 
 
 def _number(value: float | None) -> str:
@@ -4178,6 +4114,10 @@ def _chunking_score_json(score: ChunkingScore) -> dict[str, object]:
             {
                 "case_id": case.case_id,
                 "relevant_evidence_ids": sorted(case.relevant_evidence_ids),
+                # 채택분만 실으면 "왜 그랬는가"를 리포트에서 되짚을 수 없다 — 컷이 무엇을
+                # 잘랐는지가 순위에만 있다. 전략 리포트가 `ranked_hits` 를 함께 싣는 것과
+                # 같은 자격이다(`_strategy_comparison_json`).
+                "ranked_unit_ids": list(case.ranked_unit_ids),
                 "accepted_unit_ids": list(case.accepted_unit_ids),
                 "accepted_clause_ids": list(case.accepted_clause_ids),
                 "recall_at_1": case.recall_at_1,

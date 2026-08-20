@@ -21,18 +21,19 @@ from reply_gate.retrieval_eval import (
     DEFAULT_EMBEDDING_CANDIDATES,
     DEFAULT_ORACLE_REWRITTEN_QUERIES_PATH,
     STUB_EMBEDDING_MODEL,
+    CutoffSweepPoint,
     EmbeddingCandidate,
     EmbeddingProvider,
     RankedHit,
     ReportPaths,
     RetrievalConfigurationError,
     RetrievalEvalConfig,
+    RetrievalEvaluation,
     RetrievalQuery,
     RetrievedCase,
     RewriteCondition,
     StrategyCutoffs,
     StrategyLadderRetrieval,
-    evaluate_retrieval,
     evaluate_strategy_ladder,
     retrieve_cases,
     retrieve_strategy_ladder,
@@ -208,9 +209,15 @@ def test_embedding_cache_reuses_same_text_and_invalidates_changed_policy(
     ]
 
 
-def test_stub_completes_30_cases_writes_both_reports_and_never_overwrites(
-    tmp_path: Path,
-) -> None:
+def test_단일_설정_리포트는_30건을_싣고_같은_이름을_덮어쓰지_않는다(tmp_path: Path) -> None:
+    """`write_report` 의 렌더와 **덮어쓰기 방지**를 본다.
+
+    30건을 실제로 검색·채점해 리포트 문면을 만든다. 이전에는 `evaluate_retrieval` 이 이
+    조립을 대신했는데, 그 함수는 컷 스윕과 최적점 선택을 전략 사다리(`_sweep_point` ·
+    `_best_sweep_cutoff`)와 **중복 구현**하고 있었고 어떤 실행 경로도 부르지 않아 지웠다.
+    조립은 여기서 명시한다 — 스윕 값 자체는 사다리 쪽 검사가 들고 있으므로 여기서는
+    렌더 경로만 태운다.
+    """
     config = RetrievalEvalConfig(
         model="lexical-2gram-v1",
         dimensions=64,
@@ -218,33 +225,42 @@ def test_stub_completes_30_cases_writes_both_reports_and_never_overwrites(
         cutoff=0.10,
         is_stub=True,
     )
-    evaluation = evaluate_retrieval(
-        documents=load_policy_documents(),
-        cases=load_golden_set(),
-        labels=load_retrieval_labels(),
+    documents = load_policy_documents()
+    retrieved = retrieve_cases(
+        queries=tuple(
+            RetrievalQuery(case_id=case.id, text=case.content) for case in load_golden_set()
+        ),
+        policy_texts=tuple(
+            (chunk.evidence_id, chunk.embedding_text)
+            for document in documents
+            for chunk in document.chunks
+        ),
         embedder=LexicalEmbeddingClient(dimensions=64),
         config=config,
         cache_dir=tmp_path / "cache",
     )
+    labels = tuple(load_retrieval_labels())
+    score = score_retrieval(retrieved, labels, top_k=config.top_k, cutoff=config.cutoff)
+
+    def _point(cutoff: float) -> CutoffSweepPoint:
+        aggregate = score_retrieval(retrieved, labels, top_k=config.top_k, cutoff=cutoff).aggregate
+        return CutoffSweepPoint(
+            cutoff=cutoff,
+            accepted_precision=aggregate.accepted_precision,
+            accepted_recall=aggregate.accepted_recall,
+            # macro F1 의 정의는 사다리 쪽 한 곳이 소유한다 — 여기서 다시 쓰지 않는다.
+            macro_f1=None,
+            precision_case_count=aggregate.precision_case_count,
+            recall_case_count=aggregate.recall_case_count,
+        )
+
+    sweep = (_point(0.10), _point(0.30))
+    evaluation = RetrievalEvaluation(
+        config=config, score=score, sweep=sweep, best_cutoff=config.cutoff
+    )
 
     assert len(evaluation.score.cases) == 30
     assert all(len(case.ranked_hits) == 26 for case in evaluation.score.cases)
-    assert [point.cutoff for point in evaluation.sweep] == [
-        0.10,
-        0.15,
-        0.20,
-        0.25,
-        0.30,
-        0.35,
-        0.40,
-        0.45,
-        0.50,
-        0.55,
-        0.60,
-        0.65,
-        0.70,
-    ]
-    assert evaluation.best_cutoff in config.cutoff_sweep
 
     first = write_report(evaluation, output_dir=tmp_path / "reports")
     markdown_before = first.markdown.read_text(encoding="utf-8")
@@ -295,6 +311,60 @@ def test_전략_리포트는_전략마다_컷_스윕과_최적점을_싣는다(t
     assert "top_k: 5" in markdown
     assert "precision n" in markdown
     assert "채택 축: 코사인 유사도 (모든 전략 동일)" in markdown
+
+
+def test_전략_리포트는_기존_산출물을_덮어쓰지_않는다(tmp_path: Path) -> None:
+    """`_next_strategy_report_paths` 는 커밋된 라이브 리포트 12개를 만든 writer 다.
+
+    같은 이름 조합으로 다시 돌리면 접미 숫자를 붙여 **새 쌍**을 만들고 1회차 파일은 한 바이트도
+    바뀌지 않아야 한다. 재생성에 과금이 들고 확률 층이라 같은 값이 나오지 않으므로, 덮어쓰기는
+    복구 불가능한 손실이다(하드 게이트 7).
+
+    이 검사는 오래 없었다 — 단일 설정 쪽 writer 의 검사가 이 writer 까지 덮는 것처럼 보이는
+    착시였고, 두 writer 는 이름 규칙도 재귀 지점도 다르다.
+
+    **이 검사가 붙잡는 층은 경로 선택기**(`_next_strategy_report_paths`)다. writer 의
+    `open("x")` + `FileExistsError` 재귀는 **경쟁 상태** 방어라 순차 실행으로는 탈 수 없다.
+    다만 둘이 겹쳐 있어서, 선택기를 망가뜨리면 덮어쓰기가 아니라 `RecursionError` 로 터진다 —
+    **조용히 덮이는 경로가 없다**(음성 대조로 실측했다).
+    """
+    common: dict[str, object] = {
+        "live": False,
+        "dimensions": 32,
+        "top_k": 5,
+        "cutoff": 0.10,
+        "sweep_start": 0.10,
+        "sweep_end": 0.15,
+        "sweep_step": 0.05,
+        "output_dir": tmp_path / "reports",
+        "cache_dir": tmp_path / "cache",
+    }
+    first = run_retrieval_comparison(**cast(Any, common))
+    markdown_before = first.markdown.read_bytes()
+    json_before = first.json.read_bytes()
+
+    second = run_retrieval_comparison(**cast(Any, common))
+
+    assert second.markdown != first.markdown
+    assert second.json != first.json
+    assert second.markdown.stem == f"{first.markdown.stem}-2"
+    assert second.json.stem == f"{first.json.stem}-2"
+    assert first.markdown.read_bytes() == markdown_before
+    assert first.json.read_bytes() == json_before
+
+    third = run_retrieval_comparison(**cast(Any, common))
+    assert third.markdown.stem == f"{first.markdown.stem}-3"
+    assert sorted(path.name for path in (tmp_path / "reports").iterdir()) == sorted(
+        path.name
+        for path in (
+            first.markdown,
+            first.json,
+            second.markdown,
+            second.json,
+            third.markdown,
+            third.json,
+        )
+    )
 
 
 def test_전략_리포트_파일명은_재작성_조건과_컷을_구분한다(tmp_path: Path) -> None:

@@ -75,6 +75,7 @@ def _payload(
     declared: Sequence[str] = (),
     billed: bool = True,
     attribution_computed: bool = True,
+    attribution_reason: str | None = "측정 2 미실행: 대역",
     detection_rate: float | None = 1.0,
     false_positive_rate: float | None = 0.0,
     measurement3_detection_rate: float | None = 1.0,
@@ -98,11 +99,14 @@ def _payload(
         if include_evidence_fields:
             entry["missing_relevant_evidence_ids"] = list(missing or ())
         attribution_cases.append(entry)
-    attribution: dict[str, Any] = (
-        {"computed": True, "cases": attribution_cases}
-        if attribution_computed
-        else {"computed": False, "reason": "측정 2 미실행: 대역"}
-    )
+    attribution: dict[str, Any]
+    if attribution_computed:
+        attribution = {"computed": True, "cases": attribution_cases}
+    elif attribution_reason is None:
+        # 귀인 절이 **통째로 없는** 옛 산출물. `reason` 조차 없다.
+        attribution = {"computed": False}
+    else:
+        attribution = {"computed": False, "reason": attribution_reason}
     return {
         "conditions": {
             "started_at": started_at,
@@ -360,7 +364,12 @@ def test_두_줄이_상반되면_승격_기준선이_판정을_가진다(tmp_pat
 
 def test_하네스에_승격을_자동으로_기록하는_경로가_없다() -> None:
     """승격은 사람이 참조 파일을 바꾸는 것뿐이다 — 코드가 쓰면 구속이 자기추인이 된다."""
-    offenders = _promotion_writes(_python_sources())
+    sources = _python_sources()
+    # **검사 대상이 비면 이 가드는 아무것도 지키지 않는다**(`tests/AGENTS.md` 불변식 3).
+    # 음성 대조가 검사기 함수만 태우면 목록 유도부가 망가져도 초록으로 남는다.
+    names = {path.name for path in sources}
+    assert {"regression_guard.py", "evaluation.py", "evaluate.py"} <= names, sorted(names)
+    offenders = _promotion_writes(sources)
     assert offenders == [], offenders
 
 
@@ -540,6 +549,45 @@ def test_기준선에_근거_필드가_없으면_없다고_적고_0으로_채우
     assert "미산출" in rendered or "없" in rendered
 
 
+def test_귀인_절이_미산출이면_산출물이_들고_있는_사유를_그대로_적는다(tmp_path: Path) -> None:
+    """**"절이 없다"와 "절은 있고 미산출 사유가 실려 있다"는 다른 상태다.**
+
+    가드가 사유를 무시하고 "옛 산출물이라 새 필드가 없다"는 고정 문장을 적으면, 측정 2 를
+    `--measurements` 로 고르지 않았을 뿐인 실행이 "낡은 산출물"로 보고된다 — 실제로 커밋된
+    `reports/evaluation-live-l2-{16,17,18,23,24}.md` 가 그렇게 적혔다.
+    `RunSummary.attribution_reason` 은 그 자리를 위해 파싱돼 있었는데 아무도 읽지 않았다.
+    """
+    guard = _run_guard(
+        tmp_path,
+        candidate_cases=[_healthy_cases()] * RUN_SET_SIZE,
+        baseline_kwargs={
+            "attribution_computed": False,
+            "attribution_reason": "측정 2 를 실행 선택에서 제외했다 (`--measurements`)",
+        },
+    )
+    note = next(note for note in guard.binding.unknown_notes if "기준선" in note)
+    assert "측정 2 를 실행 선택에서 제외했다" in note
+    # 사유가 있는데 "옛 산출물이라 필드가 없다"고 적으면 그것이 없던 사실의 보고다.
+    assert "새 필드는 새 실행부터" not in note
+    assert guard.binding.verdict == "보류"
+
+
+def test_귀인_절_자체가_없으면_옛_산출물_문면을_그대로_쓴다(tmp_path: Path) -> None:
+    """음성 대조 — 사유조차 없는 진짜 옛 산출물에서는 원래 문장이 살아 있어야 한다.
+
+    위 검사가 사유 분기만 보고 통과하면 고정 문장을 통째로 지워도 초록으로 남는다.
+    """
+    guard = _run_guard(
+        tmp_path,
+        candidate_cases=[_healthy_cases()] * RUN_SET_SIZE,
+        baseline_kwargs={"attribution_computed": False, "attribution_reason": None},
+    )
+    note = next(note for note in guard.binding.unknown_notes if "기준선" in note)
+    assert "새 필드는 새 실행부터" in note
+    assert "사유:" not in note
+    assert guard.binding.verdict == "보류"
+
+
 def test_측정_1_무변경_검사는_가드에_남는다(tmp_path: Path) -> None:
     guard = _run_guard(
         tmp_path,
@@ -560,6 +608,37 @@ def test_측정_3_은_무변경_검사_대상이_아니다(tmp_path: Path) -> No
     assert guard.binding.verdict == "통과"
     rendered = "\n".join(render_guard_section(guard))
     assert "측정 3 은 무변경 검사 대상이 아니다" in rendered
+
+
+def test_측정_3_미실행은_미상과_다르게_적힌다(tmp_path: Path) -> None:
+    """둘 다 값이 없지만 사유가 다르다 — 뭉치면 리포트가 안 돌린 세트를 "미상"이라 적는다.
+
+    `measurement3_detection_rate=None` 은 픽스처에서 `{"executed": false}` 절을 만든다.
+    실제 산출물에서도 같은 모양이다 — `reports/evaluation-live-{1,2,3}.json` 은 L2 이전
+    세대라 측정 3 절 자체가 없어 `executed` 가 False 로 읽힌다.
+    """
+    guard = _run_guard(
+        tmp_path,
+        candidate_cases=[_healthy_cases()] * RUN_SET_SIZE,
+        candidate_kwargs={"measurement3_detection_rate": None},
+    )
+
+    note = next(item for item in guard.binding.notes if "측정 3" in item)
+    assert "실행하지 않은 산출물이 있어" in note
+    assert "이번 실측" in note
+    assert "미상이거나 세트 안에서 흔들려" not in note
+
+
+def test_측정_3_이_양쪽_다_실행됐으면_미상_문구를_쓴다(tmp_path: Path) -> None:
+    """음성 대조 — 미실행 분기가 정상 실행까지 삼키면 안 된다."""
+    guard = _run_guard(
+        tmp_path,
+        candidate_cases=[_healthy_cases()] * RUN_SET_SIZE,
+        candidate_kwargs={"measurement3_detection_rate": 0.5},
+    )
+
+    note = next(item for item in guard.binding.notes if "측정 3" in item)
+    assert "실행하지 않은 산출물" not in note
 
 
 def test_측정_3_표기는_이_실행에서_실제로_성립하는_것을_적는다(tmp_path: Path) -> None:

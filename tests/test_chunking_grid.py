@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -377,6 +378,24 @@ def test_리포트는_처분을_비교_결과와_함께_적는다(tmp_path: Path
     markdown = paths.markdown.read_text(encoding="utf-8")
     assert "비교만" in markdown
     assert "policy:<slug>:<조항>" in markdown
+
+
+def test_청킹_리포트는_채택분과_전체_순위를_함께_싣는다(tmp_path: Path) -> None:
+    """채택분만 실으면 **컷이 무엇을 잘랐는지**를 리포트에서 되짚을 수 없다.
+
+    전략 리포트는 `accepted_hits` 옆에 `ranked_hits` 를 함께 싣는다. 청킹 쪽은 채점기가
+    `ranked_unit_ids` 를 이미 들고 있었는데 직렬화에서 빠져 있었다 — 그래서 커밋된
+    `retrieval-chunking-live-*.json` 에는 순위가 없다.
+    """
+    paths = run_chunking_comparison(live=False, output_dir=tmp_path, cache_dir=tmp_path / "cache")
+
+    payload = json.loads(paths.json.read_text(encoding="utf-8"))
+    cases = [case for row in payload["rows"] for case in row["score"]["cases"]]
+    assert cases, sorted(payload)
+    for case in cases:
+        assert "ranked_unit_ids" in case, sorted(case)
+        assert set(case["accepted_unit_ids"]) <= set(case["ranked_unit_ids"]), case["case_id"]
+    assert any(len(case["ranked_unit_ids"]) > len(case["accepted_unit_ids"]) for case in cases)
 
 
 def test_리포트는_기존_산출물을_덮어쓰지_않는다(tmp_path: Path) -> None:
