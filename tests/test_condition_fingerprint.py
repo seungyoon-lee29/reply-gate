@@ -26,7 +26,8 @@ import os
 import subprocess
 import sys
 import textwrap
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Final, cast
 
@@ -278,6 +279,91 @@ def test_기각_사유_순서가_바뀌면_초안_판정_지문이_움직인다(
     assert _draft_rule_version() != before
 
 
+def _phone_normalize_without(dropped: str) -> Callable[[str], str]:
+    """`gate.normalize_phone` 에서 국가번호 갈래 **하나만** 지운 정규화.
+
+    지우면 근거의 `+82-10-1234-5678` 과 초안의 `010-1234-5678` 이 서로 다른 값이 되어
+    **정상 에코가 오기각된다** — 헤드라인 지표(오탐률)가 움직이는 자리다. 지문이 그것을
+    "같은 조건"이라고 말하면 안 된다.
+    """
+
+    def _normalize(value: str) -> str:
+        digits = gate.normalize_digits(value)
+        if dropped != "0082" and digits.startswith("0082"):
+            return f"0{digits[4:]}"
+        if dropped != "82" and digits.startswith("82"):
+            return f"0{digits[2:]}"
+        return digits
+
+    return _normalize
+
+
+@pytest.mark.parametrize("dropped", ["0082", "82"])
+def test_전화_정규화의_국가번호_갈래를_지우면_지문이_움직인다(
+    monkeypatch: pytest.MonkeyPatch, dropped: str
+) -> None:
+    """**정규화를 탐침 문자열 전체에 걸면 이 두 갈래가 한 번도 실행되지 않는다.**
+
+    정규화는 숫자만 남긴 뒤 **선두**를 보는데, 탐침 전체의 숫자열은 국가번호로 시작하지
+    않기 때문이다. 그래서 지문은 실행 경로와 **같은 자리**(매치별)에서 정규화를 부른다.
+    """
+    before = _draft_rule_version()
+    mutated = tuple(
+        replace(pattern, normalize=_phone_normalize_without(dropped))
+        if pattern.normalize is gate.normalize_phone
+        else pattern
+        for pattern in gate.DEFAULT_PII_PATTERNS
+    )
+    monkeypatch.setattr(evaluation, "DEFAULT_PII_PATTERNS", mutated)
+
+    assert _draft_rule_version() != before
+
+
+def test_지문이_국가번호_표기를_국내_표기로_접은_결과를_싣는다() -> None:
+    """두 갈래가 지문에 남긴 **흔적을 값으로** 못박는다.
+
+    위 뮤테이션은 갈래를 하나씩 지운 경우를 잡고, 이 검사는 **둘을 한꺼번에 지운 경우**까지
+    잡는다. 근거의 `+82-10-1234-5678` 과 초안의 `010-1234-5678` 이 같은 값이 되는 것이 L1
+    의 정상 에코 계약이라, 이 접힘이 사라지면 지문도 함께 움직여야 한다.
+    """
+    traces = {
+        pattern.name: evaluation._normalized_probe_matches(pattern)
+        for pattern in gate.DEFAULT_PII_PATTERNS
+    }
+
+    assert "01012345678" in traces["mobile_phone"], traces["mobile_phone"]
+    assert "021234567" in traces["landline_phone"], traces["landline_phone"]
+
+
+def test_패턴_다섯이_전부_탐침에서_한_번은_매치된다() -> None:
+    """매치가 없는 패턴은 **정규화 결과가 빈 문자열**이라 그 자리가 죽는다.
+
+    그 패턴에 붙은 정규화 함수를 갈아 끼워도 지문이 움직이지 않는다 — 패턴을 새로 심을 때
+    탐침에 표기를 함께 넣으라는 요구가 이 검사다.
+    """
+    empty = [
+        pattern.name
+        for pattern in gate.DEFAULT_PII_PATTERNS
+        if not evaluation._normalized_probe_matches(pattern)
+    ]
+
+    assert empty == [], empty
+
+
+def test_지문의_정규화가_실행_경로와_같은_입력을_받는다() -> None:
+    """L1 은 `regex.findall(fold(text))` 의 **매치 하나하나**에 정규화를 건다.
+
+    지문이 다른 입력(문자열 전체)에 걸면 같은 함수를 부르고도 **다른 분기**를 타고, 실제로
+    그렇게 국가번호 두 갈래가 지문 밖으로 나갔다.
+    """
+    for pattern in gate.DEFAULT_PII_PATTERNS:
+        expected = ",".join(
+            str(pattern.normalize(match))
+            for match in pattern.regex.findall(pattern.fold(evaluation._PII_RULE_PROBE))
+        )
+        assert evaluation._normalized_probe_matches(pattern) == expected, pattern.name
+
+
 def test_지문이_게이트_모듈의_정본_이름을_읽는다() -> None:
     """뮤테이션이 소비자 쪽 이름을 갈아 끼우므로, **정본에서 가져왔음**을 따로 못박는다.
 
@@ -418,6 +504,29 @@ def test_중단된_측정이_지문에_이름으로_남는다() -> None:
     """중단 표시가 사람이 읽는 문자열에만 붙으면 **기계가 읽는 조건은 완주와 같다.**"""
     assert _current(aborted=("측정 2",)).values["run_completion"] == "중단: 측정 2"
     assert _current(aborted=("측정 2", "측정 3")).values["run_completion"] == "중단: 측정 2·측정 3"
+
+
+def test_중단_사실은_명시_지문에_덮이지_않는다() -> None:
+    """다른 항목은 "명시가 이긴다"가 맞지만 **이 칸만은 반대다.**
+
+    나머지는 "무엇으로 돌렸는가"라 진입점이 아는 값이 정확하다. 이 칸은 "실행이 실제로
+    어떻게 끝났는가"라서, 진입점이 같은 이름의 키를 내는 순간 중단이 조용히 완주로 덮인다
+    — 그리고 절반만 돈 실행이 완주한 실측과 한 세트로 묶인다.
+    """
+    forged = dict(_script_fingerprint())
+    forged["run_completion"] = "중단 없음"
+
+    values = _current(fingerprint=forged, aborted=("측정 2",)).values
+
+    assert values["run_completion"] == "중단: 측정 2"
+
+
+def test_다른_지문_항목은_명시가_이긴다() -> None:
+    """양성 대조 — 우선순위를 뒤집은 것이 이 한 칸뿐임을 못박는다."""
+    forged = dict(_script_fingerprint())
+    forged["draft_rule_version"] = "draftrules-000000000000"
+
+    assert _current(fingerprint=forged).values["draft_rule_version"] == ("draftrules-000000000000")
 
 
 def test_중단된_실행은_완주한_실행과_대조되지_않는다() -> None:

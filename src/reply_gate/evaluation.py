@@ -60,6 +60,7 @@ from reply_gate.gate import (
     DEFAULT_PII_PATTERNS,
     NUMERIC_SEPARATOR_VARIANTS,
     REASON_ORDER,
+    PiiPattern,
     evaluate_draft,
     fold_for_detection,
     fold_numeric_for_detection,
@@ -1544,10 +1545,15 @@ JUDGE_THINKING: Final = "미전송(계열 기본)"
 #: * U+2013 · U+2212 · U+30FB — 구분자 변종(번호 계열만 하이픈으로 접는다)
 #: * U+0301 — 숫자 **자리 사이**의 결합 표식(`Mn` 범주, 번호 계열만 무시한다)
 #: * 뒤쪽 평문 — 정규화(전화·숫자·이메일)가 실제로 무엇을 하는지 드러낸다
+#:
+#: **패턴 다섯이 전부 한 번씩은 매치돼야 한다.** 매치가 없는 패턴은 정규화 결과가 빈
+#: 문자열이라, 그 패턴에 붙은 정규화 함수를 갈아 끼워도 지문이 움직이지 않는다.
+#: **전화 정규화의 한국 국가번호 두 갈래도 각각 한 번씩 탄다**(`+82…` 와 `0082…`) —
+#: 정규화는 입력의 **선두**를 보므로, 한 표기만 넣으면 다른 갈래가 죽은 채로 남는다.
 _PII_RULE_PROBE: Final = (
     "\uff10\uff11\uff10\u200b-9999\u03018888 "
     "010\u20139999\u22128888 010\u30fb9999\u30fb8888 "
-    "+82-10-1234-5678 0082 2 123 4567  A_B@Example.COM "
+    "+82-10-1234-5678 0082 2 123 4567 1588-1234 900101-1234567  A_B@Example.COM "
 )
 
 #: 조회 가드 탐침이 쓰는 주문번호. **선검사를 통과한 형식**이어야 한다(아니면 호출 측
@@ -1669,13 +1675,33 @@ def sql_guard_probe_outcomes() -> tuple[str, ...]:
     return tuple(outcomes)
 
 
+def _normalized_probe_matches(pattern: PiiPattern) -> str:
+    """탐침에서 이 패턴이 뽑은 값들을 **매치별로** 정규화한 결과.
+
+    **정규화는 실행 경로와 같은 자리에서 부른다** — L1 은 `pattern.regex.findall(fold(text))`
+    가 뽑은 매치 하나하나에 정규화를 건다(`gate._normalized_matches`). 지문이 탐침 문자열
+    **전체**에 정규화를 걸면 그 자리와 입력이 달라져, **입력의 선두를 보는 분기가 한 번도
+    실행되지 않는다**: 전화 정규화의 한국 국가번호 두 갈래(`0082`·`82`)가 정확히 그랬다.
+    두 갈래를 통째로 지워도 지문이 움직이지 않았고, 그 삭제는 근거의 `+82-10-1234-5678` 과
+    초안의 `010-1234-5678` 을 다른 값으로 만들어 **정상 에코를 오기각시키는** 실제 동작
+    변경이다.
+
+    `findall` 을 쓰는 것도 같은 이유다 — 정규식에 캡처 그룹이 생기면 뽑히는 값이 달라지고
+    실행 경로도 함께 달라진다. 지문이 그 변화를 따라가려면 같은 함수를 써야 한다.
+    """
+    return ",".join(
+        str(pattern.normalize(match))
+        for match in pattern.regex.findall(pattern.fold(_PII_RULE_PROBE))
+    )
+
+
 def _draft_rule_version() -> str:
     """초안 판정 규칙의 판 — **접기 규칙과 패턴 집합**의 내용 지문.
 
     읽는 것은 넷이다: 기각 사유의 고정 순서 · 번호 계열이 구분자로 받는 표기 변종 집합 ·
     두 접기(공통·번호)가 고정 탐침에 대해 내는 결과 · 패턴마다의 (이름, 정규식, 플래그,
-    접기 결과, 정규화 결과). 접기와 정규화는 **이름이 아니라 동작**으로 담는다 — 함수
-    이름만 담으면 본문이 바뀌어도 지문이 안 움직인다.
+    접기 결과, **매치별** 정규화 결과). 접기와 정규화는 **이름이 아니라 동작**으로 담는다 —
+    함수 이름만 담으면 본문이 바뀌어도 지문이 안 움직인다.
     """
     parts = [
         "reasons=" + ",".join(reason.value for reason in REASON_ORDER),
@@ -1685,7 +1711,8 @@ def _draft_rule_version() -> str:
     ]
     parts.extend(
         f"pattern={pattern.name}|regex={pattern.regex.pattern}|flags={pattern.regex.flags}"
-        f"|fold={pattern.fold(_PII_RULE_PROBE)}|normalize={pattern.normalize(_PII_RULE_PROBE)}"
+        f"|fold={pattern.fold(_PII_RULE_PROBE)}"
+        f"|normalize={_normalized_probe_matches(pattern)}"
         for pattern in DEFAULT_PII_PATTERNS
     )
     return text_digest("\n".join(parts), prefix="draftrules-")
@@ -1842,9 +1869,12 @@ class RunConditions:
                 "judge": self.judge,
                 "measurement_scope": self.measurement_scope,
                 "condition_fingerprint": {
-                    "run_completion": self.run_completion,
                     **code_condition_fingerprint(),
                     **dict(self.condition_fingerprint),
+                    # **중단 사실은 마지막에 쓴다 — 명시 지문이 덮을 수 없다.** 다른 항목은
+                    # "명시가 이긴다"가 맞지만 이건 실행이 실제로 어떻게 끝났는가라서,
+                    # 진입점이 같은 키를 내는 순간 중단이 조용히 완주로 덮인다.
+                    "run_completion": self.run_completion,
                 },
                 "declared_experiment_fields": list(self.declared_experiment_fields),
             }
