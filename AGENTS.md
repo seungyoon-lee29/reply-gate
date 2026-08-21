@@ -82,16 +82,16 @@
 | 손대려는 것 | 먼저 읽을 것 |
 |---|---|
 | 범위·목표·측정 기준 자체 | `docs/problem.md` + `docs/tracking/decisions/0001`·`0006` |
-| SQL 검증기(`sql_guard.py`) | `docs/engineering-notes.md` 의 "실제로 뚫렸던 경로" 3건 + `docs/tracking/decisions/0005` |
-| L1 게이트(`gate.py`) | `docs/business-rules.md` 의 PII 규칙 + `docs/engineering-notes.md` 의 오탐 사례 |
+| SQL 검증기(`sql_guard.py`) | `docs/engineering-notes.md` 의 "실제로 뚫렸던 경로" 3건 + `docs/tracking/decisions/0005`·**`0024`**(PII 유래를 안쪽 스코프까지·캐스트 허용 타입) |
+| L1 게이트(`gate.py`) | `docs/business-rules.md` 의 PII 규칙 + `docs/engineering-notes.md` 의 오탐 사례 + `docs/tracking/decisions/`**`0021`**(접기는 패턴별이고 개인정보 정의는 게이트가 단독 소유한다) |
 | L2 판정(`judge.py`) | `docs/business-rules.md` 의 "L2 판정 규칙" + `docs/tracking/decisions/0007` |
 | 인계 사유·상태 전이 | `docs/business-rules.md` 의 사유 6종 표와 `both` 우선순위 규칙 |
 | 응답 스키마·API | `docs/contracts.md` 의 "공통 규약"(키 존재 규칙)·"층별 판정 키"·"토큰 집계 경계" |
 | 스키마 변경 | `docs/engineering-notes.md` 의 "볼륨째 지워야 한다" + `docs/operations.md` 4단계 |
-| 평가·지표 | `docs/tracking/status.md` 의 첫 실측값 + `scripts/AGENTS.md` 의 리포트 불변식 |
-| 벡터 검색·임베딩 | `docs/engineering-notes.md` 의 pgvector 캐스트 + **"τ 는 임베딩 모델에 묶인다"** + 대역 수치 주의 |
-| 근거 채택 축·기권 게이트(τ) | `docs/architecture.md` 의 "근거 채택은 축이 둘이다" + `docs/tracking/decisions/0009`·`0012`·`0014` |
-| 회귀 가드·승격 기준선 | `scripts/AGENTS.md` 불변식 16~18 + `src/reply_gate/AGENTS.md` 의 `regression_guard.py` 행 |
+| 평가·지표 | `docs/tracking/status.md` 의 첫 실측값 + `scripts/AGENTS.md` 의 리포트 불변식 + `docs/tracking/decisions/`**`0025`**(구간 아홉·미측정은 0 이 아니다) |
+| 벡터 검색·임베딩 | `docs/engineering-notes.md` 의 pgvector 캐스트 + **"τ 는 임베딩 모델에 묶인다"** + 대역 수치 주의 + `docs/tracking/decisions/`**`0023`**(검증되지 않은 임베딩 조건은 조립에서 죽는다) |
+| 근거 채택 축·기권 게이트(τ) | `docs/architecture.md` 의 "근거 채택은 축이 둘이다" + `docs/tracking/decisions/0009`·`0012`·`0014`·**`0022`**(미정의 사유는 갈라 처분한다·검색 정렬 tie-break) |
+| 회귀 가드·승격 기준선 | `scripts/AGENTS.md` 불변식 16~18 + `src/reply_gate/AGENTS.md` 의 `regression_guard.py` 행 + `docs/tracking/decisions/`**`0026`**(지문 스물다섯 칸과 계보 단절의 대가)·**`0027`**(재등재) |
 | 테스트·구조 검사 | `tests/AGENTS.md` (음성 대조·검사 대상 유도·`declared_settings()` 규칙) |
 | 비용·토큰·달러 | `docs/tracking/pricing.md` (**기준일을 반드시 함께 인용한다**) + `docs/contracts.md` 의 "토큰 집계 경계" |
 
