@@ -143,6 +143,7 @@ pass 이고 **L2 가 실행됐다면** L2 도 pass. 층별 내역은 두 키로 
 | `metrics.tokens.judge_input` / `.judge_output` | **L2 판정 모델 토큰** | 생성 합산과 별도 키 쌍이다. **판정 모델을 부르지 않았으면 0** — 불러서 실패한 경우는 0 이 아닐 수 있다(아래 "실행됐으나 실패한 호출") |
 | `metrics.tokens.retrieval_input` / `.retrieval_output` | **검색 단계 생성 호출 토큰** — 질의 재작성 | 생성 합산과 별도 키 쌍이다. 재작성을 쓰지 않은 문의는 0 |
 | 임베딩 토큰 | 문의 임베딩·정책 인덱싱 | **응답에 싣지 않는다.** 처리 기록(`inquiries.embedding_tokens`)에만 남는다 |
+| 캐시 계열 write/read — **세 쌍** (생성·검색·판정) | 각 계열 호출의 캐시 기록분·적중분 | **응답에도 처리 기록에도 싣지 않는다.** 평가 리포트에만 있다. 계열마다 한 쌍이고 **계열 수를 늘리지 않는다** |
 
 - **검색 계열을 생성 합산에서 가른 이유는 특히 뾰족하다.** 무근거 문의가 검색 단계에서
   걸러져 **초안 없이** 끝나는 것이 이 제품의 장면인데, 재작성 토큰이 생성 칸에 들어가면
@@ -158,6 +159,17 @@ pass 이고 **L2 가 실행됐다면** L2 도 pass. 층별 내역은 두 키로 
   (`tokens.cache_creation_total`·`tokens.cache_read_total`). **키·스키마·정의는 바뀌지 않았다** —
   이 문단은 서술이고 응답 계약의 확장이 아니다. 스위치(`JUDGE_PROMPT_CACHING_ENABLED`)의
   기본값은 **꺼짐**이므로 기본 실행에서 이 키는 총 프롬프트 토큰과 같다.
+- **생성 계열과 검색 계열에도 같은 캐시 쌍이 있고, 경계도 같다** — 응답이 아니라 평가
+  리포트에서만 본다(`tokens.generation_cache_creation_total`·`generation_cache_read_total` ·
+  `retrieval_cache_creation_total`·`retrieval_cache_read_total`). **응답 계약은 확장되지
+  않는다** — `metrics.tokens` 에 새 키가 생기지 않았고 계열 수도 그대로 넷이다. 늘어난 것은
+  **리포트 안에서** 계열마다의 칸이다.
+  **다만 판정 계열과 포함 관계가 반대다.** OpenAI 의 두 값은 `usage.input_tokens` 의
+  **내역**이라 `metrics.tokens.input`·`retrieval_input` 안에 이미 들어 있고, Anthropic 의
+  캐시 계열은 `judge_input` **밖**이다. 그래서 생성·검색 쪽 캐시 칸은 입력 칸에서 빼지도
+  더하지도 않는다 — 빼면 옛 산출물과 정의가 갈려 대조가 끊기고, 더하면 같은 토큰을 두 번
+  센다(환산식은 [단가 문서](tracking/pricing.md) 1절).
+  **없는 값은 0 이 아니라 미측정(`None`)이다** — 판정 계열이 이미 쓰는 규칙과 같다.
 - **실행됐으나 실패한 호출의 토큰도 그대로 집계한다.** 전송 오류로 죽기 전에 200 으로
   돌아온 호출, 안전 분류기 거절(HTTP 200), 형식 불일치로 버려진 산출 — 전부 실비용이므로
   0 으로 접지 않는다. 판정 호출이 실패해 `l2` 가 `null` 인 시도에도 `judge_input`/
