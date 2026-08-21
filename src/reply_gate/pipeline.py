@@ -75,6 +75,7 @@ from reply_gate.llm import (
     accumulate_optional_tokens,
 )
 from reply_gate.order_ref import is_valid_order_no, normalize_order_no
+from reply_gate.retrieval_strategies import AbstentionUndefined
 
 __all__ = [
     "L2_JUDGE_STAGE",
@@ -293,6 +294,11 @@ class ProcessedInquiry:
     retrieval_cache_read_tokens: int | None = None
     #: 검색 단계가 폴백한 사유. `None` 이면 폴백하지 않았다 — 인계 사유가 **아니다**.
     retrieval_fallback_reason: str | None = None
+    #: 기권 게이트의 **통계량이 미정의였던 사유**. 근거 수집 결과가 들고 나온 값을 그대로
+    #: 옮긴다 — 사유는 처분(발동/열림)과 별개로 밖으로 나가야 평가 리포트가 어느 분기를
+    #: 몇 건이 탔는지 셀 수 있다. `None` 은 세 경우를 함께 덮는다: 게이트 꺼짐 · 정책 검색
+    #: 미실행 · 통계량 정의됨. **DB 에도 HTTP 응답에도 싣지 않는다** — 평가 리포트까지다.
+    abstention_undefined_reason: AbstentionUndefined | None = None
     #: 구간 아홉의 시간 합계(ms). 근거 수집 안쪽 여섯 + 시도별 셋을 합친 값이고,
     #: 시도별 내역은 `attempts[].durations` 가 따로 들고 있다. 돌지 않은 구간은 0 이 아니라
     #: 미측정이며, 측정된 구간의 합은 `latency_ms` 를 넘지 않는다(구간은 전부 처리 창
@@ -752,6 +758,9 @@ class InquiryPipeline:
             retrieval_cache_creation_tokens=collection.retrieval_cache_creation_tokens,
             retrieval_cache_read_tokens=collection.retrieval_cache_read_tokens,
             retrieval_fallback_reason=collection.retrieval_fallback_reason,
+            # 기권 미정의 사유도 폴백 사유와 같은 자격으로 그대로 옮긴다 — 여기서 끊기면
+            # 근거 묶음까지 나온 사유가 평가 리포트 앞에서 사라진다.
+            abstention_undefined_reason=collection.abstention_undefined_reason,
             # 근거 수집 안쪽 여섯 + 루프가 잰 셋. 밖에서 수집 호출 하나를 감쌌다면
             # 여섯이 한 칸으로 접혔을 자리다.
             stage_durations=collection.stage_durations.merged(
