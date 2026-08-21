@@ -346,12 +346,15 @@ def test_등재된_기준선이_자기가_가리키는_산출물과_맞는다() 
     assert _fingerprint_conflicts(registered, head) == []
 
 
-def test_지문_확장_이전_등재는_새_항목이_전부_미상이다() -> None:
-    """**계보가 한 번 끊긴 자리를 검사가 들고 있다.**
+def test_등재된_참조는_지문_스물다섯_칸을_전부_안다() -> None:
+    """**참조가 지문 항목을 빠뜨리면 여기서 잡는다.**
 
-    사이클 5 T6 이 지문에 일곱 칸을 더했고, 그 이전에 등재된 참조와 산출물은 그 칸을
-    모른다. 다음 재등재가 그 칸을 채우기 전까지는 세트 편입이 성립하지 않는 것이 정상이다
-    — 이 사실을 검사로 적어 두지 않으면 "왜 보류인가"가 코드 어디에도 남지 않는다.
+    지문이 열여덟 칸에서 스물다섯 칸으로 넓어지던 동안, 이 검사는 반대 방향을 들고
+    있었다 — 확장 이전 등재는 새 일곱 칸을 몰라야 정상이라는 것. 재등재가 그 칸을
+    채우면서 방향이 뒤집혔고, 지금 지키는 것은 **참조가 한 칸도 빠뜨리지 않았다**이다.
+
+    빠뜨린 칸은 `None`(미상)으로 읽히고 미상은 **대조를 막지 않으므로**, 오타나 누락이
+    조용히 통과해 구속 줄이 반쪽으로 도는 상태가 된다. 그 조용한 실패를 이 한 줄이 막는다.
     """
     promotion = load_promoted_baseline()
     assert isinstance(promotion, PromotedBaseline)
@@ -359,15 +362,7 @@ def test_지문_확장_이전_등재는_새_항목이_전부_미상이다() -> N
 
     unknown = {name for name, value in registered.values.items() if value is None}
 
-    assert unknown == {
-        "abstention_undefined_policy",
-        "retrieval_order",
-        "judge_thinking",
-        "draft_rule_version",
-        "l1_fixture_version",
-        "sql_guard_version",
-        "run_completion",
-    }, sorted(unknown)
+    assert unknown == set(), sorted(unknown)
 
 
 def test_두_줄이_상반되면_승격_기준선이_판정을_가진다(tmp_path: Path) -> None:
@@ -1431,18 +1426,23 @@ def test_짝_때문에_어긋난_항목은_그렇게_적는다(tmp_path: Path) -
 def test_승격_직후_1회차_실측은_옛_산출물로_정족수를_채우지_않는다() -> None:
     """**3회 연속 실측의 1회차·2회차가 거짓 미달을 커밋하는 것을 막는다.**
 
-    승격된 기준선(7·8·9)은 이번 세트에서 제외되므로, 9 를 현재 실행으로 두면 조건이 확인된
-    실측은 자기 자신 하나뿐이다. 예전에는 지문이 통째로 없는 사이클 2 산출물이 "전부 미상 =
-    어긋남 없음"으로 읽혀 정족수를 채웠고, 멀쩡한 케이스 셋이 `1/3` 으로 찍혀 **미달**이
-    나왔다. 라이브 리포트는 사후 편집하지 않으므로 그 거짓 판정은 기록에 영구히 남는다.
+    승격된 기준선(28·29·30)은 이번 세트에서 제외되므로, 28 을 현재 실행으로 두면 조건이
+    확인된 실측은 자기 자신 하나뿐이다. 예전에는 지문이 통째로 없는 사이클 2 산출물이
+    "전부 미상 = 어긋남 없음"으로 읽혀 정족수를 채웠고, 멀쩡한 케이스 셋이 `1/3` 으로 찍혀
+    **미달**이 나왔다. 라이브 리포트는 사후 편집하지 않으므로 그 거짓 판정은 기록에 영구히
+    남는다.
+
+    **현재 실행을 새 기준선 계열에서 고르는 것이 이 검사의 조건이다.** 옛 계열(7·8·9)을
+    쓰면 조건 자체가 어긋나 판정이 `대조 불가` 로 갈리고, 그것은 "정족수가 안 찼다"와 다른
+    상태다 — 이 검사가 지키려는 것은 후자다.
     """
     reports = _ROOT / "reports"
-    current = load_run_summary(reports / "evaluation-live-l2-9.json")
+    current = load_run_summary(reports / "evaluation-live-l2-28.json")
     guard = build_regression_guard(current=current, reports_dir=reports)
     assert isinstance(guard, RegressionGuard)
 
     # ① 옛 계열이 세트에 섞이지 않는다.
-    assert guard.candidate_stems == ("evaluation-live-l2-9",)
+    assert guard.candidate_stems == ("evaluation-live-l2-28",)
     for stale in ("evaluation-live-l2-1", "evaluation-live-l2-2", "evaluation-live-l2-3"):
         assert stale not in guard.candidate_stems
     assert guard.candidate_run_count == 1
