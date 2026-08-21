@@ -467,6 +467,30 @@ def test_정책_경로는_검색_구간을_재고_주문_구간은_미측정으�
     assert measured is not None and measured <= processed.latency_ms + 1.0
 
 
+def test_한_구간도_재지_않았으면_합계는_0_이_아니라_미측정이다() -> None:
+    """**"미측정은 0 이 아니다" 의 마지막 표면.**
+
+    구간별 칸은 각각 `None` 을 지키는데 **합계가 0 을 내면** 리포트가 "이 문의는 0 ms 를
+    썼다"고 말하게 된다 — 재지 않은 것과 0 초를 다시 뭉개는 자리다. 실제로 이 계약이
+    한 줄(`return 0.0 if total is None else total`)로 뒤집혀도 스위트 전체가 초록이었다.
+
+    양성 대조를 함께 둔다 — 한 칸이라도 재면 그 값이 그대로 합계가 되어야 한다.
+    """
+    빈_구간 = StageDurations()
+
+    assert all(value is None for value in 빈_구간.as_mapping().values())
+    assert 빈_구간.measured_total_ms is None
+
+    # 양성 대조 — 한 칸만 재도 합계는 그 값이다(0 으로도, None 으로도 접히지 않는다).
+    한_칸 = StageDurations(gate_ms=0.25)
+    assert 한_칸.measured_total_ms == pytest.approx(0.25)
+
+    # 0 ms 로 **측정된** 구간은 미측정이 아니다 — 둘을 값으로 가른다.
+    영_밀리초 = StageDurations(gate_ms=0.0)
+    assert 영_밀리초.measured_total_ms == pytest.approx(0.0)
+    assert 영_밀리초.measured_total_ms is not None
+
+
 @pytest.mark.db
 def test_주문_경로는_조회문_생성과_조회_실행_구간을_잰다(
     app_conn: psycopg.Connection[DictRow],
