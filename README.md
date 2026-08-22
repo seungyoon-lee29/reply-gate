@@ -1755,10 +1755,10 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8000/inquiries
 ### 5. 검증 — **API 키 불필요**
 
 ```bash
-uv run pytest              # 1,431 passed
+uv run pytest              # 1,452 passed
 uv run ruff check .        # 0
-uv run ruff format --check .   # 182 files
-uv run mypy                # strict — 75 files, 0 errors
+uv run ruff format --check .   # 183 files
+uv run mypy                # strict — 76 files, 0 errors
 ```
 
 > **`uv run pytest` 는 DB 기동을 전제한다.** `db` 마커가 붙은 통합 테스트(176건)는
@@ -1767,7 +1767,7 @@ uv run mypy                # strict — 75 files, 0 errors
 > **전체 녹색을 주장하려면 `docker compose up -d --wait` 를 먼저 실행해야 한다.**
 
 ```bash
-uv run pytest -m db        # DB 통합 테스트만 — 176 passed, 1,255 deselected
+uv run pytest -m db        # DB 통합 테스트만 — 176 passed, 1,276 deselected
 ```
 
 DB 통합 테스트는 세션당 1회 스키마 적용 + 주문 시딩을 하고, 각 테스트가 쓴 행은 롤백으로 되돌린다.
@@ -1955,4 +1955,4 @@ uv run python -m scripts.compare_retrieval --live --embedding-axis   # 임베딩
 | [`data/promoted_baseline.json`](data/promoted_baseline.json) | **승격 기준선 참조** — 회귀 판정을 구속하는 유일한 기준선. **사람만 바꾼다**(구조 테스트가 쓰기 경로를 막는다) |
 | [`scripts/handcalc_adoption_axis.py`](scripts/handcalc_adoption_axis.py) | 채택 축 손계산 산출물 — **무과금·오프라인**, 커밋된 검색 리포트만 읽는다 |
 | [`scripts/seed_orders.py`](scripts/seed_orders.py) · [`scripts/index_policies.py`](scripts/index_policies.py) | 시딩 · 인덱싱 |
-| [`tests/`](tests/) | **1,431건** (그중 DB 통합 **176건**) |
+| [`tests/`](tests/) | **1,452건** (그중 DB 통합 **176건**) |

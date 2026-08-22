@@ -154,6 +154,9 @@ uv run pytest -m db        # skip 0 이어야 한다
 **사이클 5 종료 시점의 실행값**(2026-08-21): `ruff check` 0 · `ruff format --check` 182 파일 ·
 `mypy` 75 파일 0 · `pytest` **1,431 통과** · `pytest -m db` **176 통과 / skip 0**.
 
+**종료 뒤 감사 수정을 반영한 실행값**(2026-08-22): `ruff check` 0 · `ruff format --check`
+183 파일 · `mypy` 76 파일 0 · `pytest` **1,452 통과** · `pytest -m db` **176 통과 / skip 0**.
+
 ## 8. 평가 지표 산출
 
 ```bash
