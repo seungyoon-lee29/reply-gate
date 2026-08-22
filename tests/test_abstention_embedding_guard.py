@@ -34,6 +34,7 @@ from reply_gate.config import (
     VALIDATED_ABSTENTION_EMBEDDINGS,
     AbstentionGateWiringError,
     Settings,
+    get_settings,
 )
 from reply_gate.retrieval_strategies import (
     AbstentionGate,
@@ -274,3 +275,117 @@ def test_오프라인_격자가_검증되지_않은_조건에서도_돈다() -> 
     verdict = apply_abstention_gate(gate, (0.9, 0.1, 0.05))
 
     assert verdict.abstains is False
+
+
+# ── 폭발 반경: 방어는 그것이 지키는 축까지만 죽인다 ─────────────────────────
+#
+# 조립 거부는 옳지만 **반경이 지키는 축보다 넓으면** 관계없는 경로가 함께 죽는다.
+# 실제로 그랬다: 임베딩 모델을 한 줄 바꾸면 임베딩을 한 번도 쓰지 않는 무과금 측정 1 이
+# 리포트 0개로 죽고, 기권 게이트를 쓰지 않는 조회 전용 라우트가 500 이 됐다.
+# `api.py` 의 판정 키 선검사가 같은 교훈을 이미 적어 두었다 — *"`get_service`(Depends)는
+# GET 라우트와 공유하므로 거기에 넣으면 조회 전용 경로까지 죽는다"*.
+
+
+def _미검증_조건을_환경에_건다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """실행 경로가 실제로 읽는 자리(설정 캐시)를 갈아 끼운다."""
+    monkeypatch.setenv("EMBEDDING_MODEL", "text-embedding-3-large")
+    monkeypatch.setenv("EMBEDDING_DIMENSIONS", "3072")
+    get_settings.cache_clear()
+    monkeypatch.setattr(
+        "reply_gate.api.get_settings",
+        lambda: declared_settings(
+            embedding_model="text-embedding-3-large", embedding_dimensions=3072
+        ),
+    )
+
+
+def test_조회_전용_조립은_τ_미검증_조건에서도_선다(monkeypatch: pytest.MonkeyPatch) -> None:
+    """조회는 파이프라인을 쓰지 않으므로 파이프라인 조립 오류에 걸리면 안 된다.
+
+    `get_service` 가 파이프라인을 **미리** 조립하던 동안 `GET /inquiries/{id}` 가
+    이 조건에서 죽었다. 조립을 접수 경로로 미룬 것이 이 검사가 지키는 계약이다.
+    """
+    from reply_gate import api
+
+    _미검증_조건을_환경에_건다(monkeypatch)
+
+    opener = api.get_service()  # 여기서 죽으면 조회 라우트가 함께 죽는다
+
+    assert callable(opener)
+
+
+def test_접수는_같은_조건에서_여전히_조립_거부로_죽는다(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """음성 대조 — 반경을 좁힌 것이 방어를 끈 것이 되면 안 된다.
+
+    이 검사가 없으면 "조회를 살렸다"가 곧 "접수도 살렸다"가 돼도 스위트가 초록이다.
+    """
+    from reply_gate import api
+    from reply_gate.pipeline import build_pipeline
+
+    _미검증_조건을_환경에_건다(monkeypatch)
+    설정 = declared_settings(embedding_model="text-embedding-3-large", embedding_dimensions=3072)
+
+    with pytest.raises(AbstentionGateWiringError):
+        build_pipeline(
+            generation_client=api.build_generation_client(설정),
+            embedding_client=api.build_embedding_client(설정),
+            settings=설정,
+        )
+
+
+def test_조회는_파이프라인을_부르지_않는다() -> None:
+    """구조 검사 — 조립을 미뤄도 조회가 그것을 부르면 반경이 그대로다."""
+    from reply_gate import api
+
+    assert "_open_pipeline" not in inspect.getsource(api.InquiryService.fetch)
+    assert "_open_pipeline" in inspect.getsource(api.InquiryService.process), (
+        "접수가 파이프라인을 얻는 자리를 잃으면 이 검사가 지키려는 대상이 사라진다"
+    )
+
+
+def test_무과금_지문_산출은_τ_미검증_조건에서도_돈다() -> None:
+    """측정 1 은 임베딩을 한 번도 쓰지 않는다 — 지문 조립이 그것을 죽이면 안 된다.
+
+    죽었을 때의 대가가 컸다: 채점이 **끝난 뒤** 지문 조립에서 터져 `exit 1` · 리포트
+    0개였다. 계산을 해 놓고 버리는 모양이다.
+    """
+    from tests.test_condition_fingerprint import _script_fingerprint
+
+    지문 = _script_fingerprint(
+        settings=declared_settings(
+            embedding_model="text-embedding-3-large", embedding_dimensions=3072
+        )
+    )
+
+    assert 지문["abstention_gate_statistic"] == "미조립(τ 미검증 임베딩 조건)"
+    assert 지문["abstention_tau"] == "미조립(τ 미검증 임베딩 조건)"
+
+
+def test_미조립은_꺼짐도_미상도_아니다() -> None:
+    """음성 대조 — 세 상태가 뭉개지면 대조가 거짓말을 한다.
+
+    `꺼짐` 으로 적으면 **게이트를 끄고 돈 실행**과 구분되지 않고, `미상` 으로 적으면
+    회귀 가드가 그것을 **관용**해(대조는 미상을 어긋남으로 세지 않는다) 조립이 거부된
+    조건이 조용히 대조를 통과한다. 셋은 서로 다른 조건이다.
+    """
+    from tests.test_condition_fingerprint import _script_fingerprint
+
+    미조립 = _script_fingerprint(
+        settings=declared_settings(
+            embedding_model="text-embedding-3-large", embedding_dimensions=3072
+        )
+    )["abstention_tau"]
+    꺼짐 = _script_fingerprint(
+        settings=declared_settings(
+            embedding_model="text-embedding-3-large",
+            embedding_dimensions=3072,
+            abstention_gate_enabled=False,
+        )
+    )["abstention_tau"]
+    정상 = _script_fingerprint()["abstention_tau"]
+
+    assert 꺼짐 == "꺼짐"
+    assert 정상 == "0.06"
+    assert len({미조립, 꺼짐, 정상, "미상"}) == 4

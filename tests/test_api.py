@@ -204,7 +204,7 @@ def service_client(
 
     def _override() -> ServiceOpener:
         return lambda: nullcontext(
-            InquiryService(pipeline=pipeline, app_conn=app_conn, readonly_conn=ro_conn)
+            InquiryService(open_pipeline=lambda: pipeline, app_conn=app_conn, readonly_conn=ro_conn)
         )
 
     app.dependency_overrides[get_service] = _override

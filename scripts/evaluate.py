@@ -63,7 +63,7 @@ from typing import Final, cast
 import psycopg
 from psycopg.rows import DictRow
 
-from reply_gate.config import Settings, get_settings
+from reply_gate.config import AbstentionGateWiringError, Settings, get_settings
 from reply_gate.contracts import RejectReason
 from reply_gate.db import connect, database_unavailable_reason, readonly_connect
 from reply_gate.evaluation import (
@@ -787,7 +787,21 @@ def _condition_fingerprint(
     상수를 다시 적지 않고 `Settings.abstention_gate()` 가 조립한 것을 읽는다 — 설정과
     지문이 갈리면 바뀐 축이 가드에 보이지 않는다.
     """
-    gate = run_settings.abstention_gate()
+    try:
+        gate = run_settings.abstention_gate()
+    except AbstentionGateWiringError:
+        # τ 가 검증되지 않은 임베딩 조건이다. **여기서 죽지 않는다** — 지문은 실행 조건을
+        # *기록*하는 자리이지 제품 실행 경로가 아니고, 측정 1 은 임베딩을 한 번도 쓰지
+        # 않는다. 여기서 예외를 올리면 채점만 하는 무과금 실행이 리포트 0개로 죽는다.
+        # 제품 쪽 거부는 `EvidenceCollector` 조립이 그대로 든다 — 측정 2·3 은 그 경로를
+        # 지나므로 방어의 자격은 줄지 않는다.
+        gate = None
+        # **"꺼짐"으로 적지 않는다.** 끈 실행과 조립이 거부된 실행은 다른 조건이고, 이
+        # 값은 대조에서 반드시 **어긋남**으로 읽혀야 한다("미상"으로 관용되면 안 된다).
+        gate_statistic = gate_tau = "미조립(τ 미검증 임베딩 조건)"
+    else:
+        gate_statistic = gate.statistic.value if gate is not None else "꺼짐"
+        gate_tau = f"{gate.tau:g}" if gate is not None else "꺼짐"
     return {
         # 라벨 버전 = 골든셋 내용 지문. 결정 0008 의 라벨 재정렬 전후가 여기서 갈린다.
         "label_version": content_digest(args.golden_set, prefix="golden-") or "미상",
@@ -800,8 +814,8 @@ def _condition_fingerprint(
         # 기권 게이트. **끈 실행은 τ=0 이 아니라 "꺼짐"이다** — 0 으로 적으면 "모든 질의를
         # 통과시킨 게이트"와 구분되지 않고, 그 둘은 다른 조건이다.
         # τ 는 `embedding_model` 과 짝으로 읽힌다(`regression_guard.PAIRED_FINGERPRINT_FIELDS`).
-        "abstention_gate_statistic": gate.statistic.value if gate is not None else "꺼짐",
-        "abstention_tau": f"{gate.tau:g}" if gate is not None else "꺼짐",
+        "abstention_gate_statistic": gate_statistic,
+        "abstention_tau": gate_tau,
         "query_rewrite": "on" if run_settings.query_rewrite_enabled else "off",
         # 대역 실행은 대역이라고 적는다 — 설정값 모델명을 적으면 산출물이 거짓 신고한다.
         "embedding_model": "결정론 대역" if args.stub_llm else run_settings.embedding_model,
