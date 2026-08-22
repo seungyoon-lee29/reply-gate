@@ -215,16 +215,26 @@ class VerdictContrast:
     population: str
     census: bool
     drafts: int
-    newly_rejected: tuple[str, ...]
-    newly_passed: tuple[str, ...]
+    #: 우회 라벨이 붙은 초안이 새로 기각됐다 — **미탐이 닫힌 건수**.
+    미탐_닫힘: tuple[str, ...]
+    #: 정상 라벨이 붙은 초안이 새로 기각됐다 — **새로 생긴 오탐**. 이 칸이 0 이 아니면
+    #: 채택하지 않는다 — 정상 초안 오탐률은 이 제품의 헤드라인 지표 하나다.
+    #: 라벨이 없으면 여기 담지 않는다.
+    새_오탐: tuple[str, ...]
+    #: 라벨이 없는 초안이 새로 기각됐다 — 방향을 단정할 수 없다.
+    분류_불가: tuple[str, ...]
+    #: 기각이던 것이 통과로 풀렸다. 정상 에코의 오기각이 풀린 자리가 여기다.
+    기각_풀림: tuple[str, ...]
 
     @property
     def headline(self) -> str:
         scope = "전수" if self.census else "프로브"
+        꼬리 = f" · 분류 불가 {len(self.분류_불가)}건" if self.분류_불가 else ""
         return (
             f"{self.population} ({scope}, 초안 {self.drafts}건): "
-            f"미탐 닫힘 {len(self.newly_rejected)}건 · "
-            f"정상 에코 오기각 {len(self.newly_passed)}건"
+            f"미탐 닫힘 {len(self.미탐_닫힘)}건 · "
+            f"새 오탐 {len(self.새_오탐)}건 · "
+            f"기각 풀림 {len(self.기각_풀림)}건{꼬리}"
         )
 
 
@@ -243,54 +253,106 @@ def _unsourced(
     return bool({value for _name, value in found} - {value for _name, value in allowed})
 
 
-def verdict_contrast(
-    population: str, cases: Sequence[tuple[str, Sequence[str], Sequence[str]]], *, census: bool
-) -> VerdictContrast:
-    newly_rejected: list[str] = []
-    newly_passed: list[str] = []
-    for case_id, draft_texts, evidence_texts in cases:
+def verdict_contrast(population: str, cases: Sequence[Case], *, census: bool) -> VerdictContrast:
+    """**새로 기각된 건수를 라벨로 가른다.**
+
+    가르지 않으면 우회를 닫은 건수와 정상 초안을 새로 기각한 건수가 한 칸에 들어가고,
+    그 칸은 접기를 넓힐수록 커진다 — 오탐이 늘어도 성과처럼 읽힌다. 그러면
+    *"오탐이 늘면 채택하지 않는다"* 를 이 대조로는 발동시킬 수 없다.
+    """
+    미탐_닫힘: list[str] = []
+    새_오탐: list[str] = []
+    분류_불가: list[str] = []
+    기각_풀림: list[str] = []
+    for case in cases:
         before = _unsourced(
-            draft_texts=draft_texts, evidence_texts=evidence_texts, fold_all_as_email=True
+            draft_texts=case.draft_texts,
+            evidence_texts=case.evidence_texts,
+            fold_all_as_email=True,
         )
         after = _unsourced(
-            draft_texts=draft_texts, evidence_texts=evidence_texts, fold_all_as_email=False
+            draft_texts=case.draft_texts,
+            evidence_texts=case.evidence_texts,
+            fold_all_as_email=False,
         )
         if after and not before:
-            newly_rejected.append(case_id)
+            if case.우회인가 is None:
+                분류_불가.append(case.case_id)
+            elif case.우회인가:
+                미탐_닫힘.append(case.case_id)
+            else:
+                새_오탐.append(case.case_id)
         if before and not after:
-            newly_passed.append(case_id)
+            기각_풀림.append(case.case_id)
     return VerdictContrast(
         population=population,
         census=census,
         drafts=len(cases),
-        newly_rejected=tuple(newly_rejected),
-        newly_passed=tuple(newly_passed),
+        미탐_닫힘=tuple(미탐_닫힘),
+        새_오탐=tuple(새_오탐),
+        분류_불가=tuple(분류_불가),
+        기각_풀림=tuple(기각_풀림),
     )
 
 
-def l1_fixture_cases() -> list[tuple[str, Sequence[str], Sequence[str]]]:
+@dataclass(frozen=True)
+class Case:
+    """판정 대조 1건. **라벨이 있어야 방향을 가를 수 있다.**
+
+    `우회인가` 는 이 초안이 **막아야 할 우회**인지(True), **통과해야 할 정상**인지(False),
+    라벨이 없는지(None)를 담는다. 이것이 없으면 새로 기각된 건수가 "미탐 닫힘"과
+    "새 오탐" 을 한 칸에 뭉쳐 담고, 그러면 *"오탐이 늘면 채택하지 않는다"* 가 발동할 수
+    없다 — 오탐 증가가 성과 칸을 키우는 모양이 된다.
+    """
+
+    case_id: str
+    draft_texts: Sequence[str]
+    evidence_texts: Sequence[str]
+    우회인가: bool | None
+
+
+def _pii_우회_기대(row: dict[str, Any]) -> bool:
+    """이 픽스처가 `pii_detected` 로 기각되기를 기대하는가."""
+    expected = row.get("expected")
+    if not isinstance(expected, dict):
+        return False
+    reasons = expected.get("reject_reasons")
+    reasons = reasons if isinstance(reasons, list) else []
+    return expected.get("verdict") == "reject" and "pii_detected" in reasons
+
+
+def l1_fixture_cases() -> list[Case]:
     return [
-        (
-            str(row["id"]),
-            _draft_texts(row["raw_draft"]),
-            [
+        Case(
+            case_id=str(row["id"]),
+            draft_texts=_draft_texts(row["raw_draft"]),
+            evidence_texts=[
                 str(evidence.get("evidence_text", evidence["content"]))
                 for evidence in row["evidences"]
             ],
+            우회인가=_pii_우회_기대(row),
         )
         for row in _jsonl(DEFAULT_L1_FIXTURES_PATH)
     ]
 
 
-def stub_draft_cases() -> list[tuple[str, Sequence[str], Sequence[str]]]:
+def stub_draft_cases() -> list[Case]:
+    """대역 초안에는 **라벨이 없다** — 우회인지 정상인지 이 프로브가 모른다.
+
+    그래서 여기서 뒤집힌 판정은 방향을 단정하지 않고 `분류 불가` 로 따로 센다. 모르는
+    것을 성과 칸에 넣지 않는 것이 이 대조의 목적이다.
+    """
     evidence = _policy_evidence()
     drafter = DraftGenerator(client=StubGenerationClient())
     evidence_texts = [item.evidence_text for item in evidence]
     return [
-        (
-            str(row["id"]),
-            _draft_texts(drafter.generate(inquiry=str(row["content"]), evidence=evidence).raw),
-            evidence_texts,
+        Case(
+            case_id=str(row["id"]),
+            draft_texts=_draft_texts(
+                drafter.generate(inquiry=str(row["content"]), evidence=evidence).raw
+            ),
+            evidence_texts=evidence_texts,
+            우회인가=None,
         )
         for row in _jsonl(DEFAULT_GOLDEN_SET_PATH)
     ]
@@ -324,14 +386,22 @@ def main() -> None:
         verdict_contrast("실제 초안 텍스트", stub_draft_cases(), census=False),
     ):
         print(item.headline)
-        for case_id in item.newly_rejected:
-            print(f"    기각으로 바뀜: {case_id}")
-        for case_id in item.newly_passed:
-            print(f"    통과로 바뀜: {case_id}")
+        for case_id in item.미탐_닫힘:
+            print(f"    미탐 닫힘 (우회가 기각으로): {case_id}")
+        for case_id in item.새_오탐:
+            print(f"    ⚠ 새 오탐 (정상이 기각으로): {case_id}")
+        for case_id in item.분류_불가:
+            print(f"    분류 불가 (라벨 없는 초안이 기각으로): {case_id}")
+        for case_id in item.기각_풀림:
+            print(f"    기각 풀림 (기각이 통과로): {case_id}")
 
     print(
         "\n마지막 줄은 전수가 아니라 프로브다 — 커밋된 리포트가 초안 문면을 담지 않아 "
         "실제 초안의 자유 모집단이 없다."
+    )
+    print(
+        "채택 조건은 **새 오탐 0건** 이다 — 오탐이 늘면 접기 확대를 채택하지 않는다. "
+        "라벨이 없는 초안의 뒤집힘은 성과 칸에도 오탐 칸에도 넣지 않고 분류 불가로 따로 센다."
     )
 
 

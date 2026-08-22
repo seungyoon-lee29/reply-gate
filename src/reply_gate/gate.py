@@ -90,10 +90,15 @@ NUMERIC_SEPARATOR_VARIANTS: frozenset[str] = frozenset(
     )
 )
 
-#: 번호 계열이 **무시하는** 결합 표식의 유니코드 범주. 변이선택자도 전부 여기 든다.
-#: ①의 12자와 반대로 **범주로 구현한다** — 이 계열은 범주 하나가 정확히 덮으므로,
-#: 대표 문자 몇 개로 한정하면 U+0300 같은 동일 계열이 그대로 남는다.
-_COMBINING_MARK_CATEGORY = "Mn"
+#: 번호 계열이 **무시하는** 결합 표식의 유니코드 범주 **접두사**. 변이선택자도 전부 든다.
+#: ①의 12자와 반대로 **범주로 구현한다** — 대표 문자 몇 개로 한정하면 U+0300 같은 동일
+#: 계열이 그대로 남기 때문이다.
+#:
+#: ⚠ **`Mn` 하나가 아니라 `M` 계열 전부다.** 유니메코드 결합 표식은 `Mn`(nonspacing) ·
+#: `Mc`(spacing combining) · `Me`(enclosing) 셋으로 갈린다. `Mn` 만 보면 `U+0903`(Mc)·
+#: `U+20E3`(Me)를 숫자 자리 사이에 끼운 번호가 그대로 통과한다 — 실제로 찍어 확인했고,
+#: 그것은 ①에서 경고한 "범주가 계열을 덮지 못한다"를 반대쪽에서 여는 것이다.
+_COMBINING_MARK_CATEGORY_PREFIX = "M"
 
 #: 폭 없는 서식 문자(U+200B·U+2060 등)의 범주. 공통 접기가 통째로 지운다.
 _FORMAT_CATEGORY = "Cf"
@@ -138,7 +143,7 @@ def fold_numeric_for_detection(text: str) -> str:
     return "".join(
         "-" if ch in NUMERIC_SEPARATOR_VARIANTS else ch
         for ch in folded
-        if unicodedata.category(ch) != _COMBINING_MARK_CATEGORY
+        if not unicodedata.category(ch).startswith(_COMBINING_MARK_CATEGORY_PREFIX)
     )
 
 

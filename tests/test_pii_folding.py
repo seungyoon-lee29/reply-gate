@@ -71,12 +71,17 @@ IGNORABLE_REPRESENTATIVES: tuple[str, ...] = (
 )
 
 #: 대표 2자로 한정하면 같은 계열이 그대로 남는다는 것을 보이는 대조군.
-#: 규칙 자체는 결합 표식(`Mn`) 범주 전체이고, 변이선택자도 전부 그 범주에 든다.
+#: 규칙 자체는 결합 표식 범주 **전체**(`Mn`·`Mc`·`Me`)이고, 변이선택자는 `Mn` 에 든다.
 IGNORABLE_SAME_FAMILY: tuple[str, ...] = (
-    "\u0300",  # COMBINING GRAVE ACCENT
-    "\ufe00",  # VARIATION SELECTOR-1
-    "\U000e0100",  # VARIATION SELECTOR-17
+    "\u0300",  # COMBINING GRAVE ACCENT (Mn)
+    "\ufe00",  # VARIATION SELECTOR-1 (Mn)
+    "\U000e0100",  # VARIATION SELECTOR-17 (Mn)
+    "\u0903",  # DEVANAGARI SIGN VISARGA (Mc — 간격을 차지하는 결합 표식)
+    "\u20e3",  # COMBINING ENCLOSING KEYCAP (Me — 감싸는 결합 표식)
 )
+
+#: 결합 표식 계열이 갈리는 **세 범주**. `Mn` 하나만 보면 나머지 둘이 그대로 뚫린다.
+COMBINING_CATEGORIES: tuple[str, ...] = ("Mn", "Mc", "Me")
 
 #: 접기를 넓히기 전에도 이미 잡히던 계열 — 이번 변경으로 잃지 않았는지 함께 본다.
 _FULLWIDTH_NUMBER = "\uff10\uff11\uff10-\uff19\uff19\uff19\uff19-\uff18\uff18\uff18\uff18"
@@ -231,11 +236,41 @@ def test_구분자_12자는_범주로_유도할_수_없는_열거_집합이다()
 def test_무시_문자는_결합_표식_범주로_덮는다() -> None:
     """음성 대조 — 고정 2자로 한정하면 같은 계열이 그대로 남는다.
 
-    변이선택자는 전부 결합 표식(`Mn`) 범주에 들어, 범주가 계열을 정확히 덮는다.
+    ⚠ **이 대조군은 `Mn` 하나로 채우면 안 된다.** 테스트가 고른 문자가 전부 `Mn` 이면
+    `{category(ch)} == {"Mn"}` 는 동어반복이고, 접기를 `Mn` 하나로 좁혀도 초록이다 —
+    실제로 그 상태였고 `U+0903`(Mc)·`U+20E3`(Me)가 숫자 자리 사이에서 통과했다.
+    그래서 대조군에 세 범주를 **각각** 넣고, 아래 검사가 셋이 다 들어 있음을 못박는다.
     """
     family = IGNORABLE_REPRESENTATIVES + IGNORABLE_SAME_FAMILY
-    assert {unicodedata.category(ch) for ch in family} == {"Mn"}
+    범주 = {unicodedata.category(ch) for ch in family}
+
+    assert 범주 == set(COMBINING_CATEGORIES), (
+        "결합 표식 계열은 Mn·Mc·Me 셋이다 — 한 범주만 담으면 이 검사가 동어반복이 된다"
+    )
     for mark in family:
+        assert fold_numeric_for_detection(f"010-9{mark}999-8888") == "010-9999-8888"
+
+
+@pytest.mark.parametrize("category", COMBINING_CATEGORIES)
+def test_세_범주가_각각_대조군에_들어_있다(category: str) -> None:
+    """검사 대상 목록이 비면 위 검사가 아무것도 지키지 않는다 — 범주별로 못박는다."""
+    family = IGNORABLE_REPRESENTATIVES + IGNORABLE_SAME_FAMILY
+
+    assert any(unicodedata.category(ch) == category for ch in family)
+
+
+def test_Mn_으로_좁히면_두_범주가_뚫린다() -> None:
+    """**고치기 전 동작을 그대로 재현한다** — 무엇이 열려 있었는지 검사가 기억한다.
+
+    접기가 `Mn` 하나만 볼 때 `Mc`·`Me` 는 숫자 자리 사이에 남아 번호가 달라 보인다.
+    이 검사는 규칙이 아니라 **유니코드 사실**을 확인하므로 구현을 따라 움직이지 않는다.
+    """
+    좁은_접기 = lambda text: "".join(  # noqa: E731
+        ch for ch in text if unicodedata.category(ch) != "Mn"
+    )
+
+    for mark in ("\u0903", "\u20e3"):
+        assert 좁은_접기(f"010-9{mark}999-8888") != "010-9999-8888"
         assert fold_numeric_for_detection(f"010-9{mark}999-8888") == "010-9999-8888"
 
 
