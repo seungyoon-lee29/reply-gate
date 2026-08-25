@@ -732,6 +732,48 @@ def test_contradictory_layer_states_are_rejected(
         _insert_attempt(app_conn, inquiry_id, **attempt_kwargs)
 
 
+# 위 파라미터들은 대부분 제약 여럿을 동시에 어겨, 어느 하나를 지워도 다른 제약이 대신 잡는다.
+# "층별 pass ⟺ 그 층 사유 0건" 의 cardinality 가지는 그래서 뮤테이션이 살아남는다 — 아래
+# 두 케이스는 그 가지 **하나만** 어기도록 짜고 제약 이름까지 못박는다(음성 대조).
+@pytest.mark.parametrize(
+    ("attempt_kwargs", "constraint"),
+    [
+        pytest.param(
+            {
+                "verdict": "reject",
+                "reject_reasons": ["pii_detected"],
+                "l1_verdict": "pass",
+                "l1_reject_reasons": ["pii_detected"],
+            },
+            "inquiry_attempts_l1_reasons_match_verdict",
+            id="l1-pass-with-nonzero-reasons",
+        ),
+        pytest.param(
+            {
+                "verdict": "reject",
+                "reject_reasons": ["unsupported_claim"],
+                "l1_verdict": "pass",
+                "l1_reject_reasons": [],
+                "l2_verdict": "pass",
+                "l2_reject_reasons": ["unsupported_claim"],
+            },
+            "inquiry_attempts_l2_reasons_match_verdict",
+            id="l2-pass-with-nonzero-reasons",
+        ),
+    ],
+)
+def test_layer_pass_with_reasons_is_rejected_by_its_own_constraint(
+    app_conn: psycopg.Connection[DictRow],
+    attempt_kwargs: dict[str, Any],
+    constraint: str,
+) -> None:
+    """층이 pass 인데 그 층 사유가 남아 있는 행은 **그 층의 제약이** 거부한다."""
+    inquiry_id = _insert_inquiry(app_conn)
+    with pytest.raises(psycopg.errors.CheckViolation) as excinfo:
+        _insert_attempt(app_conn, inquiry_id, **attempt_kwargs)
+    assert excinfo.value.diag.constraint_name == constraint
+
+
 def test_attempt_count_is_capped_at_two(app_conn: psycopg.Connection[DictRow]) -> None:
     """시도 기록은 최대 2건 (초안 + 재생성 1회) — DB 도 상한을 강제한다."""
     inquiry_id = _insert_inquiry(app_conn)
