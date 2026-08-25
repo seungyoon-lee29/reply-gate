@@ -9,9 +9,11 @@
 `.get_secret_value()` 로 **명시적으로 꺼내 쓴다**: 꺼내는 자리가 코드에 드러나야 어디서
 평문이 되는지 셀 수 있다. 전수 검사는 `tests/test_config_secrets.py` 가 한다.
 
-**접속 문자열(`database_url`)은 이 규칙 밖이다.** 값을 조립한 새 문자열이라 비밀번호를
-그대로 담고, 담지 않으면 DB 에 접속할 수 없다. 로그·오류 메시지용 설명은 비밀번호를
-빼고 따로 만든다(`db.describe_target`).
+**접속 문자열(`database_url`)도 같은 규칙 안이다.** 값을 조립한 새 문자열이라 비밀번호를
+그대로 담을 수밖에 없지만 — 담지 않으면 DB 에 접속할 수 없다 — 그 문자열을 **평문 `str` 로
+내놓을 이유는 없다.** 조립 결과를 `SecretStr` 로 감싸면 표시·덤프 경로가 필드와 같은
+자격으로 닫히고, 값이 필요한 psycopg 호출 한 줄만 `.get_secret_value()` 로 꺼낸다.
+로그·오류 메시지용 설명은 여전히 비밀번호를 빼고 따로 만든다(`db.describe_target`).
 """
 
 from __future__ import annotations
@@ -203,18 +205,25 @@ class Settings(BaseSettings):
         return AbstentionGate(statistic=self.abstention_gate_statistic, tau=self.abstention_tau)
 
     @property
-    def database_url(self) -> str:
-        """애플리케이션 계정(읽기/쓰기) 접속 URL.
+    def database_url(self) -> SecretStr:
+        """애플리케이션 계정(읽기/쓰기) 접속 URL — **비밀 전용 타입으로 내놓는다.**
 
-        **여기가 비밀번호가 평문이 되는 자리 둘 중 하나다** — 접속 문자열은 값을 조립한 새
-        문자열이라 필드의 표시·덤프 규칙 밖이다. 그래서 꺼내는 것을 이름 붙은 호출로 남긴다.
+        조립된 문자열은 비밀번호를 담을 수밖에 없다(담지 않으면 접속이 안 된다). 담는 것과
+        **평문 `str` 로 내놓는 것은 다른 문제**이고, 예전에는 뒤엣것까지 열려 있었다 — 이
+        속성을 로그·오류·설정 덤프에 그대로 실으면 비밀번호가 따라갔다. 감싸 두면 그 경로가
+        필드와 같은 자격으로 닫히고, 값이 필요한 자리는 `.get_secret_value()` 로 드러난다
+        (지금은 `db.connect` 한 줄뿐이다).
         """
-        return self._dsn(self.postgres_app_user, self.postgres_app_password.get_secret_value())
+        return SecretStr(
+            self._dsn(self.postgres_app_user, self.postgres_app_password.get_secret_value())
+        )
 
     @property
-    def readonly_database_url(self) -> str:
-        """text-to-SQL 실행 전용 계정(SELECT 만) 접속 URL. 평문이 되는 자리 둘 중 하나다."""
-        return self._dsn(self.postgres_ro_user, self.postgres_ro_password.get_secret_value())
+    def readonly_database_url(self) -> SecretStr:
+        """text-to-SQL 실행 전용 계정(SELECT 만) 접속 URL. 위와 같은 자격으로 감싼다."""
+        return SecretStr(
+            self._dsn(self.postgres_ro_user, self.postgres_ro_password.get_secret_value())
+        )
 
     def _dsn(self, user: str, password: str) -> str:
         auth = quote(user, safe="")

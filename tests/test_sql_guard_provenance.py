@@ -409,3 +409,56 @@ def test_임시테이블_출력_이름이_겹치면_허용_출처가_되지_않�
     )
 
     assert _safe(sql) == ()
+
+
+# ── 뮤테이션 구속 — 유래 판정의 네 분기를 각각 하나씩 문다 ──────────────────
+
+# 위 목록은 넓은 그물이라 **분기 넷이 그 안에서 조용히 살아남았다**: 뒤집어도 어느 검사도
+# 빨개지지 않았다(미해결 33). 원인은 35번과 같은 모양이다 — 닿는 입력이 있어도 그 입력이
+# **다른 이유로도** 거부돼, 노린 분기를 지워도 다른 분기가 대신 잡아 준다.
+#
+# 아래 넷은 각 분기 **하나만** 판정을 가르는 입력이다. 뮤테이션으로 RED 를 실제로 확인했다
+# (넷 다 `()` → `("customer_phone",)`):
+#
+# | 분기 | 뮤테이션 | 그 입력이 이 분기에만 닿는 이유 |
+# |---|---|---|
+# | `_resolve_bare_pii_safe` | `all` → `any` | 같은 이름을 내놓는 소스가 둘이고 한쪽만 증명됐다 |
+# | `nullif` 비교 상대 | UNKNOWN 검사 제거 | `a` 는 직접 컬럼이라 통과하고 `b` 만 UNKNOWN 이다 |
+# | `coalesce` 전부 고정값 | `DIRECT` 반환 | 인자에 UNKNOWN 이 없어 앞 가지에서 안 걸린다 |
+# | `o.*` projection | `DIRECT` 반환 | `coalesce` 인자 자리라 `_star_sources` 를 안 거친다 |
+#
+# **넷 다 유출로는 이어지지 않는다**(미해결 33 의 표가 이유를 든다). 그래도 검사를 붙이는
+# 것은, 코드가 옳다는 것을 지금 **사람이 읽어서** 알고 있을 뿐 검사가 붙들고 있지 않았기
+# 때문이다 — 심층 방어의 검사 공백은 다음 수정이 조용히 넓힐 수 있는 자리다.
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        pytest.param(
+            "WITH t AS (SELECT concat('010', '-9999-', '9999') AS customer_phone, order_no "
+            f"FROM orders {SCOPE}) "
+            f"SELECT customer_phone FROM t, orders WHERE orders.order_no = '{ORDER_NO}'",
+            id="한정자_없는_이름을_내놓는_소스가_둘이고_한쪽만_증명됐다",
+        ),
+        pytest.param(
+            f"SELECT nullif(customer_phone, '010-9999-9999') AS customer_phone FROM orders {SCOPE}",
+            id="nullif_의_비교_상대가_증명되지_않았다",
+        ),
+        pytest.param(
+            f"SELECT coalesce('미정', '없음') AS customer_phone FROM orders {SCOPE}",
+            id="coalesce_인자가_전부_고정값이라_유래가_없다",
+        ),
+        pytest.param(
+            f"SELECT coalesce(o.*, '미정') AS customer_phone FROM orders o {SCOPE}",
+            id="별표가_coalesce_인자_자리로_들어왔다",
+        ),
+    ],
+)
+def test_유래_판정의_각_분기를_뒤집으면_이_입력의_판정이_갈린다(sql: str) -> None:
+    """분기별 격리 입력 — 하나를 뒤집으면 이 검사 하나가 RED 가 된다.
+
+    `tests/AGENTS.md` 의 음성 대조 규율을 분기 단위로 내린 것이다. 넓은 목록에 파라미터를
+    더하는 것으로는 부족하다 — 그 입력이 **다른 이유로도** 거부되면 뮤테이션이 살아남는다.
+    """
+    assert _safe(sql) == ()

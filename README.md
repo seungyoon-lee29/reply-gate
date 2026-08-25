@@ -1755,19 +1755,19 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8000/inquiries
 ### 5. 검증 — **API 키 불필요**
 
 ```bash
-uv run pytest              # 1,452 passed
+uv run pytest              # 1,488 passed
 uv run ruff check .        # 0
-uv run ruff format --check .   # 183 files
-uv run mypy                # strict — 76 files, 0 errors
+uv run ruff format --check .   # 187 files
+uv run mypy                # strict — 79 files, 0 errors
 ```
 
-> **`uv run pytest` 는 DB 기동을 전제한다.** `db` 마커가 붙은 통합 테스트(176건)는
+> **`uv run pytest` 는 DB 기동을 전제한다.** `db` 마커가 붙은 통합 테스트(178건)는
 > Postgres 에 접속되지 않으면 **사유를 담아 skip** 된다 — 조용히 늘 skip 되는 테스트는 검증이 아니므로,
 > skip 사유에 접속 대상 · 원인 · 복구 명령(`docker compose up -d --wait`)이 함께 실린다.
 > **전체 녹색을 주장하려면 `docker compose up -d --wait` 를 먼저 실행해야 한다.**
 
 ```bash
-uv run pytest -m db        # DB 통합 테스트만 — 176 passed, 1,276 deselected
+uv run pytest -m db        # DB 통합 테스트만 — 178 passed, 1,310 deselected
 ```
 
 DB 통합 테스트는 세션당 1회 스키마 적용 + 주문 시딩을 하고, 각 테스트가 쓴 행은 롤백으로 되돌린다.
@@ -1883,15 +1883,32 @@ uv run python -m scripts.compare_retrieval --live --embedding-axis   # 임베딩
 - **조회 가드 둘** — 유래 추적을 임시 테이블·파생 테이블 안쪽까지 내렸고(정상 조회를 오기각하던
   자리), **캐스트 대상 타입 허용 목록 13종**을 넣었다(검사되지 않던 자리)
 - **자격 증명을 비밀 전용 타입으로** — 설정 객체를 통째 덤프해도 평문이 나오지 않는다.
-  평문 추출 자리는 **다섯 줄**이고 AST 검사가 그 개수를 못박는다.
-  **다만 접속 문자열은 이 조치 밖이다** — `database_url`·`readonly_database_url` 은 값을
-  조립한 새 문자열이라 필드 규칙이 걸리지 않고 비밀번호를 그대로 담는다. 실제로 새는지
-  재현하는 것이 먼저라 이번 범위에 넣지 않았고, `tests/test_config_secrets.py` 가
-  "의도적으로 열려 있다"를 못박는다([findings 24](docs/tracking/findings.md))
+  평문 추출 자리는 **여섯 줄**이고 AST 검사가 그 개수를 못박는다.
+  **접속 문자열은 나중에 닫혔다** — `database_url`·`readonly_database_url` 은 값을 조립한 새
+  문자열이라 오래 필드 규칙 밖에 있었다. 사이클 5 감사가 카나리아로 실제 유출을 재현한 뒤
+  (결정 0023 이 "재현이 먼저다"로 걸어 둔 조건) 조립 결과를 감싸 닫았고, 평문이 되는 지점이
+  psycopg 에 넘기는 **한 줄**로 좁아졌다([findings 24](docs/tracking/findings.md))
 - **조건 지문 18 → 25칸** — 넓히면 그 이전 산출물 전부가 새 항목에서 "미상"이 되어 계보가 한 번
   끊긴다. **재등재 시점이 그것을 감당할 유일한 자리**라 같은 사이클에 넣었다
 - **띄워서 돌렸다** — 세 장면을 웹 폼으로 흘려 처리 기록을 남기고 조회 라우트로 다시 열었다.
   **재현 확률과 미재현 회차까지 적었다**(위 데모 절)
+
+**사이클 종료 뒤, 사이클 1~5 적대 리뷰를 전부 반영하며 더한 것(2026-08-25):**
+
+- **판정 수단이 없던 게이트에 판정 수단을 세웠다** — 병합 조건이 *"링크와 앵커를 프래그먼트까지
+  검사해 0건 깨짐"* 을 요구했는데 **그 검사가 저장소에 없었다.** `scripts/check_links.py` 를
+  세워 `pytest` 에 물었고, **세우자마자 실제 깨진 앵커 1건을 잡았다**(같은 세션이 만든 것이고
+  사람은 못 봤다) — [findings 34](docs/tracking/findings.md) 종결
+- **문서가 문서를 검증하던 자리를 코드로 옮겼다** — 검증 건수 인용이 실측과 갈린 사고를 **네 번**
+  겪었다. 저장소에서 그 숫자를 아는 코드가 0줄이라 정본이 "마지막에 손으로 다시 센 사람"이었다.
+  이제 스위트가 문서의 인용을 그 실행의 실제 값과 대조한다(과거 기록 문단은 대조 대상이 아니다)
+- **뮤테이션에 안 물리던 조회 가드 분기 넷** — 코드는 옳았고 검사가 그 옳음을 붙들지 않았다.
+  넓은 음성 목록에 파라미터를 더하는 것으로는 안 닫힌다(다른 분기가 대신 잡아 준다). 분기
+  **하나만** 판정을 가르는 입력을 하나씩 짜 넣었다 — [findings 33](docs/tracking/findings.md) 종결
+- **규칙을 좁히지 말고 예외를 등재한다** — 비밀 필드 이름 규칙에서 오탐 하나를 피하려고 `token`
+  을 **규칙에서 뺐던** 자리를 되돌렸다. 규칙 축소는 **미래의 필드를 함께 지운다**
+- **허용 목록의 두 번째 사본** — 캐스트 대상 타입 13종을 보안 문서가 이름으로 적고, 코드와
+  갈리면 검사가 RED 를 낸다. "구현이 정한 목록으로 구현을 검증한다"를 끊는 자리다
 
 > **"구조 검사가 못박는다"의 한계를 함께 적는다.** 이 저장소의 구조 검사는 AST 를 읽되
 > **이름과 문면의 블록리스트**로 위반을 찾는다 — 실수는 잘 잡지만 **저자가 피하려고 마음먹으면
@@ -1955,4 +1972,4 @@ uv run python -m scripts.compare_retrieval --live --embedding-axis   # 임베딩
 | [`data/promoted_baseline.json`](data/promoted_baseline.json) | **승격 기준선 참조** — 회귀 판정을 구속하는 유일한 기준선. **사람만 바꾼다**(구조 테스트가 쓰기 경로를 막는다) |
 | [`scripts/handcalc_adoption_axis.py`](scripts/handcalc_adoption_axis.py) | 채택 축 손계산 산출물 — **무과금·오프라인**, 커밋된 검색 리포트만 읽는다 |
 | [`scripts/seed_orders.py`](scripts/seed_orders.py) · [`scripts/index_policies.py`](scripts/index_policies.py) | 시딩 · 인덱싱 |
-| [`tests/`](tests/) | **1,452건** (그중 DB 통합 **176건**) |
+| [`tests/`](tests/) | **1,488건** (그중 DB 통합 **178건**) |

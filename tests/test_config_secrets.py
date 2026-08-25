@@ -11,10 +11,15 @@
 평문 그대로 실렸다. 사이클 5 에서 네 필드를 **비밀 전용 타입**(`pydantic.SecretStr`)으로
 옮겨 두 경로를 함께 닫았고, 이 파일이 그것을 **덤프 경로 전수**로 지킨다.
 
-**닫지 못한 경로는 닫았다고 적지 않는다.** `settings.database_url` 처럼 값을 조립한
-**새 문자열**은 필드 규칙 밖이라 비밀번호를 그대로 담는다(아래 마지막 검사가 그 사실을
-못박는다). `print(settings.openai_api_key.get_secret_value())` 처럼 값을 직접 꺼내 찍는
-것도 어떤 설정 클래스도 막지 못한다 — 그건 리뷰가 막는다.
+**접속 문자열도 닫았다(미해결 24).** `settings.database_url` 은 값을 조립한 **새
+문자열**이라 오래 필드 규칙 밖에 있었다 — 담는 것과 평문 `str` 로 내놓는 것을 가르지
+않았기 때문이다. 사이클 5 감사가 카나리아로 실제 유출을 재현한 뒤(결정 0023 이 걸어 둔
+조건), 조립 결과를 비밀 전용 타입으로 감싸 표시·덤프를 함께 닫았다.
+
+**닫지 못한 경로는 닫았다고 적지 않는다.**
+`print(settings.openai_api_key.get_secret_value())` 처럼 값을 직접 꺼내 찍는 것은 어떤
+설정 클래스도 막지 못한다 — 그건 리뷰가 막는다. 꺼내는 자리의 **수**가 늘지 않는 것은
+아래 자리 세기가 지킨다.
 """
 
 from __future__ import annotations
@@ -40,9 +45,20 @@ from tests.conftest import declared_settings
 #: 생기는 순간 그 안의 런타임 코드가 조용히 검사 밖으로 나간다(`tests/AGENTS.md` 불변식 4).
 _패키지_루트 = Path(reply_gate.__file__).resolve().parent
 
-#: 자격 증명으로 읽어야 하는 필드 이름. `judge_max_output_tokens` 같은 이름이 걸리지
-#: 않도록 "token" 단독은 넣지 않는다 — 실제 비밀은 키·비밀번호·시크릿 세 갈래다.
-_비밀_이름 = re.compile(r"(api_key|password|secret)")
+#: 자격 증명으로 읽어야 하는 필드 이름.
+#:
+#: **넓게 잡고 예외를 등재한다 — 규칙을 좁히지 않는다.** 처음에는 `judge_max_output_tokens`
+#: 오탐을 피하려고 `token` 을 규칙에서 **뺐다.** 그러면 지금 있는 넷은 전부 잡히지만 앞으로
+#: 추가될 `*_token`·`*_credential` 형 비밀이 "전수" 검사 밖으로 **조용히** 나간다 — 규칙 축소는
+#: 미래의 필드를 함께 지운다. 예외 등재는 그렇지 않다: 새 필드는 자동으로 걸리고, 비밀이 아닌
+#: 것만 사유와 함께 여기 이름으로 남는다(사이클 5 감사 §3-6 의 재작성).
+_비밀_이름 = re.compile(r"(api_key|password|secret|token|credential)")
+
+#: 이름은 걸리지만 비밀이 아닌 필드 — **사유를 함께 적는다.** 아래 검사가 이 목록이 실제
+#: 필드인지, 그리고 규칙에 실제로 걸리는지를 양쪽으로 확인한다(죽은 예외 금지).
+_비밀_아님: dict[str, str] = {
+    "judge_max_output_tokens": "판정 응답 토큰 상한 — 수치 설정이고 자격 증명이 아니다",
+}
 
 
 def _비밀_필드_이름() -> list[str]:
@@ -51,7 +67,9 @@ def _비밀_필드_이름() -> list[str]:
     다음에 추가될 자격 증명 필드도 같은 검사에 자동으로 걸리게 하려는 것이다 — 목록을
     손으로 적으면 새 필드가 조용히 가드 밖으로 나간다.
     """
-    return sorted(name for name in Settings.model_fields if _비밀_이름.search(name))
+    return sorted(
+        name for name in Settings.model_fields if _비밀_이름.search(name) and name not in _비밀_아님
+    )
 
 
 def _카나리아_값() -> dict[str, str]:
@@ -177,8 +195,8 @@ def test_비밀로_읽히는_필드는_전부_비밀_전용_타입이다() -> No
     """
     평문_필드 = sorted(
         name
-        for name, field in Settings.model_fields.items()
-        if _비밀_이름.search(name) and field.annotation is not SecretStr
+        for name in _비밀_필드_이름()
+        if Settings.model_fields[name].annotation is not SecretStr
     )
     assert not 평문_필드, (
         "자격 증명 필드는 `SecretStr` 이어야 한다 — 평문 `str` 은 표시를 가려도 "
@@ -193,11 +211,7 @@ def test_비밀로_읽히는_필드는_전부_repr_에서_빠져_있다() -> Non
     설정 덤프에 자리를 만들지 않는다. 두 겹을 유지하는 것이 사고가 난 경로에 대한 이 저장소의
     답이다.
     """
-    새는_필드 = sorted(
-        name
-        for name, field in Settings.model_fields.items()
-        if _비밀_이름.search(name) and field.repr
-    )
+    새는_필드 = sorted(name for name in _비밀_필드_이름() if Settings.model_fields[name].repr)
     assert not 새는_필드, (
         "자격 증명 필드는 `Field(repr=False)` 여야 한다 — repr 에 실리면 설정 객체가 실린 "
         f"자리마다 값이 평문으로 따라간다: {', '.join(새는_필드)}"
@@ -237,13 +251,16 @@ def test_값이_필요한_곳은_명시적으로_꺼내_쓴다() -> None:
     assert not 틀린_것, f"자격 증명 값이 꺼내지지 않는다: {', '.join(틀린_것)}"
 
 
-def test_접속_문자열은_비밀번호를_그대로_담는다__이_수정의_범위가_아니다() -> None:
-    """**닫히지 않은 경로를 닫혔다고 적지 않기 위한 검사다.**
+def test_접속_문자열도_비밀_전용_타입이라_표시_덤프로_새지_않는다() -> None:
+    """**미해결 24 를 닫은 자리다** — 예전에는 이 경로가 의도적으로 열려 있었다.
 
-    `database_url` 은 값을 조립한 **새 문자열**이라 필드 규칙 밖이다. 비밀 전용 타입은
-    필드의 표시·덤프를 닫을 뿐 그 문자열을 만들지 못하게 하지 않는다 — 그리고 만들지
-    못하면 DB 에 접속할 수 없다. 이 검사는 그 경로가 **의도적으로 열려 있다**는 사실을
-    못박는다(로그·오류 메시지는 `db.describe_target` 이 따로 담당한다).
+    조립된 DSN 은 비밀번호를 담을 수밖에 없다(담지 않으면 접속이 안 된다). 그러나 **담는
+    것과 평문 `str` 로 내놓는 것은 다른 문제**다 — 예전 구현은 `str` 을 돌려줘서 이 속성을
+    로그·오류·설정 덤프에 그대로 실으면 비밀번호가 따라갔다. 사이클 5 감사가 카나리아로
+    그 사실을 재현했고(결정 0023 이 "재현이 먼저다"로 미뤄 둔 조건), 여기서 감싸 닫는다.
+
+    값이 필요한 자리는 여전히 `.get_secret_value()` 로 드러난다 — 아래 자리 세기가 그 수를
+    센다.
     """
     settings = declared_settings(
         postgres_app_password="canary-app-pw",
@@ -252,9 +269,35 @@ def test_접속_문자열은_비밀번호를_그대로_담는다__이_수정의_
     # **설정 객체를 단언식 밖에 둔다** — 실패 출력이 객체를 통째로 repr 한다(불변식 9).
     앱_dsn = settings.database_url
     ro_dsn = settings.readonly_database_url
+    표시 = f"{앱_dsn!r} {앱_dsn} {ro_dsn!r} {ro_dsn}"
 
-    assert 앱_dsn == "postgresql://reply_gate_app:canary-app-pw@localhost:5433/reply_gate"
-    assert ro_dsn == "postgresql://reply_gate_ro:canary-ro-pw@localhost:5433/reply_gate"
+    assert isinstance(앱_dsn, SecretStr)
+    assert isinstance(ro_dsn, SecretStr)
+    assert "canary-app-pw" not in 표시
+    assert "canary-ro-pw" not in 표시
+    assert 앱_dsn.get_secret_value() == (
+        "postgresql://reply_gate_app:canary-app-pw@localhost:5433/reply_gate"
+    )
+    assert ro_dsn.get_secret_value() == (
+        "postgresql://reply_gate_ro:canary-ro-pw@localhost:5433/reply_gate"
+    )
+
+
+def test_접속_문자열이_설정_덤프_전수에서도_평문으로_실리지_않는다() -> None:
+    """**속성이라 필드 덤프에는 안 실린다** — 그래서 조립해 넣은 자리를 따로 훑는다.
+
+    닫혔다는 주장의 실제 내용은 "이 값을 어디에 실어도 비밀번호가 안 따라온다"이므로,
+    필드 훑기와 같은 덤프 경로 전수에 DSN 을 **직접 얹어** 확인한다.
+    """
+    settings = declared_settings(postgres_app_password="canary-dump-pw")
+
+    class _DSN_을_담은_모델(BaseModel):
+        dsn: SecretStr
+
+    카나리아 = {"dsn": "canary-dump-pw"}
+    샌_것 = _샌_자리(_DSN_을_담은_모델(dsn=settings.database_url), 카나리아)
+
+    assert not 샌_것, f"접속 문자열이 덤프 경로로 샜다: {', '.join(샌_것)}"
 
 
 def _평문으로_꺼내는_자리() -> dict[str, int]:
@@ -278,28 +321,30 @@ def _평문으로_꺼내는_자리() -> dict[str, int]:
     return 자리
 
 
-def test_평문으로_꺼내는_자리는_두_모듈_다섯_줄뿐이다() -> None:
+def test_평문으로_꺼내는_자리는_세_모듈_여섯_줄뿐이다() -> None:
     """**꺼내는 자리를 셀 수 있게 두는 것이 이 설계의 요점이다.**
 
     비밀 전용 타입이 막는 것은 실수로 흘러나가는 표시·덤프이지, 값을 꺼내는 것 자체가
     아니다(꺼내지 못하면 접속도 호출도 못 한다). 그래서 지켜야 할 불변식은 "꺼내지 않는다"가
     아니라 **"꺼내는 자리가 코드에 드러나고 그 수가 늘지 않는다"** 이다.
 
-    - `config.py` 2회 — 접속 문자열 조립(앱 계정·read-only 계정). 접속 문자열은 값을
-      조립한 새 문자열이라 필드 규칙 밖이고, 이 수정의 범위도 아니다.
+    - `config.py` 2회 — 접속 문자열 조립(앱 계정·read-only 계정)에 쓸 비밀번호를 꺼낸다.
+    - `db.py` 1회 — 조립된 DSN 을 psycopg 에 넘기기 직전. **미해결 24 를 닫으면서 생긴
+      자리다** — 접속 문자열을 `SecretStr` 로 감싼 대가로, 평문이 되는 지점이 "속성을 읽는
+      모든 곳"에서 **이 한 줄**로 좁아졌다.
     - `llm.py` 3회 — SDK 생성자 인자(OpenAI 생성·Anthropic 판정·OpenAI 임베딩).
 
     새 자리가 생기면 이 검사가 깨진다. 깨졌을 때 할 일은 숫자를 올리는 것이 아니라 **그
     자리가 정말 필요한지 먼저 따지는 것**이다.
     """
-    assert _평문으로_꺼내는_자리() == {"config.py": 2, "llm.py": 3}
+    assert _평문으로_꺼내는_자리() == {"config.py": 2, "db.py": 1, "llm.py": 3}
 
 
 def test_비밀번호가_없으면_접속_문자열에_자격_증명_구획이_없다() -> None:
     """**양성 대조** — 빈 비밀번호에서도 DSN 이 정상 조립된다(조건 보존)."""
     settings = declared_settings()
-    앱_dsn = settings.database_url
-    ro_dsn = settings.readonly_database_url
+    앱_dsn = settings.database_url.get_secret_value()
+    ro_dsn = settings.readonly_database_url.get_secret_value()
 
     assert 앱_dsn == "postgresql://reply_gate_app@localhost:5433/reply_gate"
     assert ro_dsn == "postgresql://reply_gate_ro@localhost:5433/reply_gate"
@@ -325,3 +370,39 @@ def test_선언값_헬퍼는_환경도_env_파일도_읽지_않는다(monkeypatc
 def test_선언값_헬퍼도_명시한_덮어쓰기는_받는다() -> None:
     """차단 대상은 **환경**이지 호출자의 명시적 인자가 아니다."""
     assert declared_settings(abstention_tau=0.02).abstention_tau == 0.02
+
+
+def test_비밀_아님_예외가_죽어_있지_않다() -> None:
+    """예외 목록은 **살아 있어야** 한다 — 죽은 예외는 규칙을 조용히 넓힌다.
+
+    두 방향을 함께 본다. ① 이름이 실제 설정 필드인가(필드가 개명·삭제되면 예외가 유령이
+    된다). ② 그 이름이 규칙에 **실제로 걸리는가**(안 걸리면 예외가 필요 없는데 남아 있어,
+    다음 사람이 "이건 이미 빠져 있구나"로 잘못 읽는다).
+    """
+    유령 = sorted(name for name in _비밀_아님 if name not in Settings.model_fields)
+    안_걸리는_것 = sorted(name for name in _비밀_아님 if not _비밀_이름.search(name))
+
+    assert 유령 == [], f"예외로 적힌 이름이 설정 필드가 아니다 — 개명·삭제 뒤 남은 유령이다: {유령}"
+    assert 안_걸리는_것 == [], (
+        f"규칙에 걸리지도 않는 이름이 예외에 있다 — 예외가 아무것도 하지 않는다: {안_걸리는_것}"
+    )
+    assert all(사유.strip() for 사유 in _비밀_아님.values()), "예외에는 사유를 함께 적는다"
+
+
+def test_규칙이_토큰_계열_비밀을_다시_잡는다() -> None:
+    """**음성 대조** — 규칙을 넓힌 이유가 실제로 성립하는지 잰다.
+
+    예전 규칙(`api_key|password|secret`)에서는 `*_token`·`*_credential` 형 이름이 통째로
+    빠졌다. 그 이름들이 지금 규칙에 걸리고, 예외로 등재된 것만 빠지는지 확인한다.
+    """
+    걸리는_것 = [
+        이름
+        for 이름 in ("slack_bot_token", "gcp_credential", "refresh_token")
+        if _비밀_이름.search(이름)
+    ]
+
+    assert 걸리는_것 == ["slack_bot_token", "gcp_credential", "refresh_token"]
+    assert not re.compile(r"(api_key|password|secret)").search("slack_bot_token"), (
+        "예전 규칙이 토큰 계열을 놓쳤다는 전제가 이 검사의 근거다"
+    )
+    assert "judge_max_output_tokens" not in _비밀_필드_이름()

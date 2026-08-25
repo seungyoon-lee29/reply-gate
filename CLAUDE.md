@@ -130,3 +130,8 @@ uv run pytest -m db              # skip 0 이어야 한다
 
 DB 없이 돌리면 `db` 마커 테스트가 사유를 담아 skip 된다. **전체 녹색을 주장하려면
 `pytest -m db` 로 skip 0 을 따로 확인해야 한다.**
+
+**문서 링크·앵커 검사와 검증 건수 대조는 `pytest` 안에 있다** — 별도 명령이 아니다.
+전자는 `scripts/check_links.py`(`uv run python -m scripts.check_links` 로 따로도 돈다),
+후자는 문서가 인용한 건수를 그 실행의 실제 값과 대조한다. **건수 대조는 전체 스위트에서만
+성립한다** — 경로·`-k`·`-m` 을 주면 사유를 담아 skip 된다.

@@ -4,11 +4,11 @@ docs/security.md "text-to-SQL 안전장치" 1번(read-only DB 계정)의 코드 
 실행 경로는 반드시 `readonly_connect()` 를 쓴다 — 권한 자체가 SELECT 뿐이라 실수로
 쓰기 경로를 타도 DB 가 거부한다.
 
-DSN 은 `reply_gate.config.Settings` 가 만든다. **이 모듈은 자격 증명을 꺼내지 않는다** —
-비밀번호 필드는 비밀 전용 타입이고, 평문으로 꺼내는 자리는 접속 문자열을 조립하는
-`Settings.database_url`/`readonly_database_url` 두 줄뿐이다. 여기서는 이미 조립된 문자열을
-받아 psycopg 에 넘긴다. 오류 메시지·로그에 쓰는 접속 대상 설명은 비밀번호를 아예 담지
-않는다(`describe_target`).
+DSN 은 `reply_gate.config.Settings` 가 만들고 **비밀 전용 타입으로 내놓는다**. 그래서 이
+모듈에 평문으로 꺼내는 자리가 정확히 **한 줄** 생긴다 — psycopg 에 넘기기 직전이다. 그 한
+줄이 이 모듈에서 비밀번호가 문자열이 되는 유일한 자리이고, 그 밖의 어디에도 DSN 을 그대로
+싣지 않는다. 오류 메시지·로그에 쓰는 접속 대상 설명은 비밀번호를 아예 담지 않는다
+(`describe_target`).
 """
 
 from __future__ import annotations
@@ -53,7 +53,8 @@ def connect(
     생기지 않는다.
     """
     settings = settings if settings is not None else get_settings()
-    dsn = settings.readonly_database_url if readonly else settings.database_url
+    # 이 모듈에서 비밀번호가 평문 문자열이 되는 **유일한 줄**이다 — psycopg 에 넘기기 직전.
+    dsn = (settings.readonly_database_url if readonly else settings.database_url).get_secret_value()
     options = (
         None if statement_timeout_ms is None else f"-c statement_timeout={statement_timeout_ms:d}"
     )
