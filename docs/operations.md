@@ -141,11 +141,11 @@ uv run uvicorn reply_gate.api:app --reload
 ## 7. 검증 — **API 키 불필요**
 
 ```bash
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy
-uv run pytest
-uv run pytest -m db        # skip 0 이어야 한다
+uv run ruff check .            # 0
+uv run ruff format --check .   # 193 files
+uv run mypy                    # strict — 81 files, 0 errors
+uv run pytest                  # DB 를 띄운 실행에서만 건수 대조가 선다
+uv run pytest -m db            # 178 passed, 1,329 deselected · skip 0 이어야 한다
 ```
 
 `pytest` 는 DB 기동을 전제한다. DB 가 없으면 `db` 마커 테스트가 사유를 담아 skip 되므로,
@@ -155,7 +155,7 @@ uv run pytest -m db        # skip 0 이어야 한다
 링크 쪽은 따로도 돌릴 수 있다:
 
 ```bash
-uv run python -m scripts.check_links        # 문서 46개 · 링크 397개 · 깨짐 0건
+uv run python -m scripts.check_links        # 문서 50개 · 링크 424개 · 깨짐 0건
 ```
 
 **건수 대조는 전체 스위트에서만 성립한다.** 경로·`-k`·`-m` 을 주면 그 세션이 스위트가 아니므로

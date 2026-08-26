@@ -22,6 +22,11 @@
 │   ├── engineering-notes.md       → 실제로 뚫렸던 경로와 걸렸던 함정
 │   ├── operations.md              → 설치부터 실행·검증·지표 산출까지의 순서
 │   ├── contracts.md               → HTTP 표면 4개와 답변 계약
+│   ├── demo.md                    → README 데모 절의 나머지 네 장면
+│   ├── gates.md                   → README L1·L2 절의 세부. 판정 규칙 정본은 business-rules.md
+│   ├── retrieval.md               → README 검색 절의 사다리 이후. 실측 정본은 tracking/status.md
+│   ├── evaluation.md              → README 평가 절의 나머지 + 비용 분해.
+│   │                                달러 정본은 tracking/pricing.md
 │   └── tracking/
 │       ├── status.md              → 지금 어디까지 왔는지 + 첫 실측값
 │       ├── pricing.md             → 단가 표(기준일 명시)와 계열별 비용 분해 — 달러 수치의 정본
