@@ -7,34 +7,45 @@
     "등재되지 않은 상태는 0 이나 '통과'가 아니라 '기준선 미등재'로 리포트에 적힌다."
   ],
   "promotion": {
-    "promoted_at": "2026-08-19",
-    "promoted_by": "사용자 (사이클 4 · 관측 요약 보고 뒤 확인)",
-    "reason": "현 기본값 조합(재작성 켜짐 · 컷 0.30 · 캐싱 없음 · T6 이전 판정 프롬프트)의 첫 풀셋 라이브 3회. 관측 넷을 모두 충족했다 — G17 재작성 유지 3/3 · G18·G01·G02 상충쌍 동시 채택 각 3/3 · G21-G24 판정 층 인계 3/3 · G04 정답 조항 채택 + 정상 답변 3/3. 측정 1 은 앞선 여섯 세트와 동일하고 측정 3 은 3회 중 2회가 동일(1회는 오탐 1건 — 9세트 만의 첫 관측). 새 회귀 가드가 붙은 코드로 산출돼 근거 부분 손실 검사가 온전히 작동하는 첫 세트다.",
-    "supersedes": []
+    "promoted_at": "2026-08-21",
+    "promoted_by": "사용자 (사이클 5 · 관측 요약 보고 뒤 확인)",
+    "reason": "현 기본값 조합의 **첫 풀셋 라이브 3회**다 — 기권 게이트가 배선되고 판정 픽스처가 교정된 뒤의 조건으로 `measurement_scope=full` 을 돌린 세트가 그전까지 하나도 없어, 구속 줄이 영구히 '대조 불가'였다. 관측 항목 1~4 가 **넷 모두 3/3** 성립했다(합격선은 3회 중 2회) — ① G04 정답 조항 채택 + 정상 답변 3/3 · ② G21~G24 검색 단계 기권으로 시도 0건 3/3 · ③ G18·G01·G02 상충쌍 동시 채택 각 3/3 · ④ G17 재작성으로 정답 조항 채택 3/3. 측정 1 은 세 회차 모두 검출 100.0%(26/26) · 오탐 0.0%(0/9) 이고 **사전 무과금 대조의 예측과 정확히 같다**(합격선 항목이 아니라 동일성 확인이다 — 채점표가 27건에서 35건으로 늘었으므로 앞선 세트의 19/19·0/8 과 나란히 인용하지 않는다). 측정 2 일치율은 세 회차 모두 100.0%(30/30). 측정 3 은 세 회차 모두 L2 검출 100.0%(6/6) · 오탐 0.0%(0/5) 이다(사람의 관측이고 합격선 항목이 아니다). 미끼 기각 재현은 0/5·1/5·1/5 로 등재 시점에 커밋돼 있던 `evaluation-live-l2-*` 12세트의 관측 범위(0/5~2/5, 직전 승격 세트 -7·-8 도 0/5) 안이다. 사이클 1 계열 세 세트까지 더하면 15세트이고 범위는 같다. 이 세트가 단계별 지연과 계열별 캐시 적중 토큰을 처음으로 실측했고, 조건 지문이 18칸에서 25칸으로 넓어진 뒤의 첫 등재다 — 그래서 앞선 커밋 산출물 전부가 새 일곱 항목에 대해 '미상'이 되고 대조 계보가 여기서 한 번 끊긴다. 실측 합계 $1.656935(단가 기준일 2026-08-19).",
+    "supersedes": [
+      "evaluation-live-l2-7",
+      "evaluation-live-l2-8",
+      "evaluation-live-l2-9"
+    ]
   },
   "report_stems": [
-    "evaluation-live-l2-7",
-    "evaluation-live-l2-8",
-    "evaluation-live-l2-9"
+    "evaluation-live-l2-28",
+    "evaluation-live-l2-29",
+    "evaluation-live-l2-30"
   ],
   "fingerprint": {
-    "label_version": "golden-79e0da454f3a",
-    "retrieval_labels_version": "labels-7fb4ceef7aa6",
+    "abstention_gate_statistic": "rank1_minus_rank_k_spread",
+    "abstention_tau": "0.06",
+    "abstention_undefined_policy": "abstain-771b954a3abd",
     "acceptance_cut": "0.3",
-    "abstention_gate_statistic": "미배선",
-    "abstention_tau": "미배선",
-    "query_rewrite": "on",
-    "embedding_model": "text-embedding-3-small",
+    "draft_rule_version": "draftrules-a0e153753e62",
     "embedding_dimensions": "1536",
-    "top_k": "5",
-    "generation_model": "gpt-5.6-terra",
-    "judge_model": "claude-sonnet-5",
-    "judge_effort": "기본값",
-    "judge_prompt_version": "judge-e26f6c8e0b84",
-    "judge_fixture_version": "fixture-836322e97320",
-    "judge_prompt_caching": "off",
-    "measurement_scope": "full",
+    "embedding_model": "text-embedding-3-small",
     "generation_effort": "기본값",
-    "l2_enabled": "on"
+    "generation_model": "gpt-5.6-terra",
+    "judge_effort": "기본값",
+    "judge_fixture_version": "fixture-2b8f33392b36",
+    "judge_model": "claude-sonnet-5",
+    "judge_prompt_caching": "off",
+    "judge_prompt_version": "judge-e26f6c8e0b84",
+    "judge_thinking": "미전송(계열 기본)",
+    "l1_fixture_version": "l1fixture-6eb235f9dcd0",
+    "l2_enabled": "on",
+    "label_version": "golden-79e0da454f3a",
+    "measurement_scope": "full",
+    "query_rewrite": "on",
+    "retrieval_labels_version": "labels-7fb4ceef7aa6",
+    "retrieval_order": "db=[embedding <=> %s, evidence_id] · merge=[a>b>c]",
+    "run_completion": "중단 없음",
+    "sql_guard_version": "sqlguard-1de0777824a4",
+    "top_k": "5"
   }
 }

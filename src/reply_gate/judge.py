@@ -33,6 +33,10 @@
 read 는 싸다), 켜짐 조건의 `input_tokens` 는 적중분을 뺀 값이라 합치면 적중이 "입력 토큰
 감소"로 위장한다. 재지 않은 실행에서는 0 이 아니라 `None`(미측정)이다.
 
+**판정 호출에 흐른 벽시계(`elapsed_ms`)도 같은 자격으로 노출한다** — 호출자가 판정 구간의
+시간으로 쓴다. 형식 재시도로 버려진 시도의 시간까지 합산하며, 실패로 끝나면 두 예외가 그
+값을 그대로 들고 올라간다. 프롬프트·모델·캐싱 어느 것도 이 때문에 바뀌지 않는다.
+
 해석하지 못한 산출은 통과가 아니라 거부다(fail-closed): 사유 2종 밖 값, 판정값 밖 값,
 수집 근거에 없는 ID 의 모순 쌍, verdict·사유·세부 배열이 서로 어긋나는 산출은 전부
 형식 불일치로 취급한다 — 어긋난 판정 기록이 그대로 남으면 헤드라인 지표가 오염된다.
@@ -410,6 +414,10 @@ class JudgeOutcome:
     input_tokens: int
     output_tokens: int
     attempts: int
+    #: 이 판정 호출에 흐른 벽시계(ms) — **형식 재시도와 전송 재시도를 포함한 합산**이다.
+    #: 토큰과 같은 규칙으로 누적한다: 버려진 시도도 그만큼 시간을 썼다. 실패로 끝나면
+    #: 예외(`LLMFormatError`/`LLMCallError`)의 `elapsed_ms` 가 같은 값을 들고 올라간다.
+    elapsed_ms: float = 0.0
     #: 캐시에 **쓴**/캐시에서 **읽은** 토큰. 단가가 다르므로 뭉뚱그리지 않는다.
     #: 캐싱을 쓰지 않는 경로에서는 0 이 아니라 `None`(해당 없음/미측정)이다.
     cache_creation_input_tokens: int | None = None
@@ -465,6 +473,9 @@ class Judge:
         """
         input_tokens = 0
         output_tokens = 0
+        # 경과도 토큰과 같은 자격으로 누적한다 — 형식이 어긋나 버려진 시도의 시간도
+        # 이 구간이 쓴 시간이다. 여기서 마지막 시도만 재면 판정 구간이 실제보다 짧아진다.
+        elapsed_ms = 0.0
         # 캐시 계열은 **0 에서 시작하지 않는다** — 한 번도 보고되지 않으면 미측정이다.
         cache_creation: int | None = None
         cache_read: int | None = None
@@ -486,6 +497,7 @@ class Judge:
             except LLMFormatError as exc:
                 input_tokens += exc.input_tokens
                 output_tokens += exc.output_tokens
+                elapsed_ms += exc.elapsed_ms
                 cache_creation = accumulate_optional_tokens(
                     cache_creation, exc.cache_creation_input_tokens
                 )
@@ -511,10 +523,12 @@ class Judge:
                     cache_read_input_tokens=accumulate_optional_tokens(
                         cache_read, exc.cache_read_input_tokens
                     ),
+                    elapsed_ms=elapsed_ms + exc.elapsed_ms,
                 ) from exc
 
             input_tokens += completion.input_tokens
             output_tokens += completion.output_tokens
+            elapsed_ms += completion.elapsed_ms
             cache_creation = accumulate_optional_tokens(
                 cache_creation, completion.cache_creation_input_tokens
             )
@@ -532,6 +546,7 @@ class Judge:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 attempts=attempt,
+                elapsed_ms=elapsed_ms,
                 cache_creation_input_tokens=cache_creation,
                 cache_read_input_tokens=cache_read,
             )
@@ -545,4 +560,5 @@ class Judge:
             transport_attempts=sent,
             cache_creation_input_tokens=cache_creation,
             cache_read_input_tokens=cache_read,
+            elapsed_ms=elapsed_ms,
         )

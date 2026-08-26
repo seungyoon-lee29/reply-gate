@@ -13,6 +13,7 @@ import anthropic
 import httpx
 import openai
 import pytest
+from pydantic import SecretStr
 
 from reply_gate.llm import (
     MAX_ATTEMPTS,
@@ -61,7 +62,9 @@ class _RecordingCalls:
 def _generation_client(outcomes: list[Any]) -> tuple[OpenAIGenerationClient, _RecordingCalls]:
     responses = _RecordingCalls(outcomes)
     fake_sdk = cast(openai.OpenAI, SimpleNamespace(responses=responses))
-    client = OpenAIGenerationClient(api_key="test", model="gpt-5.6-terra", client=fake_sdk)
+    client = OpenAIGenerationClient(
+        api_key=SecretStr("test"), model="gpt-5.6-terra", client=fake_sdk
+    )
     return client, responses
 
 
@@ -77,11 +80,11 @@ def _status_error(status_code: int) -> openai.APIStatusError:
 
 def test_sdk_자동재시도를_끈다() -> None:
     """래퍼 재시도와 SDK 재시도가 중첩되면 docs/standards.md "재시도 상한"이 깨진다."""
-    client = OpenAIGenerationClient(api_key="test", model="gpt-5.6-terra")
+    client = OpenAIGenerationClient(api_key=SecretStr("test"), model="gpt-5.6-terra")
     assert client._client.max_retries == 0
 
     embedder = OpenAIEmbeddingClient(
-        api_key="test", model="text-embedding-3-small", dimensions=1536
+        api_key=SecretStr("test"), model="text-embedding-3-small", dimensions=1536
     )
     assert embedder._client.max_retries == 0
 
@@ -100,13 +103,13 @@ def test_주입한_SDK_클라이언트도_자동재시도가_꺼지고_타임아
     assert injected_anthropic.max_retries == 2
 
     generation = OpenAIGenerationClient(
-        api_key="test", model="gpt-5.6-terra", client=injected_openai
+        api_key=SecretStr("test"), model="gpt-5.6-terra", client=injected_openai
     )
     judging = AnthropicGenerationClient(
-        api_key="test", model="claude-sonnet-5", client=injected_anthropic
+        api_key=SecretStr("test"), model="claude-sonnet-5", client=injected_anthropic
     )
     embedding = OpenAIEmbeddingClient(
-        api_key="test",
+        api_key=SecretStr("test"),
         model="text-embedding-3-small",
         dimensions=1536,
         client=openai.OpenAI(api_key="test"),
@@ -126,7 +129,7 @@ def test_테스트_대역_주입은_그대로_통과한다() -> None:
     double = SimpleNamespace(responses=SimpleNamespace(create=lambda **_: None))
 
     client = OpenAIGenerationClient(
-        api_key="test", model="gpt-5.6-terra", client=cast(openai.OpenAI, double)
+        api_key=SecretStr("test"), model="gpt-5.6-terra", client=cast(openai.OpenAI, double)
     )
 
     assert cast(object, client._client) is double  # 사본을 만들지도 않는다
@@ -138,7 +141,7 @@ def test_재시도를_끌_수_없는_클라이언트는_조립에서_거부된�
 
     with pytest.raises(ValueError, match="자동 재시도를 끌 수 없다"):
         OpenAIGenerationClient(
-            api_key="test", model="gpt-5.6-terra", client=cast(openai.OpenAI, unfixable)
+            api_key=SecretStr("test"), model="gpt-5.6-terra", client=cast(openai.OpenAI, unfixable)
         )
 
 
@@ -336,7 +339,9 @@ def _anthropic_response(text: str, *, stop_reason: str = "end_turn") -> SimpleNa
 def _anthropic_client(outcomes: list[Any]) -> tuple[AnthropicGenerationClient, _RecordingCalls]:
     messages = _RecordingCalls(outcomes)
     fake_sdk = cast(anthropic.Anthropic, SimpleNamespace(messages=messages))
-    client = AnthropicGenerationClient(api_key="test", model="claude-sonnet-5", client=fake_sdk)
+    client = AnthropicGenerationClient(
+        api_key=SecretStr("test"), model="claude-sonnet-5", client=fake_sdk
+    )
     return client, messages
 
 
@@ -352,7 +357,7 @@ def _anthropic_status_error(status_code: int) -> anthropic.APIStatusError:
 
 def test_anthropic_sdk_자동재시도를_끈다() -> None:
     """Anthropic SDK 도 기본 2회 자동 재시도한다 — 래퍼가 단독 통제하도록 차단한다."""
-    client = AnthropicGenerationClient(api_key="test", model="claude-sonnet-5")
+    client = AnthropicGenerationClient(api_key=SecretStr("test"), model="claude-sonnet-5")
     assert client._client.max_retries == 0
 
 
@@ -480,7 +485,7 @@ def _openai_client(outcomes: list[Any]) -> tuple[OpenAIEmbeddingClient, _Recordi
     embeddings = _RecordingCalls(outcomes)
     fake_sdk = cast(openai.OpenAI, SimpleNamespace(embeddings=embeddings))
     client = OpenAIEmbeddingClient(
-        api_key="test", model="text-embedding-3-small", dimensions=3, client=fake_sdk
+        api_key=SecretStr("test"), model="text-embedding-3-small", dimensions=3, client=fake_sdk
     )
     return client, embeddings
 

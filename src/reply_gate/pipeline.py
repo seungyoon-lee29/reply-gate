@@ -31,10 +31,10 @@
 
 from __future__ import annotations
 
-import time
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Any, Final, Protocol
 
 import psycopg
@@ -60,6 +60,7 @@ from reply_gate.evidence import (
     EvidenceCollector,
     SqlEvidenceSnapshot,
     SqlFailure,
+    StageDurations,
 )
 from reply_gate.gate import evaluate_draft, to_draft
 from reply_gate.judge import Judge, JudgeOutcome
@@ -70,13 +71,17 @@ from reply_gate.llm import (
     JsonCompletion,
     LLMCallError,
     LLMFormatError,
+    accumulate_optional_ms,
+    accumulate_optional_tokens,
 )
 from reply_gate.order_ref import is_valid_order_no, normalize_order_no
+from reply_gate.retrieval_strategies import AbstentionUndefined
 
 __all__ = [
     "L2_JUDGE_STAGE",
     "MAX_DRAFT_ATTEMPTS",
     "AcceptedInquiry",
+    "AttemptDurations",
     "AttemptRecord",
     "DraftGenerating",
     "EvidenceCollecting",
@@ -86,6 +91,9 @@ __all__ = [
     "PipelineWiringError",
     "ProcessedInquiry",
     "ReceiptError",
+    # 구간 시간의 자료형은 근거 수집 모듈이 소유한다(아홉 중 여섯이 그 안쪽이다).
+    # 평가 산출 모듈은 파이프라인 결과를 읽으므로 여기서 함께 내보낸다.
+    "StageDurations",
     "accept_inquiry",
     "build_judge",
     "build_pipeline",
@@ -103,6 +111,16 @@ MAX_DRAFT_ATTEMPTS: Final = 2
 #: 판정 모듈이 LLM 래퍼에 넘기는 단계 이름(`judge.JUDGE_STAGE`)과 달리, 이 값은
 #: **파이프라인 층에서 어디가 무너졌는지**를 가리킨다.
 L2_JUDGE_STAGE: Final = "l2_judge"
+
+
+def _span_ms(started: float) -> float:
+    """코드만 도는 구간의 벽시계(ms) — 게이트 판정이 그 자리다.
+
+    **게이트 구간은 호출자가 잰다.** `gate.py` 는 `time` 을 import 하지 않는 것이 하드
+    게이트이고(docs/standards.md 하드 게이트 1) AST 구조 검사가 그것을 지킨다 — 계측을
+    이유로 그 경계를 넘지 않는다.
+    """
+    return max((perf_counter() - started) * 1000.0, 0.0)
 
 
 # ── 조립·설정 오류 (업무 판정이 아니다) ─────────────────────────────────────
@@ -185,6 +203,22 @@ def new_inquiry_id() -> str:
 
 
 @dataclass(frozen=True)
+class AttemptDurations:
+    """시도 1건이 쓴 구간 시간(ms) — 초안 생성 · 게이트 판정 · L2 판정.
+
+    **`None` 은 미측정이고 0 이 아니다.** L1 이 기각해 L2 가 돌지 않은 시도, L2 스위치가
+    꺼진 실행, 초안 생성이 전송 오류로 죽어 게이트에 닿지도 못한 시도가 그 자리다.
+
+    나머지 여섯 구간이 여기 없는 것은 그것들이 근거 수집에서 **문의당 한 번** 돌기
+    때문이다 — 시도별로 쌓이는 것은 이 셋뿐이다.
+    """
+
+    draft_ms: float | None = None
+    gate_ms: float | None = None
+    l2_judge_ms: float | None = None
+
+
+@dataclass(frozen=True)
 class AttemptRecord:
     """초안 1건에 대한 층별 판정 (docs/business-rules.md "엔티티와 관계" — 문의당 최대 2건).
 
@@ -204,6 +238,11 @@ class AttemptRecord:
     draft: Any
     l1_result: GateResult | None = None
     l2_result: JudgeResult | None = None
+    #: 이 시도의 구간 시간. **DB 에는 싣지 않는다** — 처리 기록 스키마를 넓히면 볼륨을
+    #: 통째로 다시 만들어야 하고 정책 재색인에 과금이 든다. 기본값을 갖는 것이 그 조건에서
+    #: 복원(`records._load_attempts`)을 깨지 않는 유일한 모양이고, 복원된 기록의 구간은
+    #: 0 이 아니라 **미측정**으로 남는다(계측은 결과 객체와 평가 리포트까지만 간다).
+    durations: AttemptDurations = field(default_factory=AttemptDurations)
 
 
 @dataclass(frozen=True)
@@ -243,8 +282,28 @@ class ProcessedInquiry:
     #: (docs/contracts.md "토큰 집계 경계"). 재작성을 쓰지 않은 문의는 0 이다.
     retrieval_input_tokens: int = 0
     retrieval_output_tokens: int = 0
+    #: 캐시 계열 토큰을 **계열별 한 쌍씩** 들고 있다. 두 계열이 같은 클라이언트를 지나므로
+    #: (재작성 클라이언트가 생성 클라이언트 그대로다) 한 쌍으로 묶으면 어느 계열의 캐시였는지
+    #: 되짚을 수 없다. **입력 칸에 접지 않는다** — 단가가 다른 값을 한 칸에 넣으면 달러 환산이
+    #: 그 차이를 볼 수 없고, OpenAI 는 적중분이 `input_tokens` 에 이미 포함돼 있어 더하면 같은
+    #: 토큰을 두 번 센다. 보고되지 않은 칸은 0 이 아니라 `None`(미측정)이다.
+    #: **DB 에도 HTTP 응답에도 싣지 않는다** — 평가 리포트까지만 간다.
+    generation_cache_creation_tokens: int | None = None
+    generation_cache_read_tokens: int | None = None
+    retrieval_cache_creation_tokens: int | None = None
+    retrieval_cache_read_tokens: int | None = None
     #: 검색 단계가 폴백한 사유. `None` 이면 폴백하지 않았다 — 인계 사유가 **아니다**.
     retrieval_fallback_reason: str | None = None
+    #: 기권 게이트의 **통계량이 미정의였던 사유**. 근거 수집 결과가 들고 나온 값을 그대로
+    #: 옮긴다 — 사유는 처분(발동/열림)과 별개로 밖으로 나가야 평가 리포트가 어느 분기를
+    #: 몇 건이 탔는지 셀 수 있다. `None` 은 세 경우를 함께 덮는다: 게이트 꺼짐 · 정책 검색
+    #: 미실행 · 통계량 정의됨. **DB 에도 HTTP 응답에도 싣지 않는다** — 평가 리포트까지다.
+    abstention_undefined_reason: AbstentionUndefined | None = None
+    #: 구간 아홉의 시간 합계(ms). 근거 수집 안쪽 여섯 + 시도별 셋을 합친 값이고,
+    #: 시도별 내역은 `attempts[].durations` 가 따로 들고 있다. 돌지 않은 구간은 0 이 아니라
+    #: 미측정이며, 측정된 구간의 합은 `latency_ms` 를 넘지 않는다(구간은 전부 처리 창
+    #: 안쪽에서 재고 서로 겹치지 않는다). **DB 에도 HTTP 응답에도 싣지 않는다.**
+    stage_durations: StageDurations = field(default_factory=StageDurations)
 
     @property
     def escalated(self) -> bool:
@@ -300,6 +359,15 @@ class _Tally:
     #: 판정(L2) 토큰은 생성 합산과 **분리**해서 센다.
     judge_input_tokens: int = 0
     judge_output_tokens: int = 0
+    #: 생성 계열의 캐시 한 쌍. **0 에서 시작하지 않는다** — 시작값이 0 이면 한 번도 보고되지
+    #: 않은 실행이 "적중 0" 으로 신고된다. 검색 계열의 쌍은 근거 묶음이 들고 온다.
+    generation_cache_creation_tokens: int | None = None
+    generation_cache_read_tokens: int | None = None
+    #: 시도별 구간을 문의 단위로 누적한 값. 시도 기록이 남지 않은 실패
+    #: (초안 생성이 전송 오류로 죽은 경우)의 경과도 여기에 들어야 구간 합이 실제와 같다.
+    draft_ms: float | None = None
+    gate_ms: float | None = None
+    l2_judge_ms: float | None = None
 
 
 def _combine(
@@ -383,7 +451,7 @@ class InquiryPipeline:
         측정에 포함하지 않는다. 평가 지표(p50/p95)가 재는 것은 **문의 처리**이지 저장이
         아니기 때문이다.
         """
-        started = time.perf_counter()
+        started = perf_counter()
         tally = _Tally(attempts=[], input_tokens=0, output_tokens=0)
 
         collection = self._collector.collect(
@@ -395,6 +463,12 @@ class InquiryPipeline:
         )
         tally.input_tokens += collection.input_tokens
         tally.output_tokens += collection.output_tokens
+        tally.generation_cache_creation_tokens = accumulate_optional_tokens(
+            tally.generation_cache_creation_tokens, collection.generation_cache_creation_tokens
+        )
+        tally.generation_cache_read_tokens = accumulate_optional_tokens(
+            tally.generation_cache_read_tokens, collection.generation_cache_read_tokens
+        )
 
         if collection.escalation_reason is not None:
             # 초안 전 인계 — 초안 생성에 진입하지 않는다.
@@ -453,8 +527,17 @@ class InquiryPipeline:
             except LLMCallError as exc:
                 # 전송 오류는 래퍼가 이미 1회 재시도했다 → 인계 + 실패 단계 기록.
                 # 실패까지 과금된 토큰(예: 거절 응답의 입력 토큰)도 실비용이므로 집계한다.
+                # **경과도 같은 자격**이다: 이 시도는 기록 행을 남기지 않으므로 원장에
+                # 넣지 않으면 초안 구간이 통째로 사라진다.
                 tally.input_tokens += exc.input_tokens
                 tally.output_tokens += exc.output_tokens
+                tally.generation_cache_creation_tokens = accumulate_optional_tokens(
+                    tally.generation_cache_creation_tokens, exc.cache_creation_input_tokens
+                )
+                tally.generation_cache_read_tokens = accumulate_optional_tokens(
+                    tally.generation_cache_read_tokens, exc.cache_read_input_tokens
+                )
+                tally.draft_ms = accumulate_optional_ms(tally.draft_ms, exc.elapsed_ms)
                 return self._LoopOutcome(
                     answer=None,
                     claims=(),
@@ -464,18 +547,35 @@ class InquiryPipeline:
 
             tally.input_tokens += generation.input_tokens
             tally.output_tokens += generation.output_tokens
+            tally.generation_cache_creation_tokens = accumulate_optional_tokens(
+                tally.generation_cache_creation_tokens, generation.cache_creation_input_tokens
+            )
+            tally.generation_cache_read_tokens = accumulate_optional_tokens(
+                tally.generation_cache_read_tokens, generation.cache_read_input_tokens
+            )
+            tally.draft_ms = accumulate_optional_ms(tally.draft_ms, generation.elapsed_ms)
+            attempt_draft_ms = generation.elapsed_ms
 
             # L1 은 LLM 호출 0회의 기계 검사다 (gate.py 는 LLM 을 import 하지 않는다).
-            l1_result: GateResult = evaluate_draft(
-                raw_draft=generation.raw, evidences=collection.evidence
-            )
-            # L1 을 통과한 초안만 `Draft` 로 해석된다 — L2 입력이자 최종 답변의 원본이다.
-            draft = to_draft(generation.raw) if l1_result.verdict is Verdict.PASS else None
+            # **게이트 구간은 호출자가 잰다** — 게이트 모듈은 시간에 의존하지 않는 것이
+            # 하드 게이트라(docs/standards.md 하드 게이트 1) 계측이 그 경계를 넘지 않는다.
+            gate_started = perf_counter()
+            try:
+                l1_result: GateResult = evaluate_draft(
+                    raw_draft=generation.raw, evidences=collection.evidence
+                )
+                # L1 을 통과한 초안만 `Draft` 로 해석된다 — L2 입력이자 최종 답변의 원본이다.
+                draft = to_draft(generation.raw) if l1_result.verdict is Verdict.PASS else None
+            finally:
+                attempt_gate_ms = _span_ms(gate_started)
+                tally.gate_ms = accumulate_optional_ms(tally.gate_ms, attempt_gate_ms)
 
             # 이 시도에서 L2 판정이 **나왔어야 하는가** — `_combine` 이 "L2 미실행"과
             # "판정이 비었다"를 구분하는 근거다(fail-open 차단).
             l2_expected = self._l2_enabled and draft is not None
             l2_result: JudgeResult | None = None
+            #: 판정이 **돌지 않은** 시도의 판정 구간은 0 이 아니라 미측정이다.
+            attempt_judge_ms: float | None = None
             if l2_expected and draft is not None:  # `draft` 재확인은 타입 좁히기다
                 # 판정자 미배선은 조립에서 이미 막혔다. 여기서 다시 보는 것은 타입 좁히기
                 # 겸 이중 잠금이다 — `assert` 로 두면 `python -O` 에서 사라져 스위치가
@@ -488,14 +588,20 @@ class InquiryPipeline:
                     outcome = self._judge.judge(draft=draft, evidence=collection.evidence)
                 except LLMFormatError as exc:
                     # 형식 불일치는 판정 모듈이 이미 1회 재시도했다. 실패한 호출이 쓴
-                    # 토큰도 실비용이므로 그대로 집계한다.
+                    # 토큰도 실비용이므로 그대로 집계한다. 경과도 같은 자격이다.
                     tally.judge_input_tokens += exc.input_tokens
                     tally.judge_output_tokens += exc.output_tokens
+                    tally.l2_judge_ms = accumulate_optional_ms(tally.l2_judge_ms, exc.elapsed_ms)
                     return self._judge_failure(
                         tally=tally,
                         attempt_no=attempt_no,
                         l1_result=l1_result,
                         raw_draft=generation.raw,
+                        durations=AttemptDurations(
+                            draft_ms=attempt_draft_ms,
+                            gate_ms=attempt_gate_ms,
+                            l2_judge_ms=exc.elapsed_ms,
+                        ),
                     )
                 except LLMCallError as exc:
                     # 전송 오류는 래퍼가 이미 1회 재시도했다. 그때까지 이미 과금된 판정
@@ -505,14 +611,22 @@ class InquiryPipeline:
                     # 실비용이 0 으로 굳는다.
                     tally.judge_input_tokens += exc.input_tokens
                     tally.judge_output_tokens += exc.output_tokens
+                    tally.l2_judge_ms = accumulate_optional_ms(tally.l2_judge_ms, exc.elapsed_ms)
                     return self._judge_failure(
                         tally=tally,
                         attempt_no=attempt_no,
                         l1_result=l1_result,
                         raw_draft=generation.raw,
+                        durations=AttemptDurations(
+                            draft_ms=attempt_draft_ms,
+                            gate_ms=attempt_gate_ms,
+                            l2_judge_ms=exc.elapsed_ms,
+                        ),
                     )
                 tally.judge_input_tokens += outcome.input_tokens
                 tally.judge_output_tokens += outcome.output_tokens
+                tally.l2_judge_ms = accumulate_optional_ms(tally.l2_judge_ms, outcome.elapsed_ms)
+                attempt_judge_ms = outcome.elapsed_ms
                 l2_result = outcome.result
 
             verdict, reasons = _combine(l1_result, l2_result, l2_expected=l2_expected)
@@ -524,6 +638,11 @@ class InquiryPipeline:
                     draft=generation.raw,
                     l1_result=l1_result,
                     l2_result=l2_result,
+                    durations=AttemptDurations(
+                        draft_ms=attempt_draft_ms,
+                        gate_ms=attempt_gate_ms,
+                        l2_judge_ms=attempt_judge_ms,
+                    ),
                 )
             )
 
@@ -551,7 +670,13 @@ class InquiryPipeline:
         )
 
     def _judge_failure(
-        self, *, tally: _Tally, attempt_no: int, l1_result: GateResult, raw_draft: Any
+        self,
+        *,
+        tally: _Tally,
+        attempt_no: int,
+        l1_result: GateResult,
+        raw_draft: Any,
+        durations: AttemptDurations,
     ) -> _LoopOutcome:
         """L2 호출이 재시도까지 실패했다 — 검증하지 못한 답변은 내보내지 않는다.
 
@@ -572,6 +697,8 @@ class InquiryPipeline:
                 draft=raw_draft,
                 l1_result=l1_result,
                 l2_result=None,
+                # 판정은 실패했지만 **돌았다** — 그 경과는 미측정이 아니라 측정값이다.
+                durations=durations,
             )
         )
         return self._LoopOutcome(
@@ -612,7 +739,7 @@ class InquiryPipeline:
             sql_snapshots=collection.sql_snapshots,
             sql_failures=collection.sql_failures,
             attempts=tuple(tally.attempts),
-            latency_ms=max(round((time.perf_counter() - started) * 1000), 0),
+            latency_ms=max(round((perf_counter() - started) * 1000), 0),
             input_tokens=tally.input_tokens,
             output_tokens=tally.output_tokens,
             embedding_tokens=collection.embedding_tokens,
@@ -624,7 +751,25 @@ class InquiryPipeline:
             # 들고 있으므로 원장을 거치지 않고 그대로 옮긴다(초안 루프가 만들지 않는다).
             retrieval_input_tokens=collection.retrieval_input_tokens,
             retrieval_output_tokens=collection.retrieval_output_tokens,
+            # 캐시 칸도 계열별로 그대로 옮긴다 — 생성 쌍은 수집 + 초안 루프의 합이고,
+            # 검색 쌍은 수집기가 이미 갈라 들고 있다. 두 쌍을 하나로 합치지 않는다.
+            generation_cache_creation_tokens=tally.generation_cache_creation_tokens,
+            generation_cache_read_tokens=tally.generation_cache_read_tokens,
+            retrieval_cache_creation_tokens=collection.retrieval_cache_creation_tokens,
+            retrieval_cache_read_tokens=collection.retrieval_cache_read_tokens,
             retrieval_fallback_reason=collection.retrieval_fallback_reason,
+            # 기권 미정의 사유도 폴백 사유와 같은 자격으로 그대로 옮긴다 — 여기서 끊기면
+            # 근거 묶음까지 나온 사유가 평가 리포트 앞에서 사라진다.
+            abstention_undefined_reason=collection.abstention_undefined_reason,
+            # 근거 수집 안쪽 여섯 + 루프가 잰 셋. 밖에서 수집 호출 하나를 감쌌다면
+            # 여섯이 한 칸으로 접혔을 자리다.
+            stage_durations=collection.stage_durations.merged(
+                StageDurations(
+                    draft_ms=tally.draft_ms,
+                    gate_ms=tally.gate_ms,
+                    l2_judge_ms=tally.l2_judge_ms,
+                )
+            ),
         )
 
 

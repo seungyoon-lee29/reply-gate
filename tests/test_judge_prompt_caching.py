@@ -22,6 +22,7 @@ from typing import Any, Final, cast
 
 import anthropic
 import pytest
+from pydantic import SecretStr
 from scripts import evaluate
 
 import reply_gate.pipeline as pipeline_module
@@ -132,7 +133,7 @@ def _anthropic_client(
     messages = _RecordingCalls(outcomes)
     fake_sdk = cast(anthropic.Anthropic, SimpleNamespace(messages=messages))
     client = AnthropicGenerationClient(
-        api_key="test",
+        api_key=SecretStr("test"),
         model="claude-sonnet-5",
         client=fake_sdk,
         prompt_caching=prompt_caching,
@@ -238,11 +239,16 @@ def test_캐시_필드가_없는_응답은_0_이_아니라_미측정이다() -> 
     assert result.cache_read_input_tokens is None
 
 
-def test_OpenAI_래퍼의_캐시_계열은_해당_없음이다() -> None:
-    """양성 대조가 아니라 경계 확인 — 생성 계열은 이 축을 재지 않는다."""
+def test_OpenAI_래퍼도_캐시_칸이_없는_응답은_미측정이다() -> None:
+    """경계 확인 — 캐시 내역을 싣지 않은 응답은 provider 와 무관하게 0 이 아니라 미측정이다.
+
+    생성 계열의 캐시 배선 자체는 `tests/test_generation_cache_tokens.py` 가 소유한다.
+    """
     calls = _RecordingCalls([_openai_response(json.dumps({"verdict": "pass"}))])
     fake_sdk = cast(Any, SimpleNamespace(responses=calls))
-    client = OpenAIGenerationClient(api_key="test", model="gpt-5.6-terra", client=fake_sdk)
+    client = OpenAIGenerationClient(
+        api_key=SecretStr("test"), model="gpt-5.6-terra", client=fake_sdk
+    )
 
     result = client.complete_json(stage="draft", system="s", user="u", schema=SCHEMA)
 
@@ -444,7 +450,7 @@ def test_판정_클라이언트가_설정_스위치를_그대로_받는다(enabl
     judge = build_judge(
         Settings(
             l2_enabled=True,
-            anthropic_api_key="키가-아닌-테스트값",
+            anthropic_api_key=SecretStr("키가-아닌-테스트값"),
             judge_prompt_caching_enabled=enabled,
         )
     )
@@ -458,6 +464,7 @@ def _fingerprint(settings: Settings) -> dict[str, str]:
     args = argparse.Namespace(
         golden_set=_ROOT / "data" / "golden_set.jsonl",
         judge_fixtures=_ROOT / "data" / "judge_fixtures.jsonl",
+        l1_fixtures=_ROOT / "data" / "l1_fixtures.jsonl",
         stub_llm=False,
     )
     return evaluate._condition_fingerprint(args=args, settings=settings, run_settings=settings)
@@ -611,8 +618,23 @@ def test_판정_실패한_픽스처의_캐시_계열도_버려지지_않는다()
     assert accuracy.cache_read_tokens_total == 0
 
 
-#: 런타임 판정 토큰이 캐시 계열로 갈라졌는지 판정하는 이름.
-_CACHE_TOKEN_FIELDS: Final = frozenset({"cache_read_input_tokens", "cache_creation_input_tokens"})
+#: 런타임 **판정** 토큰이 캐시 계열로 갈라졌는지 판정하는 이름.
+#:
+#: **계열 이름을 붙여 묻는다.** 일반형 이름(`cache_read_input_tokens`)으로 물으면 안 된다 —
+#: 생성·검색 계열의 캐시 칸이 배선되면서 파이프라인이 초안 호출의 산출·예외에서 같은 이름을
+#: 읽게 됐고, 그 이름으로 물으면 이 가드가 "판정 런타임도 배선됐다"로 잘못 읽고 **스스로
+#: 꺼진다**(아래 두 검사의 통과 조건이 곧 자기 비활성화다).
+#:
+#: 이름 목록을 좁히는 것은 **가드를 조이는 쪽**이다: 판정 계열이 다른 이름으로 배선되면
+#: 가드는 "아직 없다"로 읽고 캐싱 기본값을 계속 막는다 — 틀리는 방향이 fail-closed 다.
+_CACHE_TOKEN_FIELDS: Final = frozenset(
+    {
+        "judge_cache_read_tokens",
+        "judge_cache_creation_tokens",
+        "judge_cache_read_input_tokens",
+        "judge_cache_creation_input_tokens",
+    }
+)
 
 #: 런타임 판정 토큰이 지나가는 자리. 파이프라인이 만들고 처리 기록이 저장한다.
 _RUNTIME_TOKEN_MODULES: Final = ("pipeline.py", "records.py")

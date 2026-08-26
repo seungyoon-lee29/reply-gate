@@ -185,6 +185,15 @@ class DraftGeneration:
     raw: Any
     input_tokens: int
     output_tokens: int
+    #: 이 호출에 흐른 벽시계(ms) — **초안 생성 구간의 시간**이다. 형식이 어긋나 원문을
+    #: 그대로 넘기는 산출도 시간을 썼으므로 0 으로 접지 않는다. 전송 오류로 죽은 호출의
+    #: 경과는 `LLMCallError.elapsed_ms` 가 들고 위로 올라간다.
+    elapsed_ms: float = 0.0
+    #: 이 호출의 캐시 계열 토큰 — **생성 계열의 칸으로 간다.** 입력 토큰에 접지 않는다:
+    #: 단가가 다른 값을 한 칸에 넣으면 달러 환산이 그 차이를 볼 수 없다. 캐시 계열을 싣지
+    #: 않은 응답에서는 0 이 아니라 `None`(미측정)이다.
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
 
 
 class DraftGenerator:
@@ -226,9 +235,15 @@ class DraftGenerator:
                 raw=exc.raw_text,
                 input_tokens=exc.input_tokens,
                 output_tokens=exc.output_tokens,
+                elapsed_ms=exc.elapsed_ms,
+                cache_creation_input_tokens=exc.cache_creation_input_tokens,
+                cache_read_input_tokens=exc.cache_read_input_tokens,
             )
         return DraftGeneration(
             raw=completion.data,
             input_tokens=completion.input_tokens,
             output_tokens=completion.output_tokens,
+            elapsed_ms=completion.elapsed_ms,
+            cache_creation_input_tokens=completion.cache_creation_input_tokens,
+            cache_read_input_tokens=completion.cache_read_input_tokens,
         )

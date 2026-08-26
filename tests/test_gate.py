@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import pathlib
 from collections.abc import Sequence
 from typing import Any
@@ -470,15 +471,22 @@ def test_PII_검사는_스키마가_깨져도_텍스트만_있으면_수행한�
     )
 
 
-def test_PII_패턴은_호출자가_바꿔_넣을_수_있다() -> None:
-    """패턴 집합은 '조정 가능 기본값' 이다."""
-    evidences = [_evidence(POLICY_ID, "고객센터 운영 시간 안내")]
-    raw_draft = _draft(text="담당자 010-9999-8888 로 연락 주세요.")
+def test_PII_패턴_집합은_주입받지_않는_정본_하나다() -> None:
+    """층마다 다른 집합을 받을 수 있으면 한쪽만 넓혀져 기준이 갈린다.
 
-    without_patterns = evaluate_draft(raw_draft=raw_draft, evidences=evidences, pii_patterns=())
+    예전에는 게이트만 `pii_patterns` 로 집합을 주입받고 근거 필터는 기본 집합을 직접
+    들었다 — 접기가 층마다 달라 L1 이 뚫린 것과 **같은 모양의 비대칭**이라 주입점을
+    없앴다. 소유자는 이 모듈이고 근거 필터·조회 가드는 가져다 쓰기만 한다
+    (`tests/test_pii_pattern_ownership.py` 가 그 형태를 AST 로 지킨다).
+    """
+    parameters = set(inspect.signature(evaluate_draft).parameters)
 
-    assert without_patterns.verdict is Verdict.PASS
-    assert gate.DEFAULT_PII_PATTERNS  # 기본값 하나로 동작한다
+    assert parameters == {"raw_draft", "evidences"}
+    assert gate.DEFAULT_PII_PATTERNS  # 정본 집합 하나로 동작한다
+    with pytest.raises(TypeError):
+        evaluate_draft(  # type: ignore[call-arg]
+            raw_draft=_draft(text=NORMAL_TEXT), evidences=_evidences(), pii_patterns=()
+        )
 
 
 # ── 복수 사유 · 결정론 ───────────────────────────────────────────────────────

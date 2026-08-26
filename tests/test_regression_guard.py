@@ -43,23 +43,32 @@ from reply_gate.regression_guard import (
 _ROOT = Path(__file__).resolve().parents[1]
 
 #: 기준선·새 실측이 공유하는 지문. 이 값이 갈리면 대조 가능성부터 달라진다.
+#: **필수 항목을 전부 채운다** — 하나라도 비면 세트 편입 술어가 "미상"으로 읽어 정족수가
+#: 안 차고, 이 파일의 케이스가 재려던 판정 대신 편입 실패를 재게 된다.
 _BASE_FINGERPRINT: Mapping[str, str] = {
     "label_version": "0008-이후",
     "retrieval_labels_version": "labels-aaaa",
     "acceptance_cut": "0.3",
     "abstention_gate_statistic": "미배선",
     "abstention_tau": "미배선",
+    "abstention_undefined_policy": "abstain-aaaa",
     "query_rewrite": "on",
+    "retrieval_order": "db=[embedding <=> %s, evidence_id] · merge=[a>b>c]",
     "embedding_model": "text-embedding-3-small",
     "embedding_dimensions": "1536",
     "top_k": "5",
     "generation_model": "gpt-5.6-terra",
     "judge_model": "claude-sonnet-5",
     "judge_effort": "기본값",
+    "judge_thinking": "미전송(계열 기본)",
     "judge_prompt_version": "p-aaaa",
     "judge_fixture_version": "f-bbbb",
     "judge_prompt_caching": "off",
+    "draft_rule_version": "draftrules-aaaa",
+    "l1_fixture_version": "l1fixture-aaaa",
+    "sql_guard_version": "sqlguard-aaaa",
     "measurement_scope": "full",
+    "run_completion": "중단 없음",
 }
 
 #: 케이스 관측 1건 — (일치 여부, 정답 근거, 빠진 정답 근거).
@@ -300,8 +309,26 @@ def test_저장소의_승격_참조는_사람의_등재_기록을_들고_있다(
     assert len(loaded.report_stems) == RUN_SET_SIZE
 
 
+def _fingerprint_conflicts(left: ConditionFingerprint, right: ConditionFingerprint) -> list[str]:
+    """등재 정합성이 보는 것 — **적힌 것끼리의 어긋남**. 미상은 어긋남이 아니다."""
+    comparison = ConditionFingerprint(values=left.values).compare(
+        ConditionFingerprint(values=right.values)
+    )
+    return [
+        item.field
+        for item in (*comparison.declared_differences, *comparison.undeclared_differences)
+    ]
+
+
 def test_등재된_기준선이_자기가_가리키는_산출물과_맞는다() -> None:
-    """실제 등재로 확인한다 — 참조의 조건 지문과 세 산출물이 한 조건이어야 한다."""
+    """실제 등재로 확인한다 — 참조에 **적힌** 지문이 세 산출물과 어긋나지 않아야 한다.
+
+    술어는 가드의 등재 정합성 검사와 같다(`_promotion_drift`): 미상은 어긋남이 아니고,
+    **적은 것은 맞아야 한다.** 세트 편입 술어(`same_condition`)를 여기 쓰지 않는 것은
+    사이클 5 T6 의 지문 확장 때문이다 — 확장한 일곱 항목은 그 이전에 커밋된 라이브
+    전부에서 "미상"이고, 그 미상 때문에 등재가 무효가 되는 것은 아니다. 세트 편입 쪽의
+    엄격함은 그대로 남아 있고 아래 테스트가 그것을 따로 못박는다.
+    """
     promotion = load_promoted_baseline()
     assert isinstance(promotion, PromotedBaseline)
     runs = [
@@ -314,10 +341,28 @@ def test_등재된_기준선이_자기가_가리키는_산출물과_맞는다() 
     ]
     head = runs[0].fingerprint
     for other in runs[1:]:
-        same, reason = other.fingerprint.same_condition(head)
-        assert same, reason
-    same, reason = ConditionFingerprint(values=promotion.fingerprint.values).same_condition(head)
-    assert same, reason
+        assert _fingerprint_conflicts(other.fingerprint, head) == [], other.stem
+    registered = ConditionFingerprint(values=promotion.fingerprint.values)
+    assert _fingerprint_conflicts(registered, head) == []
+
+
+def test_등재된_참조는_지문_스물다섯_칸을_전부_안다() -> None:
+    """**참조가 지문 항목을 빠뜨리면 여기서 잡는다.**
+
+    지문이 열여덟 칸에서 스물다섯 칸으로 넓어지던 동안, 이 검사는 반대 방향을 들고
+    있었다 — 확장 이전 등재는 새 일곱 칸을 몰라야 정상이라는 것. 재등재가 그 칸을
+    채우면서 방향이 뒤집혔고, 지금 지키는 것은 **참조가 한 칸도 빠뜨리지 않았다**이다.
+
+    빠뜨린 칸은 `None`(미상)으로 읽히고 미상은 **대조를 막지 않으므로**, 오타나 누락이
+    조용히 통과해 구속 줄이 반쪽으로 도는 상태가 된다. 그 조용한 실패를 이 한 줄이 막는다.
+    """
+    promotion = load_promoted_baseline()
+    assert isinstance(promotion, PromotedBaseline)
+    registered = ConditionFingerprint.from_values(promotion.fingerprint.values)
+
+    unknown = {name for name, value in registered.values.items() if value is None}
+
+    assert unknown == set(), sorted(unknown)
 
 
 def test_두_줄이_상반되면_승격_기준선이_판정을_가진다(tmp_path: Path) -> None:
@@ -1378,37 +1423,67 @@ def test_짝_때문에_어긋난_항목은_그렇게_적는다(tmp_path: Path) -
 # ── 세트 편입 — 정족수를 채우려고 다른 조건을 끌어오지 않는다 ────────────────
 
 
-def test_승격_직후_1회차_실측은_옛_산출물로_정족수를_채우지_않는다() -> None:
-    """**3회 연속 실측의 1회차·2회차가 거짓 미달을 커밋하는 것을 막는다.**
+def test_세트_편입은_옛_산출물을_끌어오지_않는다() -> None:
+    """**정족수를 채우려고 조건이 다른 산출물을 끌어오지 않는다** — 실물로 지킨다.
 
-    승격된 기준선(7·8·9)은 이번 세트에서 제외되므로, 9 를 현재 실행으로 두면 조건이 확인된
-    실측은 자기 자신 하나뿐이다. 예전에는 지문이 통째로 없는 사이클 2 산출물이 "전부 미상 =
-    어긋남 없음"으로 읽혀 정족수를 채웠고, 멀쩡한 케이스 셋이 `1/3` 으로 찍혀 **미달**이
-    나왔다. 라이브 리포트는 사후 편집하지 않으므로 그 거짓 판정은 기록에 영구히 남는다.
+    예전에는 지문이 통째로 없는 사이클 2 산출물이 "전부 미상 = 어긋남 없음"으로 읽혀
+    정족수를 채웠고, 멀쩡한 케이스 셋이 `1/3` 으로 찍혀 **미달**이 나왔다. 라이브 리포트는
+    사후 편집하지 않으므로 그 거짓 판정은 기록에 영구히 남는다.
+
+    **여기서는 편입 필터만 지킨다.** 정족수와 판정은 커밋된 산출물이 늘어날 때마다 바뀌므로
+    실물에 붙들어 둘 수 없다 — "1회차는 보류"라는 모양은 바로 아래 합성 검사가 든다.
     """
     reports = _ROOT / "reports"
-    current = load_run_summary(reports / "evaluation-live-l2-9.json")
+    current = load_run_summary(reports / "evaluation-live-l2-28.json")
     guard = build_regression_guard(current=current, reports_dir=reports)
     assert isinstance(guard, RegressionGuard)
 
-    # ① 옛 계열이 세트에 섞이지 않는다.
-    assert guard.candidate_stems == ("evaluation-live-l2-9",)
-    for stale in ("evaluation-live-l2-1", "evaluation-live-l2-2", "evaluation-live-l2-3"):
+    promoted = load_promoted_baseline()
+    assert isinstance(promoted, PromotedBaseline)
+
+    # ① 옛 계열이 세트에 섞이지 않는다 — 지문이 통째로 없는 사이클 2 산출물도, 조건이
+    #    어긋난 옛 승격 세트도.
+    for stale in (
+        "evaluation-live-l2-1",
+        "evaluation-live-l2-2",
+        "evaluation-live-l2-3",
+        "evaluation-live-l2-7",
+        "evaluation-live-l2-8",
+        "evaluation-live-l2-9",
+    ):
         assert stale not in guard.candidate_stems
-    assert guard.candidate_run_count == 1
+    assert "evaluation-live-l2-28" in guard.candidate_stems
 
-    # ② 그래서 판정은 미달도 통과도 아닌 보류다.
-    assert guard.verdict == "보류"
-    assert guard.binding.match_shortfalls == ()
-    assert guard.binding.evidence_losses == ()
+    # ② 편입된 것은 **전부** 등재 지문과 같다 — 가드의 필터를 믿지 않고 산출물에서 다시 읽는다.
+    for stem in guard.candidate_stems:
+        payload = json.loads((reports / f"{stem}.json").read_text(encoding="utf-8"))
+        run = run_summary_from_payload(payload, stem=stem, source=stem)
+        assert _fingerprint_conflicts(run.fingerprint, promoted.fingerprint) == [], stem
+        unknown = [n for n, v in run.fingerprint.values.items() if v is None]
+        assert unknown == [], (stem, unknown)
 
-    # ③ 왜 정족수를 못 채웠는지가 산출물에 이름으로 남는다.
-    assert "1/3" in guard.binding.verdict_reason
-    assert "evaluation-live-l2-2" in guard.binding.verdict_reason
+    # ③ 제외된 옛 산출물이 **이름으로** 남는다 — 조용히 빠지지 않는다.
     assert any("evaluation-live-l2-2" in item for item in guard.candidate_exclusions)
     payload = guard_to_json(guard)
     assert payload["candidate_exclusions"]
     assert "조건 불일치로 세트에서 제외" in "\n".join(render_guard_section(guard))
+
+
+def test_정족수가_안_찬_1회차는_미달도_통과도_아닌_보류다(tmp_path: Path) -> None:
+    """**1회차·2회차가 거짓 판정을 커밋하지 않는다** — 합성 픽스처로 고정한다.
+
+    이 모양은 원래 커밋된 산출물로 검사했는데, 같은 조건의 실측이 하나 더 커밋되는 순간
+    정족수가 올라가 재현되지 않았다(사이클 5 확인 라이브가 실제로 그렇게 만들었다).
+    **커밋된 산출물은 계속 늘어나므로 "1회차" 라는 상태를 실물로 붙들 수 없다** — 그래서
+    합성으로 옮기고, 실물 쪽은 위 검사가 "옛 계열이 안 섞인다" 만 지킨다.
+    """
+    guard = _run_guard(tmp_path, candidate_cases=[dict(_healthy_cases())])
+
+    assert guard.candidate_run_count == 1
+    assert guard.verdict == "보류"
+    assert guard.binding.match_shortfalls == ()
+    assert guard.binding.evidence_losses == ()
+    assert f"1/{RUN_SET_SIZE}" in guard.binding.verdict_reason
 
 
 def test_조건이_확인된_3회가_모이면_진짜_회귀는_그대로_미달이다(tmp_path: Path) -> None:

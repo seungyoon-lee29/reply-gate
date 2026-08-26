@@ -63,7 +63,7 @@ from typing import Final, cast
 import psycopg
 from psycopg.rows import DictRow
 
-from reply_gate.config import Settings, get_settings
+from reply_gate.config import AbstentionGateWiringError, Settings, get_settings
 from reply_gate.contracts import RejectReason
 from reply_gate.db import connect, database_unavailable_reason, readonly_connect
 from reply_gate.evaluation import (
@@ -606,6 +606,7 @@ def main(argv: list[str] | None = None) -> int:
 
     judge_accuracy: JudgeAccuracy | SkippedMeasurement
     measurement3_is_real = False
+    measurement3_aborted = False
     if judge_skip is not None:
         print(f"측정 3 — 미실행: {judge_skip}")
         judge_accuracy = SkippedMeasurement(reason=judge_skip)
@@ -622,6 +623,7 @@ def main(argv: list[str] | None = None) -> int:
             aborted = f"측정 3 이 중단됐다: {type(error).__name__}: {error}"
             print(f"측정 3 — 중단: {aborted}")
             judge_accuracy = SkippedMeasurement(reason=aborted)
+            measurement3_aborted = True
             interrupted = interrupted or isinstance(error, KeyboardInterrupt)
         else:
             measurement3_is_real = True
@@ -681,6 +683,14 @@ def main(argv: list[str] | None = None) -> int:
         # 선언된 실험 변인은 **실행이 명시**한다 — 코드가 추측하지 않는다. 선언되지 않은
         # 지문 불일치는 "대조 불가"로 남고, 그것이 조용한 조건 드리프트를 잡는 자리다.
         declared_experiment_fields=tuple(args.declare_experiment or ()),
+        # **중단은 기계가 읽는 조건에도 남는다.** 위 세 설명 문자열의 꼬리표와 같은 변수를
+        # 읽는다 — 같은 사실을 두 경로로 만들면 언젠가 갈린다. 선검사에 걸려 처음부터 안 돈
+        # 측정은 여기 들지 않는다(그건 `measurement_scope` 가 든다).
+        aborted_measurements=tuple(
+            name
+            for name, hit in (("측정 2", measurement2_aborted), ("측정 3", measurement3_aborted))
+            if hit
+        ),
     )
     report: EvaluationReport = build_report(
         conditions=conditions,
@@ -777,7 +787,21 @@ def _condition_fingerprint(
     상수를 다시 적지 않고 `Settings.abstention_gate()` 가 조립한 것을 읽는다 — 설정과
     지문이 갈리면 바뀐 축이 가드에 보이지 않는다.
     """
-    gate = run_settings.abstention_gate()
+    try:
+        gate = run_settings.abstention_gate()
+    except AbstentionGateWiringError:
+        # τ 가 검증되지 않은 임베딩 조건이다. **여기서 죽지 않는다** — 지문은 실행 조건을
+        # *기록*하는 자리이지 제품 실행 경로가 아니고, 측정 1 은 임베딩을 한 번도 쓰지
+        # 않는다. 여기서 예외를 올리면 채점만 하는 무과금 실행이 리포트 0개로 죽는다.
+        # 제품 쪽 거부는 `EvidenceCollector` 조립이 그대로 든다 — 측정 2·3 은 그 경로를
+        # 지나므로 방어의 자격은 줄지 않는다.
+        gate = None
+        # **"꺼짐"으로 적지 않는다.** 끈 실행과 조립이 거부된 실행은 다른 조건이고, 이
+        # 값은 대조에서 반드시 **어긋남**으로 읽혀야 한다("미상"으로 관용되면 안 된다).
+        gate_statistic = gate_tau = "미조립(τ 미검증 임베딩 조건)"
+    else:
+        gate_statistic = gate.statistic.value if gate is not None else "꺼짐"
+        gate_tau = f"{gate.tau:g}" if gate is not None else "꺼짐"
     return {
         # 라벨 버전 = 골든셋 내용 지문. 결정 0008 의 라벨 재정렬 전후가 여기서 갈린다.
         "label_version": content_digest(args.golden_set, prefix="golden-") or "미상",
@@ -790,8 +814,8 @@ def _condition_fingerprint(
         # 기권 게이트. **끈 실행은 τ=0 이 아니라 "꺼짐"이다** — 0 으로 적으면 "모든 질의를
         # 통과시킨 게이트"와 구분되지 않고, 그 둘은 다른 조건이다.
         # τ 는 `embedding_model` 과 짝으로 읽힌다(`regression_guard.PAIRED_FINGERPRINT_FIELDS`).
-        "abstention_gate_statistic": gate.statistic.value if gate is not None else "꺼짐",
-        "abstention_tau": f"{gate.tau:g}" if gate is not None else "꺼짐",
+        "abstention_gate_statistic": gate_statistic,
+        "abstention_tau": gate_tau,
         "query_rewrite": "on" if run_settings.query_rewrite_enabled else "off",
         # 대역 실행은 대역이라고 적는다 — 설정값 모델명을 적으면 산출물이 거짓 신고한다.
         "embedding_model": "결정론 대역" if args.stub_llm else run_settings.embedding_model,
@@ -803,6 +827,9 @@ def _condition_fingerprint(
         "judge_effort": run_settings.judge_effort or "기본값",
         "judge_prompt_version": text_digest(JUDGE_SYSTEM_PROMPT, prefix="judge-"),
         "judge_fixture_version": content_digest(args.judge_fixtures, prefix="fixture-") or "미상",
+        # **L1 채점표의 판.** 측정 1 의 분모가 여기서 정해진다 — 픽스처가 늘거나 줄면 같은
+        # 코드가 다른 검출률·오탐률을 내고, 지문에 없으면 그 차이가 회귀로 읽힌다.
+        "l1_fixture_version": content_digest(args.l1_fixtures, prefix="l1fixture-") or "미상",
         # 판정 프롬프트 캐싱. **하드코딩으로 두면 캐싱을 켜도 지문이 거짓말을 한다** —
         # 판정자를 조립하는 것과 같은 설정(`run_settings`)에서 읽는다.
         "judge_prompt_caching": "on" if run_settings.judge_prompt_caching_enabled else "off",

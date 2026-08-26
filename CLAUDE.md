@@ -26,7 +26,8 @@
 │       ├── status.md              → 지금 어디까지 왔는지 + 첫 실측값
 │       ├── pricing.md             → 단가 표(기준일 명시)와 계열별 비용 분해 — 달러 수치의 정본
 │       ├── decisions/             → 트레이드오프가 있었던 결정 기록
-│       └── findings.md            → 지금 해결할 수 없는 문제
+│       └── findings.md            → 남은 문제를 두 갈래로: 의도적으로 하지 않기로 한 것 /
+│                                     여전히 미해결인 것. 닫힌 항목은 닫는 방식과 함께 남는다
 ├── src/reply_gate/
 │   └── AGENTS.md                  → 파일별 경계·불변식·테스트 지침
 ├── scripts/
@@ -82,16 +83,16 @@
 | 손대려는 것 | 먼저 읽을 것 |
 |---|---|
 | 범위·목표·측정 기준 자체 | `docs/problem.md` + `docs/tracking/decisions/0001`·`0006` |
-| SQL 검증기(`sql_guard.py`) | `docs/engineering-notes.md` 의 "실제로 뚫렸던 경로" 3건 + `docs/tracking/decisions/0005` |
-| L1 게이트(`gate.py`) | `docs/business-rules.md` 의 PII 규칙 + `docs/engineering-notes.md` 의 오탐 사례 |
+| SQL 검증기(`sql_guard.py`) | `docs/engineering-notes.md` 의 "실제로 뚫렸던 경로" 3건 + `docs/tracking/decisions/0005`·**`0024`**(PII 유래를 안쪽 스코프까지·캐스트 허용 타입) |
+| L1 게이트(`gate.py`) | `docs/business-rules.md` 의 PII 규칙 + `docs/engineering-notes.md` 의 오탐 사례 + `docs/tracking/decisions/`**`0021`**(접기는 패턴별이고 개인정보 정의는 게이트가 단독 소유한다) |
 | L2 판정(`judge.py`) | `docs/business-rules.md` 의 "L2 판정 규칙" + `docs/tracking/decisions/0007` |
 | 인계 사유·상태 전이 | `docs/business-rules.md` 의 사유 6종 표와 `both` 우선순위 규칙 |
 | 응답 스키마·API | `docs/contracts.md` 의 "공통 규약"(키 존재 규칙)·"층별 판정 키"·"토큰 집계 경계" |
 | 스키마 변경 | `docs/engineering-notes.md` 의 "볼륨째 지워야 한다" + `docs/operations.md` 4단계 |
-| 평가·지표 | `docs/tracking/status.md` 의 첫 실측값 + `scripts/AGENTS.md` 의 리포트 불변식 |
-| 벡터 검색·임베딩 | `docs/engineering-notes.md` 의 pgvector 캐스트 + **"τ 는 임베딩 모델에 묶인다"** + 대역 수치 주의 |
-| 근거 채택 축·기권 게이트(τ) | `docs/architecture.md` 의 "근거 채택은 축이 둘이다" + `docs/tracking/decisions/0009`·`0012`·`0014` |
-| 회귀 가드·승격 기준선 | `scripts/AGENTS.md` 불변식 16~18 + `src/reply_gate/AGENTS.md` 의 `regression_guard.py` 행 |
+| 평가·지표 | `docs/tracking/status.md` 의 첫 실측값 + `scripts/AGENTS.md` 의 리포트 불변식 + `docs/tracking/decisions/`**`0025`**(구간 아홉·미측정은 0 이 아니다) |
+| 벡터 검색·임베딩 | `docs/engineering-notes.md` 의 pgvector 캐스트 + **"τ 는 임베딩 모델에 묶인다"** + 대역 수치 주의 + `docs/tracking/decisions/`**`0023`**(검증되지 않은 임베딩 조건은 조립에서 죽는다) |
+| 근거 채택 축·기권 게이트(τ) | `docs/architecture.md` 의 "근거 채택은 축이 둘이다" + `docs/tracking/decisions/0009`·`0012`·`0014`·**`0022`**(미정의 사유는 갈라 처분한다·검색 정렬 tie-break) |
+| 회귀 가드·승격 기준선 | `scripts/AGENTS.md` 불변식 16~18 + `src/reply_gate/AGENTS.md` 의 `regression_guard.py` 행 + `docs/tracking/decisions/`**`0026`**(지문 스물다섯 칸과 계보 단절의 대가)·**`0027`**(재등재) |
 | 테스트·구조 검사 | `tests/AGENTS.md` (음성 대조·검사 대상 유도·`declared_settings()` 규칙) |
 | 비용·토큰·달러 | `docs/tracking/pricing.md` (**기준일을 반드시 함께 인용한다**) + `docs/contracts.md` 의 "토큰 집계 경계" |
 
@@ -106,8 +107,15 @@
 - 자격 증명이 저장소·로그·오류 메시지에 평문으로 남는 경우
 
 그 외에는 `docs/tracking/findings.md` 에 기록한다 — **단, 먼저 고쳐보고** 고칠 수 있으면
-고친 뒤 얻은 지식을 `docs/engineering-notes.md` 로 옮긴다. findings 는 "지금 해결할 수 없는
-것"의 자리이지 "귀찮아서 미룬 것"의 자리가 아니다.
+고친 뒤 얻은 지식을 `docs/engineering-notes.md` 로 옮긴다. findings 는 "귀찮아서 미룬 것"의
+자리가 아니다.
+
+**목록의 정의가 프로젝트 종결과 함께 갈렸다.** 원래는 "지금 세션에서 해결할 수 없는 것"
+하나였는데, "다음 세션"이 없어지면서 2026-08-21 에 남은 항목을 **두 갈래**로 갈랐다 —
+**의도적으로 하지 않기로 한 것**(범위 밖이라는 판단과 근거가 있고, 결함으로 다시 열 자리가
+아니다)과 **여전히 미해결인 것**(무엇이 왜 열려 있는지와 다시 여는 사람이 무엇부터 볼지).
+새 항목을 적을 때 어느 갈래인지 함께 적고, **항목 번호는 다시 매기지 않는다** — 저장소
+곳곳의 인용이 번호를 링크 글자에만 담고 있어 링크 검사가 잡지 못한 채 어긋난다.
 
 ## 검증
 
@@ -122,3 +130,9 @@ uv run pytest -m db              # skip 0 이어야 한다
 
 DB 없이 돌리면 `db` 마커 테스트가 사유를 담아 skip 된다. **전체 녹색을 주장하려면
 `pytest -m db` 로 skip 0 을 따로 확인해야 한다.**
+
+**문서 링크·앵커 검사와 검증 건수 대조는 `pytest` 안에 있다** — 별도 명령이 아니다.
+전자는 `scripts/check_links.py`(`uv run python -m scripts.check_links` 로 따로도 돈다),
+후자는 문서가 인용한 건수를 그 실행의 실제 값과 대조한다. **건수 대조는 전체 스위트에서만
+성립한다** — 경로·`-k`·`-m` 을 주면 사유를 담아 skip 된다. **테스트 건수 쪽은 DB 까지 필요하다**
+— 문서가 인용하는 것은 `N passed` 인데 수집 건수와 그것은 skip 이 0 일 때만 같다.

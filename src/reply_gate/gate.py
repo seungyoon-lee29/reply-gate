@@ -13,6 +13,11 @@ docs/business-rules.md "L1 게이트 판정 규칙" 을 그대로 옮긴 모듈�
 
 구조 검사를 `DRAFT_JSON_SCHEMA` 에 위임하지 않는다: 그건 생성 측 구조화 출력용이고,
 생성 측 강제가 L1 검사를 대체하면 게이트가 실제로 무엇을 막는지 증명할 수 없다.
+
+**패턴형 개인정보 정의의 단독 소유자가 이 모듈이다.** 정규식·접기·정규화를 한 벌
+(`DEFAULT_PII_PATTERNS`)로 들고, 근거 렌더의 개인정보 필터와 조회 가드가 `pii_shaped`
+로 가져다 쓴다 — 층마다 자기 정의를 두면 한쪽만 넓혀져 기준이 갈리고, 실제로 그렇게
+뚫렸다(docs/engineering-notes.md "접기 기준이 층마다 달라 근거 필터가 게이트보다 헐거웠다").
 """
 
 from __future__ import annotations
@@ -26,13 +31,16 @@ from reply_gate.contracts import Claim, Draft, Evidence, GateResult, RejectReaso
 
 __all__ = [
     "DEFAULT_PII_PATTERNS",
+    "NUMERIC_SEPARATOR_VARIANTS",
     "REASON_ORDER",
     "PiiPattern",
     "evaluate_draft",
     "fold_for_detection",
+    "fold_numeric_for_detection",
     "normalize_digits",
     "normalize_email",
     "normalize_phone",
+    "pii_shaped",
     "to_draft",
 ]
 
@@ -55,7 +63,91 @@ _MAX_TEXT_DEPTH = 8
 _NON_DIGIT = re.compile(r"[^0-9]")
 
 
-# ── PII 정규화 — 조정 가능 기본값 ────────────────────────────────────────────
+# ── PII 접기 — 탐지 전 유니코드 정규화 ──────────────────────────────────────
+
+#: 번호 계열이 **구분자로 받는** 표기 변종 12자. **열거된 고정 집합**이고 범주 이름으로
+#: 유도하지 않는다 — 이 12자는 네 범주에 흩어져 있어 어떤 범주도 절반 이상을 덮지 못한다:
+#: 대시 범주(`Pd`)에 드는 것은 U+2010~U+2015 여섯 자뿐이고, U+2212 는 수학기호(`Sm`),
+#: U+2027·U+30FB·U+FF65·`/` 는 구두점(`Po`), `_` 는 연결선(`Pc`) 이다.
+#: `category == "Pd"` 로 짜면 **열거된 절반이 그대로 뚫린 채** 문서는 닫혔다고 적게 된다.
+#:
+#: 눈으로 구분되지 않는 문자는 **이스케이프로 적는다** — 리터럴로 쓰면 무엇이 들어 있는지
+#: 읽을 수 없고, 편집 중에 조용히 ASCII 하이픈으로 바뀌어도 아무도 모른다.
+NUMERIC_SEPARATOR_VARIANTS: frozenset[str] = frozenset(
+    (
+        "\u2010",  # HYPHEN
+        "\u2011",  # NON-BREAKING HYPHEN
+        "\u2012",  # FIGURE DASH
+        "\u2013",  # EN DASH
+        "\u2014",  # EM DASH
+        "\u2015",  # HORIZONTAL BAR
+        "\u2212",  # MINUS SIGN
+        "\u2027",  # HYPHENATION POINT
+        "\u30fb",  # KATAKANA MIDDLE DOT
+        "\uff65",  # HALFWIDTH KATAKANA MIDDLE DOT
+        "/",  # SOLIDUS
+        "_",  # LOW LINE
+    )
+)
+
+#: 번호 계열이 **무시하는** 결합 표식의 유니코드 범주 **접두사**. 변이선택자도 전부 든다.
+#: ①의 12자와 반대로 **범주로 구현한다** — 대표 문자 몇 개로 한정하면 U+0300 같은 동일
+#: 계열이 그대로 남기 때문이다.
+#:
+#: ⚠ **`Mn` 하나가 아니라 `M` 계열 전부다.** 유니메코드 결합 표식은 `Mn`(nonspacing) ·
+#: `Mc`(spacing combining) · `Me`(enclosing) 셋으로 갈린다. `Mn` 만 보면 `U+0903`(Mc)·
+#: `U+20E3`(Me)를 숫자 자리 사이에 끼운 번호가 그대로 통과한다 — 실제로 찍어 확인했고,
+#: 그것은 ①에서 경고한 "범주가 계열을 덮지 못한다"를 반대쪽에서 여는 것이다.
+_COMBINING_MARK_CATEGORY_PREFIX = "M"
+
+#: 폭 없는 서식 문자(U+200B·U+2060 등)의 범주. 공통 접기가 통째로 지운다.
+_FORMAT_CATEGORY = "Cf"
+
+
+def fold_for_detection(text: str) -> str:
+    """탐지 전 **공통** 접기 — 사람 눈에 같은 값이 패턴을 비껴가지 못하게 한다.
+
+    전각 숫자(U+FF10~U+FF19)로 쓴 전화번호는 사람이 읽으면 전화번호지만 ASCII 숫자
+    정규식에 걸리지 않는다. NFKC 로 호환 문자를 반각으로 접고, 폭 없는 서식 문자
+    (`Cf` 범주 — U+200B 등)를 지운다.
+
+    **이메일 패턴이 쓰는 접기가 이것이고, 여기서 더 넓히지 않는다.** 밑줄과 빗금을
+    하이픈으로 접으면 `a_b@…` 와 `a-b@…` 가 **같은 값이 되어**, 근거에 있는 주소를 한
+    글자 바꿔 지어낸 주소가 근거 유래로 통과한다 — 우회 하나를 닫으면서 반대 방향 우회를
+    여는 것이다. 밑줄은 이 저장소의 사유 코드·근거 ID·컬럼명에 흔해서, 전역으로 접으면
+    번호와 무관한 문자열까지 함께 움직인다.
+
+    **초안과 근거 양쪽에 같은 접기를 적용한다.** 한쪽에만 걸면 근거의 같은 값이 다른
+    문자열이 되어 정상 에코가 오기각되고, 반대로 근거 쪽만 헐거우면 접어야 PII 가 되는
+    값이 allowlist 근거로 살아남는다.
+    """
+    folded = unicodedata.normalize("NFKC", text)
+    return "".join(ch for ch in folded if unicodedata.category(ch) != _FORMAT_CATEGORY)
+
+
+def fold_numeric_for_detection(text: str) -> str:
+    """번호 계열 접기 — 공통 접기 위에 구분자 변종과 결합 표식을 얹는다.
+
+    NFKC 는 대시류를 ASCII 하이픈으로 접지 않고, 결합 표식은 `Cf` 가 아니라 지워지지도
+    않는다. 그래서 en dash 로 쓴 `010-9999-8888` 도, 숫자 **자리 사이**에 U+0301 을 끼운
+    `010-9999-8888` 도 구분자 클래스 `[-. ()]` 를 그대로 비껴갔다 — 사람 눈에는 둘 다
+    같은 번호로 읽힌다. 실제 우회 문자열은 `tests/test_pii_folding.py` 가 들고 있다.
+
+    **배치가 판정을 가른다** — 결합 표식은 숫자열 안쪽에 끼워야 뚫리고 끝에 붙이면 매치가
+    이미 끝난 뒤라 원래도 기각된다. 회귀 검사가 자리 사이 배치를 박는 이유다.
+
+    접기는 **탐지에만** 쓴다. 근거 문면을 갈아 끼우지 않는다 — 바꾸면 정상 에코 계약과
+    L2 근거가 함께 흔들린다.
+    """
+    folded = fold_for_detection(text)
+    return "".join(
+        "-" if ch in NUMERIC_SEPARATOR_VARIANTS else ch
+        for ch in folded
+        if not unicodedata.category(ch).startswith(_COMBINING_MARK_CATEGORY_PREFIX)
+    )
+
+
+# ── PII 정규화 ──────────────────────────────────────────────────────────────
 
 
 def normalize_digits(value: str) -> str:
@@ -80,17 +172,28 @@ def normalize_email(value: str) -> str:
 
 @dataclass(frozen=True)
 class PiiPattern:
-    """패턴형 PII 1종 — 탐지 정규식과 대조용 정규화 규칙을 함께 가진다."""
+    """패턴형 PII 1종 — 탐지 정규식 · 탐지 전 접기 · 대조용 정규화를 함께 가진다.
+
+    **접기가 패턴별인 것이 이 자료형의 요점이다.** 번호 계열은 구분자 변종을 하이픈으로
+    접고 결합 표식을 무시해야 하지만, 이메일에 같은 접기를 걸면 서로 다른 주소가 같은
+    값이 되어 반대 방향 우회가 열린다. 접기를 전역 함수 하나로 두면 그 둘을 가를 자리가
+    없어서, 기본값 없이 **패턴마다 명시**하게 한다.
+    """
 
     name: str
     regex: re.Pattern[str]
+    fold: Callable[[str], str]
     normalize: Callable[[str], str]
 
 
 # 숫자 경계 lookaround 를 붙이는 이유:
 #   1) 초안 쪽 — 주문번호처럼 긴 숫자열 한가운데의 일부가 전화번호로 오탐되는 것을 막는다.
 #   2) 근거 쪽 — 긴 숫자열의 조각이 allowlist 에 올라 지어낸 번호를 통과시키는 것을 막는다.
-# 패턴 집합·정규화 규칙은 "조정 가능 기본값" 이다. 호출자가 `pii_patterns` 로 바꿔 넣을 수 있다.
+#
+# **이 집합이 저장소의 패턴형 개인정보 정의 정본이고, 소유자는 이 모듈 하나다.** 근거 렌더의
+# 개인정보 필터(`evidence._sql_evidence_texts`)와 조회 가드가 여기서 가져다 쓴다 — 층마다
+# 자기 정의를 두면 한쪽만 넓혀져 기준이 갈리고, 접기가 층마다 달라 터진 것이 정확히 그
+# 모양이었다. 층별 주입점을 두지 않는 것도 같은 이유다(구조 테스트가 검사한다).
 DEFAULT_PII_PATTERNS: tuple[PiiPattern, ...] = (
     PiiPattern(
         name="mobile_phone",
@@ -98,6 +201,7 @@ DEFAULT_PII_PATTERNS: tuple[PiiPattern, ...] = (
             r"(?<![0-9])(?:(?:\+82|0082)[-. ()]*10|01[016789])"
             r"[-. ()]*[0-9]{3,4}[-. ()]*[0-9]{4}(?![0-9])"
         ),
+        fold=fold_numeric_for_detection,
         normalize=normalize_phone,
     ),
     PiiPattern(
@@ -106,6 +210,7 @@ DEFAULT_PII_PATTERNS: tuple[PiiPattern, ...] = (
             r"(?<![0-9])(?:(?:\+82|0082)[-. ()]*(?:2|[3-9][0-9]?)|0[2-9][0-9]?)"
             r"[-. ()]*[0-9]{3,4}[-. ()]*[0-9]{4}(?![0-9])"
         ),
+        fold=fold_numeric_for_detection,
         normalize=normalize_phone,
     ),
     # 15xx/16xx/17xx/18xx 대표번호. 개인 연락처는 아니지만 정책 문서의 미끼 조항이
@@ -115,35 +220,54 @@ DEFAULT_PII_PATTERNS: tuple[PiiPattern, ...] = (
     PiiPattern(
         name="service_phone",
         regex=re.compile(r"(?<![0-9])1[5-8][0-9]{2}[-. ]?[0-9]{4}(?![0-9])"),
+        fold=fold_numeric_for_detection,
         normalize=normalize_digits,
     ),
     PiiPattern(
         name="resident_registration_number",
         regex=re.compile(r"(?<![0-9])[0-9]{6}[-. ]?[1-4][0-9]{6}(?![0-9])"),
+        fold=fold_numeric_for_detection,
         normalize=normalize_digits,
     ),
+    # 이메일만 **공통 접기**를 든다. 번호 계열 접기를 걸면 밑줄·빗금이 하이픈으로 접혀
+    # `a_b@…` 와 `a-b@…` 가 같은 allowlist 값이 되고, 근거에 있는 주소를 한 글자 바꿔
+    # 지어낸 주소가 통과한다 — 넓히기는 번호 계열 안에서만 한다.
     PiiPattern(
         name="email",
         regex=re.compile(r"[A-Za-z0-9._%+-]+@(?:[^\W_]|-)+(?:\.(?:[^\W_]|-)+)+"),
+        fold=fold_for_detection,
         normalize=normalize_email,
     ),
 )
 
 
+def pii_shaped(text: str) -> bool:
+    """텍스트에 패턴형 PII 가 한 건이라도 있으면 True — **탐지 전용 공개 표면**.
+
+    값 대조 없이 "개인정보 모양인가"만 묻는 층이 쓴다: 근거 렌더의 개인정보 필터가
+    계산 컬럼의 이름·값을 `evidence_text` 에서 걸러낼 때, 그리고 조회 가드가 고정값을
+    승인할지 볼 때. **그 층들이 자기 정규식을 따로 두면 저장소에 개인정보 정의가 셋이
+    되고, 한쪽만 넓혀지는 순간 기준이 갈린다** — 접기가 층마다 달라 뚫렸던 경로가
+    정확히 그 모양이었다(docs/engineering-notes.md "접기 기준이 층마다 달라 근거
+    필터가 게이트보다 헐거웠다").
+
+    패턴별 접기를 그대로 태운다. 접기는 판정에만 쓰고 값을 갈아 끼우지 않는다.
+    """
+    return any(pattern.regex.search(pattern.fold(text)) for pattern in DEFAULT_PII_PATTERNS)
+
+
 # ── 진입점 ──────────────────────────────────────────────────────────────────
 
 
-def evaluate_draft(
-    *,
-    raw_draft: object,
-    evidences: Sequence[Evidence],
-    pii_patterns: Sequence[PiiPattern] = DEFAULT_PII_PATTERNS,
-) -> GateResult:
+def evaluate_draft(*, raw_draft: object, evidences: Sequence[Evidence]) -> GateResult:
     """원시 초안을 이번 문의의 수집 근거와 대조해 `pass | reject + 사유 목록` 을 낸다.
 
     `raw_draft` 는 **무엇이든 들어올 수 있다** — 초안 생성이 형식 불일치 시 원문 문자열을
     그대로 넘기기 때문이다. dict 가 아닌 값에도 예외를 던지지 않고 `schema_violation`
     으로 판정한다.
+
+    **패턴 집합은 인자로 받지 않는다** — 정본은 `DEFAULT_PII_PATTERNS` 하나이고 근거
+    필터·조회 가드가 같은 것을 쓴다.
     """
     reasons: set[RejectReason] = set()
 
@@ -163,7 +287,6 @@ def evaluate_draft(
     if _has_unsourced_pii(
         draft_texts=_answer_texts(inspection=inspection, raw_draft=raw_draft),
         evidence_texts=[evidence.evidence_text for evidence in evidences],
-        patterns=pii_patterns,
     ):
         reasons.add(RejectReason.PII_DETECTED)
 
@@ -313,35 +436,16 @@ def _collect_texts(value: object, *, depth: int = 0) -> list[str]:
     return []
 
 
-def fold_for_detection(text: str) -> str:
-    """탐지 전 유니코드 접기 — 사람 눈에 같은 값이 패턴을 비껴가지 못하게 한다.
-
-    전각 숫자(U+FF10~U+FF19)로 쓴 전화번호는 사람이 읽으면 전화번호지만 ASCII 숫자
-    정규식에 걸리지 않는다. NFKC 로 호환 문자를 반각으로 접고, 폭 없는 서식 문자
-    (`Cf` 범주 — U+200B 등)를 지운다. 숫자 사이에 끼워 넣는 우회도 같은 계열이다.
-    실제 우회 문자열은 `tests/test_gate.py` 의 표기 변형 케이스에 그대로 들어 있다.
-
-    **초안과 근거 양쪽에 같은 접기를 적용한다.** 한쪽에만 걸면 근거의 같은 값이 다른 문자열이
-    되어 정상 에코가 오기각된다.
-    """
-    folded = unicodedata.normalize("NFKC", text)
-    return "".join(ch for ch in folded if unicodedata.category(ch) != "Cf")
-
-
 def _normalized_matches(*, texts: Sequence[str], pattern: PiiPattern) -> set[str]:
+    """패턴 하나가 텍스트들에서 뽑은 **정규화된 값** 집합. 접기는 그 패턴의 것을 쓴다."""
     return {
         pattern.normalize(match)
         for text in texts
-        for match in pattern.regex.findall(fold_for_detection(text))
+        for match in pattern.regex.findall(pattern.fold(text))
     }
 
 
-def _has_unsourced_pii(
-    *,
-    draft_texts: Sequence[str],
-    evidence_texts: Sequence[str],
-    patterns: Sequence[PiiPattern],
-) -> bool:
+def _has_unsourced_pii(*, draft_texts: Sequence[str], evidence_texts: Sequence[str]) -> bool:
     """초안의 패턴형 PII 중 **근거에서 유래하지 않은 값**이 있으면 True.
 
     대조 방식 — 근거 텍스트에도 **같은 패턴·같은 정규화**를 적용해 값 집합을 뽑고,
@@ -356,13 +460,15 @@ def _has_unsourced_pii(
     쪽이므로 이 방향의 보수성을 택한다.
 
     비패턴형 개인정보(이름·주소)는 정규식으로 잡을 수 없어 **L1 의 검사 대상이 아니다** —
-    L2 사이클의 claim 단위 근거 대조로 이월한다. 커버리지를 과장하지 않는다.
-    """
-    if not patterns:
-        return False
+    그리고 **L2 의 대상도 아니다**(L2 는 근거와 claim 의 정합만 본다). 어느 층의 검사
+    대상도 아니므로 커버리지를 과장하지 않는다.
 
+    **패턴 집합은 주입받지 않는다.** 이 저장소의 정본은 `DEFAULT_PII_PATTERNS` 하나이고,
+    근거 필터·조회 가드도 같은 집합을 가져다 쓴다 — 층마다 다른 집합을 받을 수 있으면
+    한쪽만 넓혀져 기준이 갈린다.
+    """
     found: set[str] = set()
-    for pattern in patterns:
+    for pattern in DEFAULT_PII_PATTERNS:
         found |= _normalized_matches(texts=draft_texts, pattern=pattern)
     if not found:
         return False
@@ -370,7 +476,7 @@ def _has_unsourced_pii(
     # allowlist 는 패턴별로 나누지 않고 하나로 합친다 — 근거에서 어느 패턴이 뽑았든
     # 근거에 있었다는 사실은 같기 때문이다(숫자열과 이메일은 정규화 결과가 겹치지 않는다).
     allowed: set[str] = set()
-    for pattern in patterns:
+    for pattern in DEFAULT_PII_PATTERNS:
         allowed |= _normalized_matches(texts=evidence_texts, pattern=pattern)
 
     return bool(found - allowed)

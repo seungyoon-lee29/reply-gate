@@ -28,9 +28,12 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import re
-from collections.abc import Callable, Mapping, Sequence
+import textwrap
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import reduce
@@ -40,6 +43,7 @@ from typing import Any, Final, Protocol, cast
 import psycopg
 from psycopg.rows import DictRow
 
+from reply_gate import policy_index, retrieval_strategies, sql_guard
 from reply_gate.contracts import (
     Claim,
     Draft,
@@ -52,14 +56,24 @@ from reply_gate.contracts import (
     Verdict,
     is_policy_evidence_id,
 )
-from reply_gate.gate import DEFAULT_PII_PATTERNS, REASON_ORDER, evaluate_draft
+from reply_gate.gate import (
+    DEFAULT_PII_PATTERNS,
+    NUMERIC_SEPARATOR_VARIANTS,
+    REASON_ORDER,
+    PiiPattern,
+    evaluate_draft,
+    fold_for_detection,
+    fold_numeric_for_detection,
+)
 from reply_gate.judge import L2_REJECT_REASONS
 from reply_gate.llm import LLMCallError, LLMFormatError, accumulate_optional_tokens
 from reply_gate.pipeline import (
     L2_JUDGE_STAGE,
+    AttemptDurations,
     Judging,
     ProcessedInquiry,
     ReceiptError,
+    StageDurations,
     accept_inquiry,
     new_inquiry_id,
 )
@@ -74,7 +88,10 @@ from reply_gate.regression_guard import (
     guard_to_json,
     render_guard_section,
     run_summary_from_payload,
+    text_digest,
 )
+from reply_gate.retrieval_strategies import AbstentionUndefined
+from reply_gate.sql_guard import SqlGuardRejection
 
 __all__ = [
     "DEFAULT_GOLDEN_SET_PATH",
@@ -103,11 +120,13 @@ __all__ = [
     "ReportStemError",
     "RunConditions",
     "SkippedMeasurement",
+    "SpanAggregate",
     "StubGenerationClient",
     "TargetAssessment",
     "assess_targets",
     "attach_regression_guard",
     "build_report",
+    "code_condition_fingerprint",
     "display_path",
     "load_golden_set",
     "load_judge_fixtures",
@@ -115,13 +134,18 @@ __all__ = [
     "measure_gate_accuracy",
     "measure_judge_accuracy",
     "measure_pipeline_agreement",
+    "order_by_clause",
     "render_markdown",
     "report_to_json",
     "resolve_report_stem",
+    "sql_guard_probe_outcomes",
     "write_report",
 ]
 
 _ROOT: Final = Path(__file__).resolve().parents[2]
+
+#: 구간 이름 아홉. **자료형에서 유도한다** — 목록을 여기에 다시 적으면 한쪽만 늘어난다.
+SPAN_NAMES: Final[tuple[str, ...]] = tuple(StageDurations().as_mapping())
 
 #: 저장소의 골든셋(30건) — 허용 결과 집합 라벨이 붙은 ground truth.
 DEFAULT_GOLDEN_SET_PATH: Final = _ROOT / "data" / "golden_set.jsonl"
@@ -528,12 +552,30 @@ class GoldenOutcome:
     #: 문의는 0 이고, 실패한 호출의 토큰도 실비용이므로 그대로 들어온다.
     retrieval_input_tokens: int = 0
     retrieval_output_tokens: int = 0
+    #: 캐시 계열 토큰 — **계열마다 (write, read) 한 쌍**이다. 두 계열이 같은 클라이언트를
+    #: 지나므로 한 쌍으로 묶으면 어느 계열의 캐시였는지 되짚을 수 없다. 입력 칸에 접지
+    #: 않는다(단가가 다르고, OpenAI 는 적중분이 입력 토큰에 이미 포함돼 있다).
+    #: 보고되지 않은 칸은 0 이 아니라 `None`(미측정)이다.
+    generation_cache_creation_tokens: int | None = None
+    generation_cache_read_tokens: int | None = None
+    retrieval_cache_creation_tokens: int | None = None
+    retrieval_cache_read_tokens: int | None = None
     #: 검색 단계가 폴백한 사유. 인계 사유가 아니다 — 폴백한 문의도 답변으로 끝날 수 있다.
     retrieval_fallback_reason: str | None = None
+    #: 기권 게이트의 통계량이 **미정의였던 사유**. `None` 은 세 경우를 함께 덮는다 —
+    #: 게이트 꺼짐 · 정책 검색 미실행 · 통계량 정의됨. **처분만으로는 갈리지 않는다**:
+    #: "2건 미만이라 열어 뒀다"와 "정의됐고 통과했다"는 채택 결과가 같다.
+    abstention_undefined_reason: str | None = None
     #: 의도 해석이 고른 근거 소스(`policy`/`order`/`both`). **정책 검색이 실제로 돌았는지**를
     #: 이 값이 들고 있다 — 지금까지는 검색 토큰 0 + `sql:` 단독 채택으로 역추론해야 했다
     #: (docs/tracking/findings.md 20번 ①). 의도 해석이 무너진 문의는 `None`(미상)이다.
     intent: str | None = None
+    #: 이 케이스의 구간 아홉 시간(ms). 돌지 않은 구간은 0 이 아니라 미측정이다.
+    #: 접수 거부처럼 파이프라인에 진입조차 못한 케이스는 아홉 칸 전부 미측정이다.
+    stage_durations: StageDurations = field(default_factory=StageDurations)
+    #: 시도별 구간(초안 생성·게이트 판정·L2 판정). 재생성이 돌면 2건이 쌓이고, 합계는
+    #: `stage_durations` 가 들고 있다 — **합계와 시도별 값을 함께** 알 수 있어야 한다.
+    attempt_durations: tuple[AttemptDurations, ...] = ()
 
     @property
     def rejected_at_least_once(self) -> bool:
@@ -564,6 +606,60 @@ class GoldenOutcome:
             self.escalation_reason is EscalationReason.LLM_CALL_FAILED
             and self.failed_stage == L2_JUDGE_STAGE
         )
+
+
+@dataclass(frozen=True)
+class SpanAggregate:
+    """구간 하나의 세트 집계 — **미측정은 분모에서 뺀다.**
+
+    0 을 섞어 평균 내면 그 구간이 실제보다 빨라 보인다. 그래서 분모는 전체 케이스 수가
+    아니라 **그 구간이 실제로 돈 케이스 수**(`measured_cases`)이고, 돌지 않은 건수는
+    `unmeasured_cases` 로 따로 적어 사람이 분모를 눈으로 확인할 수 있게 둔다.
+
+    한 케이스도 재지 않은 구간의 값은 0 이 아니라 `None`(미측정)이다.
+    """
+
+    span: str
+    measured_cases: int
+    unmeasured_cases: int
+    total_ms: float | None
+    mean_ms: float | None
+    p50_ms: float | None
+    p95_ms: float | None
+
+
+def _span_aggregate(span: str, values: Sequence[float | None]) -> SpanAggregate:
+    """구간 하나를 집계한다. **미측정(`None`)은 분모에도 분자에도 들어가지 않는다.**"""
+    measured = [value for value in values if value is not None]
+    if not measured:
+        return SpanAggregate(
+            span=span,
+            measured_cases=0,
+            unmeasured_cases=len(values),
+            total_ms=None,
+            mean_ms=None,
+            p50_ms=None,
+            p95_ms=None,
+        )
+    total = sum(measured)
+    return SpanAggregate(
+        span=span,
+        measured_cases=len(measured),
+        unmeasured_cases=len(values) - len(measured),
+        total_ms=total,
+        mean_ms=total / len(measured),
+        p50_ms=_percentile_ms(measured, 50),
+        p95_ms=_percentile_ms(measured, 95),
+    )
+
+
+def _percentile_ms(values: Sequence[float], percent: int) -> float | None:
+    """nearest-rank 백분위 — 정수 지연(`_percentile`)과 **같은 규칙**의 실수판이다."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, min(len(ordered), _ceil_div(percent * len(ordered), 100)))
+    return ordered[rank - 1]
 
 
 @dataclass(frozen=True)
@@ -599,10 +695,26 @@ class PipelineAgreement:
     #: 검색 계열도 같은 자격으로 분리해서 센다.
     retrieval_input_tokens_total: int = 0
     retrieval_output_tokens_total: int = 0
+    #: 캐시 계열 합계 — **계열마다 한 쌍**이다. 한 쌍으로 묶으면 두 계열 중 어느 쪽의
+    #: 캐시였는지 되짚을 수 없고, 이 절감의 증상은 **두 계열 모두**의 달러가 상한이라는
+    #: 것이라 한 쌍으로는 목적을 못 채운다. **한 건도 보고되지 않았으면 0 이 아니라
+    #: `None`(미측정)** 이다 — "캐시가 0 토큰 적중했다"와 "캐시를 잰 적이 없다"는 다르다.
+    generation_cache_creation_total: int | None = None
+    generation_cache_read_total: int | None = None
+    retrieval_cache_creation_total: int | None = None
+    retrieval_cache_read_total: int | None = None
     #: 검색 단계가 폴백한 문의 수. **조용한 폴백을 금지하는 집계**다
     #: (docs/business-rules.md "검색 단계 실패") — 0 이 정상이고, 커지면 재작성 층이
     #: 사실상 꺼진 실행을 정상 실측으로 읽게 된다.
     retrieval_fallback_total: int = 0
+    #: 기권 게이트 통계량이 미정의였던 문의 수 — **사유별로** 센다. 두 사유는 처분이
+    #: 반대라(2건 미만은 열어 두고, 1위 코사인 0 이하는 기권) 한 칸으로 접으면 어느
+    #: 분기를 탔는지 산출물에서 사라진다. 사유가 없던 문의는 세지 않는다(0 이 아니라
+    #: 그 사유 키가 없다 — 미정의가 한 번도 없었다는 뜻이다).
+    abstention_undefined_counts: Mapping[str, int] = field(default_factory=dict)
+    #: 구간 아홉의 세트 집계. **미측정 케이스는 각 구간의 분모에서 빠진다.**
+    #: 순서는 `evidence.SPAN_NAMES`(파이프라인 실행 순서)와 같다.
+    stage_durations: tuple[SpanAggregate, ...] = ()
 
     @property
     def match_rate(self) -> float | None:
@@ -643,6 +755,22 @@ class PipelineAgreement:
         if self.total == 0:
             return None
         return (self.retrieval_input_tokens_total + self.retrieval_output_tokens_total) / self.total
+
+    @property
+    def generation_cache_measured(self) -> bool:
+        """생성 계열의 캐시를 **잰** 실행인가. 안 잰 실행의 표기는 0 이 아니라 "미측정" 이다."""
+        return (
+            self.generation_cache_creation_total is not None
+            or self.generation_cache_read_total is not None
+        )
+
+    @property
+    def retrieval_cache_measured(self) -> bool:
+        """검색 계열의 캐시를 **잰** 실행인가 — 생성 계열과 따로 묻는다."""
+        return (
+            self.retrieval_cache_creation_total is not None
+            or self.retrieval_cache_read_total is not None
+        )
 
     @property
     def total_tokens_per_inquiry(self) -> float | None:
@@ -826,8 +954,19 @@ def evaluate_case(
         error=None,
         retrieval_input_tokens=processed.retrieval_input_tokens,
         retrieval_output_tokens=processed.retrieval_output_tokens,
+        generation_cache_creation_tokens=processed.generation_cache_creation_tokens,
+        generation_cache_read_tokens=processed.generation_cache_read_tokens,
+        retrieval_cache_creation_tokens=processed.retrieval_cache_creation_tokens,
+        retrieval_cache_read_tokens=processed.retrieval_cache_read_tokens,
         retrieval_fallback_reason=processed.retrieval_fallback_reason,
+        abstention_undefined_reason=(
+            None
+            if processed.abstention_undefined_reason is None
+            else processed.abstention_undefined_reason.value
+        ),
         intent=None if processed.intent is None else processed.intent.value,
+        stage_durations=processed.stage_durations,
+        attempt_durations=tuple(attempt.durations for attempt in processed.attempts),
     )
 
 
@@ -903,9 +1042,57 @@ def measure_pipeline_agreement(
         outcomes=tuple(outcomes),
         retrieval_input_tokens_total=sum(outcome.retrieval_input_tokens for outcome in outcomes),
         retrieval_output_tokens_total=sum(outcome.retrieval_output_tokens for outcome in outcomes),
+        # 캐시 계열은 `sum` 이 아니라 누적기로 접는다 — 미측정을 0 으로 만들지 않는다
+        # (판정 계열의 같은 자리와 같은 규칙).
+        generation_cache_creation_total=_fold_optional(
+            outcome.generation_cache_creation_tokens for outcome in outcomes
+        ),
+        generation_cache_read_total=_fold_optional(
+            outcome.generation_cache_read_tokens for outcome in outcomes
+        ),
+        retrieval_cache_creation_total=_fold_optional(
+            outcome.retrieval_cache_creation_tokens for outcome in outcomes
+        ),
+        retrieval_cache_read_total=_fold_optional(
+            outcome.retrieval_cache_read_tokens for outcome in outcomes
+        ),
         retrieval_fallback_total=sum(
             1 for outcome in outcomes if outcome.retrieval_fallback_reason is not None
         ),
+        abstention_undefined_counts=_abstention_undefined_counts(outcomes),
+        stage_durations=_aggregate_stage_durations(outcomes),
+    )
+
+
+def _abstention_undefined_counts(outcomes: Sequence[GoldenOutcome]) -> dict[str, int]:
+    """기권 미정의 사유별 건수. **정본 순서**(`AbstentionUndefined` 선언 순서)로 담는다.
+
+    사유가 한 건도 없으면 빈 맵이다 — 있지도 않은 사유를 0 으로 채우면 "이 실행에서 그
+    분기를 쟀다"로 읽힌다. 사전 순회 순서에 기대지 않는 것은 산출물이 실행마다 같은
+    모양이어야 하기 때문이다.
+    """
+    counts: dict[str, int] = {}
+    for reason in AbstentionUndefined:
+        hits = sum(1 for outcome in outcomes if outcome.abstention_undefined_reason == reason.value)
+        if hits:
+            counts[reason.value] = hits
+    return counts
+
+
+def _fold_optional(values: Iterable[int | None]) -> int | None:
+    """캐시 계열 합계 — **미측정(`None`)을 0 으로 접지 않는다.**
+
+    한 번이라도 측정값이 있으면 합계는 측정값이고, 끝까지 없으면 합계도 미측정이다.
+    `sum()` 을 쓰면 미측정이 0 이 되어 재지도 않은 축이 "적중 0" 으로 신고된다.
+    """
+    return reduce(accumulate_optional_tokens, values, cast(int | None, None))
+
+
+def _aggregate_stage_durations(outcomes: Sequence[GoldenOutcome]) -> tuple[SpanAggregate, ...]:
+    """구간 아홉을 세트 단위로 집계한다 — 순서는 구간 이름의 정본 순서 그대로다."""
+    per_case = [outcome.stage_durations.as_mapping() for outcome in outcomes]
+    return tuple(
+        _span_aggregate(span, [values[span] for values in per_case]) for span in SPAN_NAMES
     )
 
 
@@ -989,6 +1176,10 @@ class L2Outcome:
     #: 캐시를 재지 않은 실행에서는 0 이 아니라 `None`(해당 없음/미측정)이다.
     cache_creation_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None
+    #: 판정 호출에 흐른 벽시계(ms) — **형식 재시도와 전송 재시도를 포함한 합산**이다.
+    #: 판정하지 못한 픽스처도 시간은 썼으므로 실패 경로에서도 값이 실린다. 값을 채우지
+    #: 않고 조립한 결과에서는 0 이 아니라 `None`(미측정)이고, 집계 분모에서 빠진다.
+    elapsed_ms: float | None = None
 
     @property
     def judged(self) -> bool:
@@ -1028,6 +1219,9 @@ class JudgeAccuracy:
     #: "캐시가 0 토큰 적중했다"와 "캐시를 잰 적이 없다"는 다른 상태다.
     cache_creation_tokens_total: int | None = None
     cache_read_tokens_total: int | None = None
+    #: 판정 호출 지연의 세트 집계. 지금까지 측정 3 은 지연을 **아예 기록하지 않았다**.
+    #: 미측정 픽스처는 분모에서 빠지고, 한 건도 재지 않았으면 `measured_cases` 가 0 이다.
+    judge_latency: SpanAggregate | None = None
 
     @property
     def judged_total(self) -> int:
@@ -1217,6 +1411,8 @@ def evaluate_judge_fixture(*, fixture: JudgeFixture, judge: Judging) -> L2Outcom
             # 실행됐으나 실패한 호출의 캐시 write 도 실비용이다 — 0 으로 접지 않는다.
             cache_creation_input_tokens=exc.cache_creation_input_tokens,
             cache_read_input_tokens=exc.cache_read_input_tokens,
+            # 판정하지 못한 픽스처도 시간은 썼다 — 토큰과 같은 규칙이다.
+            elapsed_ms=exc.elapsed_ms,
         )
 
     result = outcome.result
@@ -1248,6 +1444,7 @@ def evaluate_judge_fixture(*, fixture: JudgeFixture, judge: Judging) -> L2Outcom
         error=None,
         cache_creation_input_tokens=outcome.cache_creation_input_tokens,
         cache_read_input_tokens=outcome.cache_read_input_tokens,
+        elapsed_ms=outcome.elapsed_ms,
     )
 
 
@@ -1310,7 +1507,281 @@ def measure_judge_accuracy(
             (outcome.cache_read_input_tokens for outcome in outcomes),
             cast(int | None, None),
         ),
+        # 판정 실패한 픽스처의 경과도 분모에 든다 — 그 호출도 판정 층이 쓴 시간이다.
+        judge_latency=_span_aggregate(L2_JUDGE_STAGE, [outcome.elapsed_ms for outcome in outcomes]),
     )
+
+
+# ══ 조건 지문 — 코드가 결정하는 항목 ════════════════════════════════════════
+#
+# **여기 있는 값들은 실행 인자도 설정도 시각도 보지 않는다.** 같은 코드면 언제 어디서
+# 돌려도 같은 값이어야 한다 — 그렇지 않으면 다음 실행이 자기 자신과 "대조 불가"가 되어
+# 지문이 스스로를 무력화한다. 그래서 집합은 반드시 정렬해서 담는다(파이썬 문자열 해시는
+# 프로세스마다 다른 시드를 받아 `frozenset` 순회 순서가 실행마다 달라진다).
+#
+# **범위를 어떻게 갈랐나**: 소스 파일을 통째로 해시하지 않는다 — 주석 한 줄이 계보를
+# 끊는다. 대신 규칙을 이루는 **선언**(패턴 표·허용 목록·enum)과, 선언에 없고 코드에만
+# 있는 규칙의 **동작**(고정 탐침에 대한 산출)을 읽는다. 그래서 문면을 고쳐도 값이
+# 그대로이고, 규칙을 고치면 값이 움직인다.
+
+
+#: **판정 호출이 보내는 사고 과정(thinking) 설정.** 지문의 `judge_effort` 와 **다른 축이다**
+#: — effort 는 "얼마나"이고 이쪽은 "켜는가"다. 지금 판정 래퍼는 thinking 설정을 **보내지
+#: 않는다**: 미전송은 '끔'이 아니라 계열 기본을 따른다는 뜻이고, 그 기본은 계열마다 다르다
+#: (adaptive thinking 이 켜짐인 계열도, 기능이 아예 없는 계열도 있다). 그래서 "기본값"
+#: 한 단어로는 무엇으로 돌았는지 복원되지 않는다.
+#:
+#: 값이 코드 사실과 갈리지 않게 **구조 검사가 판정 요청 조립에 `thinking` 키가 없음을
+#: 못박는다**(`tests/test_condition_fingerprint.py`). 보내기 시작하면 그 검사가 먼저 죽어
+#: 이 값을 고치지 않고 지나갈 수 없다.
+JUDGE_THINKING: Final = "미전송(계열 기본)"
+
+#: 접기 규칙의 **동작**을 드러내는 고정 탐침. 눈으로 구분되지 않는 문자는 이스케이프로
+#: 적는다 — 리터럴로 쓰면 무엇이 들어 있는지 읽을 수 없고, 편집 중에 조용히 ASCII 로
+#: 바뀌어도 아무도 모른다(게이트 모듈이 같은 이유로 같은 규율을 쓴다).
+#:
+#: * U+FF10~U+FF19 — 전각 숫자(NFKC 가 반각으로 접는다)
+#: * U+200B — 폭 없는 서식 문자(`Cf` 범주, 공통 접기가 지운다)
+#: * U+2013 · U+2212 · U+30FB — 구분자 변종(번호 계열만 하이픈으로 접는다)
+#: * U+0301 · U+0903 · U+20E3 — 숫자 **자리 사이**의 결합 표식. 번호 계열만 무시하고,
+#:   **`Mn`·`Mc`·`Me` 세 범주를 각각 한 번씩 태운다.** 한 범주만 넣으면 접기가
+#:   `Mn` 하나로 좁아져도 지문이 움직이지 않아, 계열이 반쯤 뚫린 채 "규칙 무변경"으로
+#:   읽힌다 — 국가번호 두 갈래에서 이미 한 번 겪은 함정과 같은 모양이다
+#: * 뒤쪽 평문 — 정규화(전화·숫자·이메일)가 실제로 무엇을 하는지 드러낸다
+#:
+#: **패턴 다섯이 전부 한 번씩은 매치돼야 한다.** 매치가 없는 패턴은 정규화 결과가 빈
+#: 문자열이라, 그 패턴에 붙은 정규화 함수를 갈아 끼워도 지문이 움직이지 않는다.
+#: **전화 정규화의 한국 국가번호 두 갈래도 각각 한 번씩 탄다**(`+82…` 와 `0082…`) —
+#: 정규화는 입력의 **선두**를 보므로, 한 표기만 넣으면 다른 갈래가 죽은 채로 남는다.
+_PII_RULE_PROBE: Final = (
+    "\uff10\uff11\uff10\u200b-9999\u03018888 "
+    "010-9999\u09038888 010-9999\u20e38888 "
+    "010\u20139999\u22128888 010\u30fb9999\u30fb8888 "
+    "+82-10-1234-5678 0082 2 123 4567 1588-1234 900101-1234567  A_B@Example.COM "
+)
+
+#: 조회 가드 탐침이 쓰는 주문번호. **선검사를 통과한 형식**이어야 한다(아니면 호출 측
+#: 오류로 죽는다). 값 자체는 판정에 쓰이지 않고 범위 한정 문면에만 들어간다.
+_SQL_GUARD_PROBE_ORDER_NO: Final = "ORD-20260201-0001"
+
+#: 조회 가드의 **유래 승인 규칙**을 가르는 고정 탐침. 이 규칙은 허용 목록이 아니라 코드에
+#: 있어서(스코프를 타고 내려가는 증명) 선언만 읽으면 지문이 안 움직인다.
+#:
+#: 승인 쪽 넷(직접 컬럼 · 임시 테이블 경유 · 파생 테이블 경유 · 개인정보 모양이 아닌 빈칸
+#: 채우기)과 불승인 쪽 넷(개인정보 모양 고정값 · `nullif` 의 비교 상대 자리 · 이어 붙이기 ·
+#: 계산 컬럼), 그리고 거부 쪽 셋(목록 밖 캐스트 대상 타입 · 목록 밖 함수 · 주문 범위 미한정)을
+#: 함께 든다. **양쪽을 다 담아야** 규칙이 어느 방향으로 움직여도 값이 따라간다.
+_SQL_GUARD_PROBES: Final[tuple[str, ...]] = (
+    f"SELECT customer_phone FROM orders WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
+    "WITH scoped AS ("
+    f"SELECT order_no, customer_phone FROM orders WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'"
+    ") SELECT customer_phone FROM scoped",
+    "SELECT d.customer_phone FROM ("
+    f"SELECT order_no, customer_phone FROM orders WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'"
+    ") d",
+    "SELECT coalesce(customer_phone, '미정') AS phone FROM orders "
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
+    "SELECT coalesce(customer_phone, '010-0000-0000') AS phone FROM orders "
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
+    "SELECT nullif('010-1234-5678', customer_phone) AS phone FROM orders "
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
+    "SELECT concat(customer_name, customer_phone) AS joined FROM orders "
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
+    "SELECT upper(customer_email) AS shouted FROM orders "
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
+    "SELECT cast(quantity AS text) AS qty FROM orders "
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
+    "SELECT cast('orders' AS regclass) AS catalog FROM orders "
+    f"WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
+    f"SELECT pg_sleep(1) AS napped FROM orders WHERE order_no = '{_SQL_GUARD_PROBE_ORDER_NO}'",
+    "SELECT customer_phone FROM orders",
+)
+
+#: 조회 가드 탐침의 결과 행 수 상한. 판정에 영향을 주지 않는 고정값이다.
+_SQL_GUARD_PROBE_MAX_ROWS: Final = 50
+
+#: 기권 게이트의 **미정의 경계**를 가르는 고정 점수열. 처분만 담으면 "측정 2건 미만" ·
+#: "1위 코사인 0 이하" 두 경계가 움직여도 지문이 그대로다.
+_ABSTENTION_PROBES: Final[tuple[tuple[float, ...], ...]] = (
+    (),
+    (0.9,),
+    (0.0, 0.0),
+    (-0.2, 0.4),
+    (0.0, 0.5),
+    (0.9, 0.3),
+    (0.9, 0.9),
+)
+
+#: 검색 정렬의 tie-break 를 드러내는 고정 동점 후보. **정본 순서와 반대로 넣는다** —
+#: 입력 순서대로 나오는 구현과 정렬하는 구현이 같은 답을 내면 탐침이 아무것도 못 가른다.
+_RETRIEVAL_TIE_PROBE: Final[tuple[str, ...]] = ("b", "a", "c")
+
+#: 정책 검색 SQL 의 정렬 절을 뽑는 패턴. **파일 전체가 아니라 이 절 하나만** 읽는다 —
+#: 함수 안 주석이 바뀌었다고 계보가 끊기면 안 된다.
+_ORDER_BY_PATTERN: Final = re.compile(r"ORDER BY\s+(.*)", re.DOTALL)
+
+#: `ORDER BY` 뒤에서 절을 끝내는 표기. 여기까지만 정렬 키로 읽는다.
+_ORDER_BY_TERMINATORS: Final[tuple[str, ...]] = ("LIMIT", "OFFSET", "FETCH")
+
+
+def order_by_clause(source: str) -> str:
+    """SQL 문면에서 `ORDER BY` 절만 뽑아 공백을 접는다. 없으면 `"정렬 없음"`.
+
+    **없을 때 옛 값을 남기지 않는다** — 정렬 절이 사라진 것은 조용한 무변경이 아니라
+    행동 계약이 바뀐 것이고, 지문은 그것을 값으로 드러내야 한다.
+    """
+    match = _ORDER_BY_PATTERN.search(source)
+    if match is None:
+        return "정렬 없음"
+    clause = match.group(1)
+    for terminator in _ORDER_BY_TERMINATORS:
+        clause = clause.partition(terminator)[0]
+    return " ".join(clause.split())
+
+
+def _policy_search_sql() -> str:
+    """정책 검색 함수가 **실제로 실행하는** SQL 문면.
+
+    소스를 문자열로 훑지 않고 AST 로 본다 — 주석은 애초에 없고 docstring 은 제외할 수 있다.
+    설명 문장에 `ORDER BY` 가 스치기만 해도 지문이 흔들리면, 문서를 고친 것이 계보를 끊는다.
+    """
+    module = ast.parse(textwrap.dedent(inspect.getsource(policy_index.search_policy_chunks)))
+    function = module.body[0]
+    if not isinstance(function, ast.FunctionDef):  # pragma: no cover - 방어
+        return ""
+    body = function.body[1:] if ast.get_docstring(function) is not None else function.body
+    return "\n".join(
+        node.value
+        for statement in body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    )
+
+
+def sql_guard_probe_outcomes() -> tuple[str, ...]:
+    """조회 가드 탐침의 판정 결과. `ok|<PII 허용 출력명>` 또는 `reject|<규칙 코드>`.
+
+    **거부 사유 문면은 담지 않는다** — 안내 문구를 다듬었다고 계보가 끊기면 안 된다.
+    담는 것은 규칙 코드와 허용 출처 목록, 즉 **판정 자체**다.
+    """
+    outcomes: list[str] = []
+    for probe in _SQL_GUARD_PROBES:
+        try:
+            validated = sql_guard.validate_sql(
+                probe,
+                order_no=_SQL_GUARD_PROBE_ORDER_NO,
+                max_rows=_SQL_GUARD_PROBE_MAX_ROWS,
+            )
+        except SqlGuardRejection as rejection:
+            outcomes.append(f"reject|{rejection.rule.value}")
+        else:
+            outcomes.append("ok|" + ",".join(validated.pii_safe_output_columns))
+    return tuple(outcomes)
+
+
+def _normalized_probe_matches(pattern: PiiPattern) -> str:
+    """탐침에서 이 패턴이 뽑은 값들을 **매치별로** 정규화한 결과.
+
+    **정규화는 실행 경로와 같은 자리에서 부른다** — L1 은 `pattern.regex.findall(fold(text))`
+    가 뽑은 매치 하나하나에 정규화를 건다(`gate._normalized_matches`). 지문이 탐침 문자열
+    **전체**에 정규화를 걸면 그 자리와 입력이 달라져, **입력의 선두를 보는 분기가 한 번도
+    실행되지 않는다**: 전화 정규화의 한국 국가번호 두 갈래(`0082`·`82`)가 정확히 그랬다.
+    두 갈래를 통째로 지워도 지문이 움직이지 않았고, 그 삭제는 근거의 `+82-10-1234-5678` 과
+    초안의 `010-1234-5678` 을 다른 값으로 만들어 **정상 에코를 오기각시키는** 실제 동작
+    변경이다.
+
+    `findall` 을 쓰는 것도 같은 이유다 — 정규식에 캡처 그룹이 생기면 뽑히는 값이 달라지고
+    실행 경로도 함께 달라진다. 지문이 그 변화를 따라가려면 같은 함수를 써야 한다.
+    """
+    return ",".join(
+        str(pattern.normalize(match))
+        for match in pattern.regex.findall(pattern.fold(_PII_RULE_PROBE))
+    )
+
+
+def _draft_rule_version() -> str:
+    """초안 판정 규칙의 판 — **접기 규칙과 패턴 집합**의 내용 지문.
+
+    읽는 것은 넷이다: 기각 사유의 고정 순서 · 번호 계열이 구분자로 받는 표기 변종 집합 ·
+    두 접기(공통·번호)가 고정 탐침에 대해 내는 결과 · 패턴마다의 (이름, 정규식, 플래그,
+    접기 결과, **매치별** 정규화 결과). 접기와 정규화는 **이름이 아니라 동작**으로 담는다 —
+    함수 이름만 담으면 본문이 바뀌어도 지문이 안 움직인다.
+    """
+    parts = [
+        "reasons=" + ",".join(reason.value for reason in REASON_ORDER),
+        "separators=" + ",".join(f"U+{ord(ch):04X}" for ch in sorted(NUMERIC_SEPARATOR_VARIANTS)),
+        "fold_common=" + fold_for_detection(_PII_RULE_PROBE),
+        "fold_numeric=" + fold_numeric_for_detection(_PII_RULE_PROBE),
+    ]
+    parts.extend(
+        f"pattern={pattern.name}|regex={pattern.regex.pattern}|flags={pattern.regex.flags}"
+        f"|fold={pattern.fold(_PII_RULE_PROBE)}"
+        f"|normalize={_normalized_probe_matches(pattern)}"
+        for pattern in DEFAULT_PII_PATTERNS
+    )
+    return text_digest("\n".join(parts), prefix="draftrules-")
+
+
+def _sql_guard_version() -> str:
+    """조회 가드의 판 — **허용 함수 · 허용 캐스트 타입 · PII 유래 승인 규칙**의 내용 지문.
+
+    앞의 둘은 생성 안내가 그대로 싣는 목록 문면(`describe_allowed_functions()`)에서 읽고,
+    셋째는 코드에만 있어서 고정 탐침의 판정 결과로 읽는다.
+    """
+    parts = [sql_guard.describe_allowed_functions(), *sql_guard_probe_outcomes()]
+    return text_digest("\n".join(parts), prefix="sqlguard-")
+
+
+def _abstention_undefined_policy() -> str:
+    """기권 게이트의 **미정의 처리 방식** 지문 — 사유별 처분과 그 경계.
+
+    두 사유는 처분이 반대라 하나로 접지 않는다(2건 미만은 열어 두고, 1위 코사인 0 이하는
+    기권). **경계까지 담는 이유**: 처분만 담으면 `<= 0` 을 `< 0` 으로 바꾸는 변경이 지문에
+    아무 흔적을 남기지 않는다.
+    """
+    parts = [
+        f"{reason.value}={'기권' if reason.abstains else '비기권'}"
+        for reason in retrieval_strategies.AbstentionUndefined
+    ]
+    for scores in _ABSTENTION_PROBES:
+        reason = retrieval_strategies.undefined_statistic_reason(scores)
+        rendered = "정의됨" if reason is None else reason.value
+        parts.append(f"probe({','.join(f'{score:g}' for score in scores)})={rendered}")
+    return text_digest("\n".join(parts), prefix="abstain-")
+
+
+def _retrieval_order_rule() -> str:
+    """검색 순서 규칙 — **tie-break 유무**를 두 자리에서 함께 읽는다.
+
+    DB 가 상위 `top_k` 를 자를 때의 정렬(`policy_index.search_policy_chunks`)과, 원문·재작성
+    합집합을 접는 파이썬 병합(`retrieval_strategies.merge_rewritten_rankings`)이다. **두
+    자리가 갈리면 재작성 켜짐/꺼짐이 다른 순서를 낸다** — 그래서 한 칸에 함께 싣는다.
+    병합 쪽은 동점 후보를 정본 순서와 반대로 넣어 결과 순서를 그대로 적는다.
+    """
+    db_clause = order_by_clause(_policy_search_sql())
+    merged = retrieval_strategies.merge_rewritten_rankings(
+        original=[
+            retrieval_strategies.VectorHit(rank=rank, evidence_id=evidence_id, similarity=0.5)
+            for rank, evidence_id in enumerate(_RETRIEVAL_TIE_PROBE, start=1)
+        ],
+        rewritten=(),
+    )
+    return f"db=[{db_clause}] · merge=[{'>'.join(hit.evidence_id for hit in merged)}]"
+
+
+def code_condition_fingerprint() -> dict[str, str]:
+    """**코드가 결정하는** 조건 지문 항목. 실행 인자·설정·시각을 보지 않는다.
+
+    실행 인자에 묶인 항목(골든셋·판정 픽스처·L1 채점표의 판 등)은 진입점이 명시 지문으로
+    싣고, 명시가 이긴다 — 여기 값과 이름이 겹치면 진입점 쪽이 남는다.
+    """
+    return {
+        "judge_thinking": JUDGE_THINKING,
+        "draft_rule_version": _draft_rule_version(),
+        "sql_guard_version": _sql_guard_version(),
+        "retrieval_order": _retrieval_order_rule(),
+        "abstention_undefined_policy": _abstention_undefined_policy(),
+    }
 
 
 # ══ 실행 조건 · 리포트 ══════════════════════════════════════════════════════
@@ -1370,9 +1841,28 @@ class RunConditions:
     #: 이번 실행이 "의도적으로 바꾼 축"으로 **선언한** 지문 항목. 선언된 차이는 대조를
     #: 진행하며 차이 목록을 병기하고, 선언되지 않은 불일치만 "대조 불가"다.
     declared_experiment_fields: tuple[str, ...] = ()
+    #: **도중에 중단된 측정의 이름들.** 중단 표시가 사람이 읽는 설명 문자열에만 붙으면
+    #: 기계가 읽는 조건은 완주한 실행과 **같아진다** — 그러면 절반만 돈 실행의 케이스
+    #: 결과가 완주한 실측과 한 세트로 묶인다. 선검사에 걸려 **처음부터 안 돈** 측정은
+    #: 여기 들지 않는다(그건 `measurement_scope` 가 든다).
+    aborted_measurements: tuple[str, ...] = ()
+
+    @property
+    def run_completion(self) -> str:
+        """완주했는가 — 지문의 `run_completion` 항목이 되는 문면."""
+        if not self.aborted_measurements:
+            return "중단 없음"
+        return "중단: " + "·".join(self.aborted_measurements)
 
     def fingerprint(self) -> ConditionFingerprint:
-        """대조 가능성을 결정하는 지문. 파생값은 명시 지문에 덮인다(명시가 이긴다)."""
+        """대조 가능성을 결정하는 지문. 파생값은 명시 지문에 덮인다(명시가 이긴다).
+
+        **코드가 결정하는 항목은 여기서 합친다** — 진입점이 실행 인자로 만드는 명시 지문과
+        같은 맵에 들어가고, 이름이 겹치면 명시가 이긴다. 옛 산출물을 읽을 때는 이 경로를
+        타지 않으므로(`regression_guard.fingerprint_from_conditions` 가 JSON 을 그대로
+        읽는다) **지금 코드의 값이 옛 산출물에 소급해 찍히지 않는다.** 그게 핵심이다:
+        옛 산출물의 새 항목은 "미상"이지 이번 코드의 값이 아니다.
+        """
         return fingerprint_from_conditions(
             {
                 "similarity_threshold": self.similarity_threshold,
@@ -1382,7 +1872,14 @@ class RunConditions:
                 "generation": self.generation,
                 "judge": self.judge,
                 "measurement_scope": self.measurement_scope,
-                "condition_fingerprint": dict(self.condition_fingerprint),
+                "condition_fingerprint": {
+                    **code_condition_fingerprint(),
+                    **dict(self.condition_fingerprint),
+                    # **중단 사실은 마지막에 쓴다 — 명시 지문이 덮을 수 없다.** 다른 항목은
+                    # "명시가 이긴다"가 맞지만 이건 실행이 실제로 어떻게 끝났는가라서,
+                    # 진입점이 같은 키를 내는 순간 중단이 조용히 완주로 덮인다.
+                    "run_completion": self.run_completion,
+                },
                 "declared_experiment_fields": list(self.declared_experiment_fields),
             }
         )
@@ -1830,6 +2327,61 @@ def _count(value: int | None) -> str:
     return "미실행" if value is None else f"{value}건"
 
 
+def _ms(value: float | None) -> str:
+    """구간 시간 한 칸 — **미측정은 0 이 아니라 "미측정"** 이라고 적는다.
+
+    사람이 읽는 줄과 리포트 JSON 이 **같은 값을 적어야 한다**는 것이 계약이다
+    (커밋된 리포트에서 두 표면이 갈린 전례가 있다). 두 표면이 같은 원본에서 나오고,
+    이 함수가 그 원본을 문자열로 옮기는 유일한 자리다.
+    """
+    return "미측정" if value is None else f"{value:.1f}"
+
+
+def _render_stage_durations(
+    aggregates: Sequence[SpanAggregate], conditions: RunConditions
+) -> list[str]:
+    """단계별 지연 표 — **미측정 케이스는 각 구간의 분모에서 빠진다.**
+
+    구간 아홉을 밖으로 나가는 호출 여섯(의도 분류·질의 재작성·질의 임베딩·조회문 생성·
+    초안 생성·L2 판정)과 코드만 도는 셋(벡터 검색·조회 실행·게이트 판정)으로 가른 것은
+    "어느 단계가 몇 초인지"를 그 경계로 말할 수 있게 하기 위해서다.
+    """
+    lines = [
+        "### 단계별 지연 (구간 아홉)",
+        "",
+        "밖으로 나가는 호출 여섯(의도 분류 · 질의 재작성 · 질의 임베딩 · 조회문 생성 ·",
+        "초안 생성 · L2 판정)과 코드만 도는 셋(벡터 검색 · 조회 실행 · 게이트 판정)이다.",
+        "한 구간의 시간은 그 구간의 **총 벽시계**이고 재시도·형식 실패·예외로 죽은 호출을",
+        "포함한다. **미측정은 0 이 아니다** — 돌지 않은 구간은 분모에서 빠진다(0 을 섞어",
+        "평균 내면 그 구간이 실제보다 빨라 보인다). 재생성이 돈 문의는 초안·게이트·판정",
+        "구간이 시도별로 쌓이고, 시도별 값은 리포트 JSON 의 `attempt_durations` 에 있다.",
+        "",
+    ]
+    if not conditions.measurement2_is_real:
+        lines.extend(
+            [
+                "> **대역 실행에서는 밖으로 나가는 호출 여섯이 0 에 수렴한다** — 대역은",
+                "> 프로세스 밖으로 나가지 않으므로 그 구간이 실제로 0 인 것이지 재지 않은",
+                "> 것이 아니다(미측정은 `미측정` 으로 적힌다). 코드만 도는 셋(벡터 검색 ·",
+                "> 조회 실행 · 게이트 판정)은 대역 실행에서도 실제 값이다.",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "| 구간 | 측정 케이스 | 미측정 | 합계 ms | 평균 ms | p50 ms | p95 ms |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    lines.extend(
+        f"| `{item.span}` | {item.measured_cases} | {item.unmeasured_cases} | "
+        f"{_ms(item.total_ms)} | {_ms(item.mean_ms)} | {_ms(item.p50_ms)} | {_ms(item.p95_ms)} |"
+        for item in aggregates
+    )
+    lines.append("")
+    return lines
+
+
 _LIMITS: Final = """\
 ## 한계 (과장하지 않는다)
 
@@ -2058,6 +2610,7 @@ def _render_measurement_two(
                 if pipeline.retrieval_fallback_total
                 else " (전건 재작성 성공 — 검색 구성이 실행 조건 그대로 돌았다)"
             ),
+            *_abstention_undefined_lines(pipeline),
             "",
             "### 문의 1건당 토큰 (생성·임베딩·판정·검색 구분)",
             "",
@@ -2069,6 +2622,9 @@ def _render_measurement_two(
             "| --- | ---: | ---: |",
             *_token_rows(pipeline, conditions),
             "",
+            *_generation_cache_token_lines(pipeline),
+            "",
+            *_render_stage_durations(pipeline.stage_durations, conditions),
             "### 종결 분포",
             "",
             f"- 최종 상태: {_counts(pipeline.status_counts)}",
@@ -2096,6 +2652,27 @@ def _render_measurement_two(
         lines.append("모든 문의가 허용 결과 집합 안에서 종결했다.")
     lines.append("")
     return lines
+
+
+def _abstention_undefined_lines(pipeline: PipelineAgreement) -> list[str]:
+    """기권 게이트 통계량이 미정의였던 분기 — **사유마다 처분이 다르므로 갈라 적는다.**
+
+    사유가 한 건도 없었으면 그 사실을 적는다. 줄 자체를 빼면 "재지 않았다"와 "없었다"가
+    산출물에서 같아진다(미실행을 0 으로 채우지 않는다는 규칙의 같은 자리다).
+    """
+    counts = pipeline.abstention_undefined_counts
+    if not counts:
+        return [
+            "- 기권 게이트 통계량 미정의: 0건 (전건에서 통계량이 정의됐거나 게이트가 돌지 않았다)"
+        ]
+    rendered = " · ".join(
+        f"`{reason}` {hits}건({'기권' if AbstentionUndefined(reason).abstains else '비기권'})"
+        for reason, hits in counts.items()
+    )
+    return [
+        f"- 기권 게이트 통계량 미정의: {rendered}"
+        " — **사유마다 처분이 다르다.** 처분만 보면 두 분기가 구분되지 않는다."
+    ]
 
 
 def _token_rows(pipeline: PipelineAgreement, conditions: RunConditions) -> list[str]:
@@ -2232,6 +2809,53 @@ def _render_failure_attribution(
     return lines
 
 
+def _generation_cache_token_lines(pipeline: PipelineAgreement) -> list[str]:
+    """생성·검색 계열의 프롬프트 캐시 — **계열마다 한 줄, 입력 칸과 분리해서** 적는다.
+
+    두 계열은 같은 클라이언트를 지나므로 한 줄로 합치면 어느 계열의 캐시였는지 되짚을 수
+    없다. 그리고 이 줄이 없으면 달러 환산이 전부 정가를 곱해, 리포트의 비용이 **실제
+    청구액이 아니라 그 이상일 수 없는 값**(상한)이 된다.
+
+    **위 표의 '생성 입력'·'검색 입력'에서 이 값을 빼지 않았다.** OpenAI 응답에서 캐시
+    적중분은 입력 토큰 **안에** 들어 있다(Anthropic 판정 계열은 반대로 제외돼 있다).
+    빼면 옛 산출물과 정의가 갈리고, 합산에 더하면 같은 토큰을 두 번 센다.
+
+    **재지 않은 계열은 0 이 아니라 "미측정"** 이다(`scripts/AGENTS.md` 불변식 5).
+    """
+
+    def line(label: str, measured: bool, creation: int | None, read: int | None) -> str:
+        if not measured:
+            return (
+                f"- {label} 계열 프롬프트 캐시: **미측정** "
+                "(캐시 계열 토큰을 보고하지 않은 실행 — 0 이 아니다)"
+            )
+        return (
+            f"- {label} 계열 프롬프트 캐시({label} 입력 토큰과 별도 칸): "
+            f"write {_int_or_unmeasured(creation)} / read {_int_or_unmeasured(read)} "
+            f"— 위 '{label} 입력'은 **캐시 적중분을 포함한 총 입력**이다(빼지도 더하지도 않는다)"
+        )
+
+    return [
+        line(
+            "생성",
+            pipeline.generation_cache_measured,
+            pipeline.generation_cache_creation_total,
+            pipeline.generation_cache_read_total,
+        ),
+        line(
+            "검색",
+            pipeline.retrieval_cache_measured,
+            pipeline.retrieval_cache_creation_total,
+            pipeline.retrieval_cache_read_total,
+        ),
+    ]
+
+
+def _int_or_unmeasured(value: int | None) -> str:
+    """한쪽 칸만 보고된 계열의 나머지 칸 — 0 으로 채우지 않는다."""
+    return "미측정" if value is None else str(value)
+
+
 def _grand_total(pipeline: PipelineAgreement) -> int:
     """네 계열 합산 — 한 계열이 빠지면 건당 비용이 실제보다 작아진다."""
     return (
@@ -2243,6 +2867,23 @@ def _grand_total(pipeline: PipelineAgreement) -> int:
         + pipeline.retrieval_input_tokens_total
         + pipeline.retrieval_output_tokens_total
     )
+
+
+def _judge_latency_lines(accuracy: JudgeAccuracy) -> list[str]:
+    """판정 호출 지연 — 픽스처 측정도 이제 지연을 기록한다.
+
+    **판정하지 못한 픽스처의 경과도 분모에 든다**(그 호출도 판정 층이 쓴 시간이다).
+    한 건도 재지 않은 실행은 0 이 아니라 "미측정"이다.
+    """
+    latency = accuracy.judge_latency
+    if latency is None or latency.measured_cases == 0:
+        return ["- 판정 호출 지연: **미측정** (경과를 기록하지 않은 실행 — 0 이 아니다)"]
+    return [
+        f"- 판정 호출 지연: 평균 {_ms(latency.mean_ms)} ms / "
+        f"p50 {_ms(latency.p50_ms)} ms / p95 {_ms(latency.p95_ms)} ms "
+        f"(측정 {latency.measured_cases}건 / 미측정 {latency.unmeasured_cases}건 — "
+        "재시도와 판정 실패 호출을 포함한 총 벽시계다)"
+    ]
 
 
 def _cache_token_lines(accuracy: JudgeAccuracy) -> list[str]:
@@ -2334,6 +2975,7 @@ def _render_measurement_three(
             f"- 판정 토큰: 입력 {accuracy.input_tokens_total} / "
             f"출력 {accuracy.output_tokens_total} "
             f"(픽스처당 {_num(accuracy.tokens_per_fixture)})",
+            *_judge_latency_lines(accuracy),
             *_cache_token_lines(accuracy),
             "",
             "### 사유 2종별 내역",
@@ -2519,6 +3161,19 @@ def _failure_attribution_json(
     }
 
 
+def _span_aggregate_json(item: SpanAggregate) -> dict[str, Any]:
+    """구간 집계 한 줄. **미측정은 0 이 아니라 `null`** 이고 분모는 측정 케이스 수다."""
+    return {
+        "span": item.span,
+        "measured_cases": item.measured_cases,
+        "unmeasured_cases": item.unmeasured_cases,
+        "total_ms": item.total_ms,
+        "mean_ms": item.mean_ms,
+        "p50_ms": item.p50_ms,
+        "p95_ms": item.p95_ms,
+    }
+
+
 def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> dict[str, Any]:
     if isinstance(pipeline, SkippedMeasurement):
         return {"executed": False, "skip_reason": pipeline.reason}
@@ -2540,6 +3195,14 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
         "latency_p95_ms": pipeline.latency_p95_ms,
         #: 검색 단계가 폴백한 문의 수. 인계가 아니라 "재작성 없이 원문으로 돌았다"이다.
         "retrieval_fallback_total": pipeline.retrieval_fallback_total,
+        #: 기권 게이트 통계량이 미정의였던 문의 수 — **사유별**이다. 두 사유의 처분이
+        #: 반대라 한 칸으로 접으면 어느 분기였는지 되짚을 수 없다. 사유가 한 번도 없었으면
+        #: 빈 맵이고, 없는 사유를 0 으로 채우지 않는다.
+        "abstention_undefined_counts": dict(pipeline.abstention_undefined_counts),
+        #: 구간 아홉의 세트 집계. **미측정 케이스는 그 구간의 분모에서 빠지고**,
+        #: 한 건도 재지 않은 구간의 값은 0 이 아니라 `null` 이다. 사람이 읽는 줄
+        #: ("단계별 지연" 표)과 **같은 값**이며 같은 원본에서 나온다.
+        "stage_durations": [_span_aggregate_json(item) for item in pipeline.stage_durations],
         "tokens": {
             "generation_input_total": pipeline.input_tokens_total,
             "generation_output_total": pipeline.output_tokens_total,
@@ -2548,6 +3211,13 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
             "judge_output_total": pipeline.judge_output_tokens_total,
             "retrieval_input_total": pipeline.retrieval_input_tokens_total,
             "retrieval_output_total": pipeline.retrieval_output_tokens_total,
+            #: 캐시 계열은 **계열마다 한 쌍**이고 입력 칸과 분리 표기한다. 위 두 입력 칸은
+            #: 캐시 적중분을 **포함한** 총 입력이므로(OpenAI 는 적중분이 입력 토큰 안에 있다)
+            #: 이 값을 합산에 다시 더하지 않는다. 재지 않은 실행은 0 이 아니라 `null` 이다.
+            "generation_cache_creation_total": pipeline.generation_cache_creation_total,
+            "generation_cache_read_total": pipeline.generation_cache_read_total,
+            "retrieval_cache_creation_total": pipeline.retrieval_cache_creation_total,
+            "retrieval_cache_read_total": pipeline.retrieval_cache_read_total,
             "generation_per_inquiry": pipeline.generation_tokens_per_inquiry,
             "embedding_per_inquiry": pipeline.embedding_tokens_per_inquiry,
             "judge_per_inquiry": pipeline.judge_tokens_per_inquiry,
@@ -2579,9 +3249,28 @@ def _measurement_two_json(pipeline: PipelineAgreement | SkippedMeasurement) -> d
                 "judge_output_tokens": outcome.judge_output_tokens,
                 "retrieval_input_tokens": outcome.retrieval_input_tokens,
                 "retrieval_output_tokens": outcome.retrieval_output_tokens,
+                #: 케이스별 캐시 칸도 계열별이다. 미측정은 0 이 아니라 `null` 이다.
+                "generation_cache_creation_tokens": outcome.generation_cache_creation_tokens,
+                "generation_cache_read_tokens": outcome.generation_cache_read_tokens,
+                "retrieval_cache_creation_tokens": outcome.retrieval_cache_creation_tokens,
+                "retrieval_cache_read_tokens": outcome.retrieval_cache_read_tokens,
                 "retrieval_fallback_reason": outcome.retrieval_fallback_reason,
+                #: 기권 게이트 통계량이 미정의였던 사유. `null` 은 게이트 꺼짐 · 정책 검색
+                #: 미실행 · 통계량 정의됨 셋을 함께 덮는다(처분이 아니라 **사유**다).
+                "abstention_undefined_reason": outcome.abstention_undefined_reason,
                 # 정책 검색이 돌았는지를 산출물에서 바로 읽게 한다 — 역추론 금지.
                 "intent": outcome.intent,
+                #: 케이스별 구간 시간(ms). 키는 아홉이 항상 있고 미측정은 `null` 이다.
+                "stage_durations": outcome.stage_durations.as_mapping(),
+                #: 시도별 구간. 재생성이 돌면 2건이고, 합계는 위 `stage_durations` 다.
+                "attempt_durations": [
+                    {
+                        "draft_ms": item.draft_ms,
+                        "gate_ms": item.gate_ms,
+                        "l2_judge_ms": item.l2_judge_ms,
+                    }
+                    for item in outcome.attempt_durations
+                ],
                 "matched": outcome.matched,
                 "mismatches": list(outcome.mismatches),
                 "error": outcome.error,
@@ -2635,6 +3324,11 @@ def _measurement_three_json(
             "cache_creation_total": accuracy.cache_creation_tokens_total,
             "cache_read_total": accuracy.cache_read_tokens_total,
         },
+        #: 판정 호출 지연의 세트 집계 — 사람이 읽는 줄과 같은 원본이다. 판정에 실패한
+        #: 픽스처의 경과도 분모에 들고, 한 건도 재지 않았으면 `measured_cases` 가 0 이다.
+        "judge_latency": (
+            None if accuracy.judge_latency is None else _span_aggregate_json(accuracy.judge_latency)
+        ),
         "reason_breakdown": [
             {
                 "reason": item.reason.value,
@@ -2664,6 +3358,8 @@ def _measurement_three_json(
                 "output_tokens": outcome.output_tokens,
                 "cache_creation_input_tokens": outcome.cache_creation_input_tokens,
                 "cache_read_input_tokens": outcome.cache_read_input_tokens,
+                #: 판정 호출에 흐른 벽시계(ms). 판정하지 못한 픽스처도 시간은 썼다.
+                "elapsed_ms": outcome.elapsed_ms,
                 "matched": outcome.reasons_matched,
                 "error": outcome.error,
             }
@@ -2881,3 +3577,12 @@ class _StubCompletion:
     input_tokens: int
     output_tokens: int
     transport_attempts: int = 1
+    #: 대역은 **밖으로 나가지 않으므로 이 값이 0.0 이다** — "재지 않았다"가 아니라
+    #: "밖으로 나간 시간이 0"이라는 측정값이다. 여기서 실제 시계를 재면 대역 산출이
+    #: 비결정론이 되어 `--stub-llm` 실행이 재현되지 않는다(대역 결정론은 이 저장소의
+    #: 계약이고 `tests/test_testing_doubles.py` 가 지킨다).
+    elapsed_ms: float = 0.0
+    #: 대역은 캐시를 재지 않는다 — 0 이 아니라 **미측정**이다. 모양을 맞추지 않으면 캐시
+    #: 칸을 읽는 자리에서 대역만 터진다(경과 칸이 이미 겪은 사고다).
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None

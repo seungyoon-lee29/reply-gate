@@ -60,7 +60,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from psycopg.rows import DictRow
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, SecretStr, model_validator
 
 from reply_gate.config import Settings, get_settings
 from reply_gate.contracts import GateResult, JudgeResult
@@ -352,21 +352,28 @@ class InquiryService:
 
     문의 ID 는 **근거 수집 전에** 확정한다: SQL 근거 ID 가 그 값을 품고, DB CHECK 가
     둘의 일치를 강제하기 때문이다.
+
+    **파이프라인은 `process()` 가 처음 부를 때 조립한다.** 조회(`fetch`)는 파이프라인을
+    한 번도 쓰지 않는데, 조립을 앞당기면 **접수와 무관한 설정 조합 오류가 조회 라우트를
+    죽인다** — 이 모듈이 커넥션과 LLM 클라이언트에 이미 적용한 것과 같은 교훈이고
+    (`get_service` · `_LazyGenerationClient`), τ 미검증 임베딩 조건에서 실제로
+    `GET /inquiries/{id}` 가 500 이 됐다. 조립 시점 거부라는 성질은 그대로다 —
+    접수 경로는 여전히 **데이터가 흐르기 전에** 죽는다.
     """
 
     def __init__(
         self,
         *,
-        pipeline: InquiryPipeline,
+        open_pipeline: Callable[[], InquiryPipeline],
         app_conn: psycopg.Connection[DictRow],
         readonly_conn: psycopg.Connection[DictRow],
     ) -> None:
-        self._pipeline = pipeline
+        self._open_pipeline = open_pipeline
         self._app_conn = app_conn
         self._readonly_conn = readonly_conn
 
     def process(self, *, content: str, order_no: str | None) -> ProcessedInquiry:
-        processed = self._pipeline.run(
+        processed = self._open_pipeline().run(
             inquiry_id=new_inquiry_id(),
             content=content,
             order_no=order_no,
@@ -385,7 +392,9 @@ class InquiryService:
 type ServiceOpener = Callable[[], AbstractContextManager[InquiryService]]
 
 
-def _require_api_key(settings: Settings) -> str:
+def _require_api_key(settings: Settings) -> SecretStr:
+    """자격 증명은 **비밀 전용 타입 그대로** 넘긴다 — 평문으로 꺼내는 자리는
+    호출 래퍼의 SDK 인자 한 줄뿐이다(`docs/security.md` "비밀 관리")."""
     if not settings.openai_api_key:
         raise MissingCredentialsError(
             "OPENAI_API_KEY 가 설정되지 않았다. `.env` 또는 환경 변수에 키를 넣고 다시 실행한다."
@@ -467,17 +476,20 @@ def get_service() -> ServiceOpener:
     LLM 목과 트랜잭션 커넥션을 주입하는 지점이다.
     """
     settings = get_settings()
-    pipeline = build_pipeline(
-        generation_client=build_generation_client(settings),
-        embedding_client=build_embedding_client(settings),
-        settings=settings,
-    )
+
+    def _pipeline() -> InquiryPipeline:
+        """**접수 경로가 실제로 부를 때** 조립한다 — 조회 라우트까지 끌고 가지 않는다."""
+        return build_pipeline(
+            generation_client=build_generation_client(settings),
+            embedding_client=build_embedding_client(settings),
+            settings=settings,
+        )
 
     @contextmanager
     def _open() -> Iterator[InquiryService]:
         """요청마다 커넥션 2개를 열고 닫는다 (text-to-SQL 은 반드시 read-only 계정으로)."""
         with connect(settings=settings) as app_conn, readonly_connect(settings=settings) as ro:
-            yield InquiryService(pipeline=pipeline, app_conn=app_conn, readonly_conn=ro)
+            yield InquiryService(open_pipeline=_pipeline, app_conn=app_conn, readonly_conn=ro)
 
     return _open
 

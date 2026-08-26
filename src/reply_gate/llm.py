@@ -7,6 +7,10 @@ docs/standards.md "재시도 상한" 중 **전송 오류 1회 재시도**만 담
 (의도 해석은 1회 재시도, 초안 생성은 재시도 없이 L1 으로 넘김, SQL 생성은 SQL 실패 경로).
 따라서 형식 오류는 `LLMFormatError` 로 올려보내고 호출자가 정책을 적용한다.
 
+**밖으로 나가는 호출의 경과 시간(`elapsed_ms`)을 재서 산출·예외에 함께 싣는다.** 재는 자리는
+전송 재시도 루프의 **바깥**이라 재시도로 날아간 시간이 그 구간에 그대로 든다. 규칙은 토큰과
+같다 — 실행됐으나 실패한 호출의 시간도 그 구간이 쓴 시간이므로 0 으로 접지 않는다.
+
 주의: OpenAI·Anthropic SDK 모두 전송 오류·429·5xx 를 기본 2회 자동 재시도한다. 중첩되면
 docs/standards.md "재시도 상한"의
 "1회 재시도"가 실제로는 최대 6회 전송 시도가 되어 지연·처리 기록이 어긋나므로,
@@ -15,6 +19,12 @@ docs/standards.md "재시도 상한"의
 샘플링 파라미터(temperature 등)는 보내지 않는다 — 결정론을 샘플링 파라미터로 보장하지
 않으며, 모델 계열에 따라 아예 받지 않는 경우도 있다
 (docs/standards.md "샘플링 파라미터를 보내지 않는다").
+
+**API 키는 비밀 전용 타입(`SecretStr`)으로 받는다.** 평문이 되는 자리는 각 래퍼 생성자의
+SDK 호출 인자 **한 줄뿐**이고(`api_key.get_secret_value()`), 그 세 줄이 이 패키지에서
+API 키가 평문이 되는 자리의 전부다. 꺼내는 자리를 눈으로 셀 수 있게 두는 것이 요점이라,
+편의로 `str` 도 받게 넓히지 않는다 — 넓히는 순간 어디서 이미 꺼내졌는지 알 수 없어진다
+(docs/security.md "비밀 관리").
 """
 
 from __future__ import annotations
@@ -23,12 +33,14 @@ import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from importlib import import_module
+from time import perf_counter
 from typing import Any, Protocol, cast
 
 import anthropic
 import openai
 from anthropic.types import Message
 from openai.types.responses import Response
+from pydantic import SecretStr
 
 __all__ = [
     "AnthropicGenerationClient",
@@ -42,6 +54,7 @@ __all__ = [
     "OpenAIEmbeddingClient",
     "OpenAIGenerationClient",
     "OptionalEmbeddingDependencyError",
+    "accumulate_optional_ms",
     "accumulate_optional_tokens",
 ]
 
@@ -52,10 +65,14 @@ MAX_ATTEMPTS = 2
 def _optional_token_count(usage: object, field: str) -> int | None:
     """캐시 계열 토큰 1개 — **없으면 0 이 아니라 `None`(해당 없음/미측정)이다.**
 
-    프롬프트 캐싱을 쓰지 않는 provider(OpenAI 생성 계열)와 캐시 계열 필드를 싣지 않는
-    응답에는 이 값이 아예 없다. 그때 0 으로 접으면 "캐시가 0 토큰 적중했다"(측정했고 0)와
-    "캐시를 잰 적이 없다"(미측정)가 같은 값이 되어, 리포트가 재지도 않은 축을 잰 것처럼
-    적는다 — 미실행·미측정을 0 으로 채우지 않는 규칙과 같은 자리다.
+    캐시 계열 필드를 싣지 않는 응답(내역 묶음이 없거나 그 칸이 비어 있는 응답)에는 이 값이
+    아예 없다. 그때 0 으로 접으면 "캐시가 0 토큰 적중했다"(측정했고 0)와 "캐시를 잰 적이
+    없다"(미측정)가 같은 값이 되어, 리포트가 재지도 않은 축을 잰 것처럼 적는다 —
+    미실행·미측정을 0 으로 채우지 않는 규칙과 같은 자리다.
+
+    `usage` 자리에 `None` 이 와도 그대로 미측정이다 — provider 마다 이 값이 담긴 묶음의
+    위치가 달라(OpenAI 는 `input_tokens_details` 안, Anthropic 은 `usage` 바로 아래) 호출자가
+    한 겹 더 들어간 뒤 부르는 경우가 있다.
     """
     value = getattr(usage, field, None)
     if value is None:
@@ -72,6 +89,23 @@ def accumulate_optional_tokens(total: int | None, value: int | None) -> int | No
     if value is None:
         return total
     return value if total is None else total + value
+
+
+def accumulate_optional_ms(total: float | None, value: float | None) -> float | None:
+    """구간 시간 누적 — 토큰과 **같은 규칙**이다: 미측정(`None`)을 0 으로 접지 않는다.
+
+    돌지 않은 구간(재작성을 쓰지 않은 문의의 재작성 구간, L2 가 돌지 않은 시도의 판정
+    구간)은 "0 밀리초"가 아니라 **미측정**이다. 0 으로 채우면 집계 평균이 그 구간을 실제
+    보다 빠르게 적고, 리포트가 재지도 않은 축을 잰 것처럼 보인다.
+    """
+    if value is None:
+        return total
+    return value if total is None else total + value
+
+
+def _elapsed_ms(started: float) -> float:
+    """시작 시각(`perf_counter`)부터 지금까지의 벽시계 밀리초."""
+    return max((perf_counter() - started) * 1000.0, 0.0)
 
 
 def _pin_transport_policy[C](client: C, *, timeout: float) -> C:
@@ -115,6 +149,12 @@ class LLMCallError(RuntimeError):
     캐시 계열(`cache_creation_input_tokens`/`cache_read_input_tokens`)은 같은 규칙을 따르되
     **기본값이 0 이 아니라 `None`(해당 없음/미측정)** 이다 — 캐싱을 쓰지 않는 경로에서 0 을
     싣으면 재지 않은 축이 측정값으로 신고된다.
+
+    `elapsed_ms` 는 **이 실패까지 실제로 흐른 벽시계**(밀리초)이고 토큰과 같은 자격이다:
+    예외로 죽은 호출도 시간을 썼고, 재시도한 시도의 시간도 그 구간이 쓴 시간이다. 성공한
+    마지막 호출만 재면 래퍼 재시도 1회가 통째로 사라져, 이 저장소가 토큰 축에서 이미 겪은
+    사고(전송 3회를 `attempts=2` 로 신고)를 지연 축에서 반복한다. 형식 루프를 도는 호출자는
+    토큰·전송 수와 **같은 줄에서** 이 값을 누적한다.
     """
 
     def __init__(
@@ -128,6 +168,7 @@ class LLMCallError(RuntimeError):
         output_tokens: int = 0,
         cache_creation_input_tokens: int | None = None,
         cache_read_input_tokens: int | None = None,
+        elapsed_ms: float = 0.0,
     ) -> None:
         super().__init__(f"LLM 호출 실패 (stage={stage}, reason={reason}, attempts={attempts})")
         self.stage = stage
@@ -138,6 +179,7 @@ class LLMCallError(RuntimeError):
         self.output_tokens = output_tokens
         self.cache_creation_input_tokens = cache_creation_input_tokens
         self.cache_read_input_tokens = cache_read_input_tokens
+        self.elapsed_ms = elapsed_ms
 
 
 class LLMFormatError(ValueError):
@@ -150,6 +192,8 @@ class LLMFormatError(ValueError):
     `transport_attempts` 는 이 형식 오류가 나오기까지 **실제로 나간 전송 수**다. 형식 루프를
     도는 호출자(판정·의도 해석)가 토큰과 **같은 이유로** 누적해야 하는 값이다 — 앞선 시도의
     비용을 세면서 그 시도가 있었다는 사실을 세지 않으면 기록과 실제가 갈린다.
+
+    `elapsed_ms` 도 같은 자격이다 — 형식이 어긋나 버려진 산출도 그만큼 시간을 썼다.
     """
 
     def __init__(
@@ -163,6 +207,7 @@ class LLMFormatError(ValueError):
         transport_attempts: int = 1,
         cache_creation_input_tokens: int | None = None,
         cache_read_input_tokens: int | None = None,
+        elapsed_ms: float = 0.0,
     ) -> None:
         super().__init__(f"구조화 출력 형식 불일치 (stage={stage}): {detail}")
         self.stage = stage
@@ -174,6 +219,7 @@ class LLMFormatError(ValueError):
         #: 캐시 계열은 **0 이 아니라 `None`** 이 미측정이다 (`LLMCallError` 와 같은 규칙).
         self.cache_creation_input_tokens = cache_creation_input_tokens
         self.cache_read_input_tokens = cache_read_input_tokens
+        self.elapsed_ms = elapsed_ms
 
 
 @dataclass(frozen=True)
@@ -189,20 +235,29 @@ class JsonCompletion:
     input_tokens: int
     output_tokens: int
     transport_attempts: int = 1
-    #: 캐시에 **쓴** 토큰(약 1.25배 단가). 캐싱을 쓰지 않는 provider·응답에서는 `None`
-    #: (해당 없음)이고 **0 이 아니다** — 재지 않은 축을 0 으로 신고하지 않기 위해서다.
+    #: 이 산출을 얻기까지 흐른 **벽시계 밀리초 — 전송 재시도를 포함한다.** 성공한 마지막
+    #: 호출만 재면 래퍼 재시도 1회가 통째로 사라진다. 대역이 직접 만드는 산출에서는 0.0
+    #: 이고, 그것은 "재지 않았다"가 아니라 **밖으로 나간 시간이 없다**는 뜻이다.
+    elapsed_ms: float = 0.0
+    #: 캐시에 **쓴** 토큰. 캐시 계열을 싣지 않는 응답에서는 `None`(해당 없음/미측정)이고
+    #: **0 이 아니다** — 재지 않은 축을 0 으로 신고하지 않기 위해서다.
     cache_creation_input_tokens: int | None = None
-    #: 캐시에서 **읽은** 토큰(약 0.1배 단가). 켜짐 조건에서 `input_tokens` 는 이 값을
-    #: **제외한** 비캐시 입력이므로, 둘을 뭉뚱그리면 적중이 "입력 토큰 감소"로 위장한다.
+    #: 캐시에서 **읽은** 토큰(적중분). **`input_tokens` 와의 포함 관계는 provider 마다
+    #: 반대다** — Anthropic 은 `input_tokens` 가 이 값을 **제외한** 비캐시 입력이고, OpenAI 는
+    #: 이 값이 `input_tokens` 에 **포함**돼 있다. 어느 쪽이든 둘을 뭉뚱그리면 안 된다:
+    #: 앞은 적중이 "입력 토큰 감소"로 위장하고, 뒤는 같은 토큰을 두 번 세게 된다.
+    #: 단가가 다르므로 칸을 가르고, 곱하는 단가는 계열별로 단가 문서가 정한다.
     cache_read_input_tokens: int | None = None
 
 
 @dataclass(frozen=True)
 class EmbeddingResult:
-    """임베딩 벡터 목록 + 사용 토큰 수."""
+    """임베딩 벡터 목록 + 사용 토큰 수 + 호출에 흐른 벽시계(전송 재시도 포함)."""
 
     vectors: list[list[float]]
     total_tokens: int
+    #: 질의 임베딩 구간의 시간. 부를 것이 없어 즉시 돌아온 호출은 0.0 이다(측정값이다).
+    elapsed_ms: float = 0.0
 
 
 class GenerationClient(Protocol):
@@ -253,30 +308,46 @@ def _call_with_one_retry[T](
     call: Callable[[], T],
     is_transport_error: Callable[[Exception], bool],
     is_api_error: Callable[[Exception], bool],
-) -> tuple[T, int]:
-    """전송 오류면 1회 재시도, 재실패하면 `LLMCallError`. 결과와 **실제 전송 수**를 돌려준다.
+) -> tuple[T, int, float]:
+    """전송 오류면 1회 재시도, 재실패하면 `LLMCallError`.
+
+    결과와 함께 **실제 전송 수**와 **재시도를 포함한 경과 벽시계(ms)** 를 돌려준다.
 
     전송 오류가 아닌 API 오류(4xx 등)는 재시도해도 결과가 같으므로 즉시 실패시킨다.
     두 경우 모두 호출자에게는 `LLMCallError` 로 보여 인계 사유가 `llm_call_failed` 로 통일된다.
 
     전송 수를 **세어서** 돌려주는 이유: 이 값을 상수(`MAX_ATTEMPTS`)로 되읽으면 "몇 번 돌았나"가
     아니라 "몇 번까지 돌 수 있나"를 신고하게 된다. 호출자가 형식 루프를 돌면 그 차이가 누적된다.
+
+    **경과도 같은 이유로 루프 **바깥**에서 잰다.** 성공한 마지막 `call()` 만 재면 재시도로
+    날아간 시간이 통째로 사라져, 토큰 축에서 이미 겪은 사고(전송 3회를 2회로 신고)를 지연
+    축에서 반복한다. 실패로 끝나는 두 경로도 그때까지 흐른 시간을 예외에 실어 올린다.
     """
+    started = perf_counter()
     last: Exception | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            return call(), attempt
+            result = call()
         except Exception as exc:
             if is_transport_error(exc):
                 last = exc
                 continue
             if is_api_error(exc):
                 raise LLMCallError(
-                    stage=stage, reason="api_error", attempts=attempt, cause=exc
+                    stage=stage,
+                    reason="api_error",
+                    attempts=attempt,
+                    cause=exc,
+                    elapsed_ms=_elapsed_ms(started),
                 ) from exc
             raise
+        return result, attempt, _elapsed_ms(started)
     raise LLMCallError(
-        stage=stage, reason="transport_error", attempts=MAX_ATTEMPTS, cause=last
+        stage=stage,
+        reason="transport_error",
+        attempts=MAX_ATTEMPTS,
+        cause=last,
+        elapsed_ms=_elapsed_ms(started),
     ) from last
 
 
@@ -287,13 +358,14 @@ def _parse_json_completion(
     input_tokens: int,
     output_tokens: int,
     transport_attempts: int = 1,
+    elapsed_ms: float = 0.0,
     cache_creation_input_tokens: int | None = None,
     cache_read_input_tokens: int | None = None,
 ) -> JsonCompletion:
     """구조화 출력 원문을 파싱한다 — 빈 응답·비 JSON 은 `LLMFormatError` (양 래퍼 공통).
 
-    성공하든 형식 오류든 **실제 전송 수를 그대로 실어 보낸다** — 형식 루프를 도는 호출자가
-    토큰과 같은 자격으로 누적한다.
+    성공하든 형식 오류든 **실제 전송 수와 경과를 그대로 실어 보낸다** — 형식 루프를 도는
+    호출자가 토큰과 같은 자격으로 누적한다.
     """
     if not text.strip():
         raise LLMFormatError(
@@ -305,6 +377,7 @@ def _parse_json_completion(
             transport_attempts=transport_attempts,
             cache_creation_input_tokens=cache_creation_input_tokens,
             cache_read_input_tokens=cache_read_input_tokens,
+            elapsed_ms=elapsed_ms,
         )
     try:
         data = json.loads(text)
@@ -318,12 +391,14 @@ def _parse_json_completion(
             transport_attempts=transport_attempts,
             cache_creation_input_tokens=cache_creation_input_tokens,
             cache_read_input_tokens=cache_read_input_tokens,
+            elapsed_ms=elapsed_ms,
         ) from exc
     return JsonCompletion(
         data=data,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         transport_attempts=transport_attempts,
+        elapsed_ms=elapsed_ms,
         cache_creation_input_tokens=cache_creation_input_tokens,
         cache_read_input_tokens=cache_read_input_tokens,
     )
@@ -342,6 +417,22 @@ def _is_openai_api_error(exc: Exception) -> bool:
     return isinstance(exc, openai.APIError)
 
 
+def _openai_cache_tokens(usage: object) -> tuple[int | None, int | None]:
+    """OpenAI 응답의 (캐시 write, 캐시 read) — **없으면 0 이 아니라 `None`(미측정)** 이다.
+
+    두 값은 `usage.input_tokens_details` 안에 있고 그 묶음은 **입력 토큰의 내역**이다.
+    즉 여기서 읽는 값은 `input_tokens` 에 **이미 포함**돼 있다 — Anthropic 이 캐시 적중분을
+    `input_tokens` 에서 **제외**하는 것과 포함 관계가 반대다. 그래서 이 값을 입력 칸에서
+    빼거나 더하지 않는다: 빼면 옛 산출물과 정의가 갈리고, 더하면 같은 토큰을 두 번 센다.
+    별도 칸으로만 싣고, 어느 쪽 단가를 곱할지는 단가 문서가 계열별로 정한다.
+    """
+    details = getattr(usage, "input_tokens_details", None)
+    return (
+        _optional_token_count(details, "cache_write_tokens"),
+        _optional_token_count(details, "cached_tokens"),
+    )
+
+
 def _refusal_text(response: Response) -> str | None:
     """안전 분류기 거절이면 그 사유를, 아니면 None."""
     for item in getattr(response, "output", []) or []:
@@ -358,7 +449,7 @@ class OpenAIGenerationClient:
     def __init__(
         self,
         *,
-        api_key: str,
+        api_key: SecretStr,
         model: str,
         timeout: float = 120.0,
         client: openai.OpenAI | None = None,
@@ -366,7 +457,8 @@ class OpenAIGenerationClient:
         # 재시도·타임아웃은 이 래퍼가 단독 통제한다 (모듈 docstring 참조). 값을 `or`
         # 우변에만 두면 주입 시 우회되므로 **관문을 지나게** 한다.
         self._client = _pin_transport_policy(
-            client or openai.OpenAI(api_key=api_key, max_retries=0, timeout=timeout),
+            client
+            or openai.OpenAI(api_key=api_key.get_secret_value(), max_retries=0, timeout=timeout),
             timeout=timeout,
         )
         self._model = model
@@ -413,7 +505,7 @@ class OpenAIGenerationClient:
             # `**request` 로 넘기면 오버로드 추론이 풀려 Any 가 되므로 반환 타입을 고정한다.
             return cast(Response, self._client.responses.create(**request))
 
-        response, sent = _call_with_one_retry(
+        response, sent, elapsed = _call_with_one_retry(
             stage=stage,
             call=_call,
             is_transport_error=_is_openai_transport_error,
@@ -423,6 +515,10 @@ class OpenAIGenerationClient:
         usage = getattr(response, "usage", None)
         input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
         output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+        # **캐시 계열은 `input_tokens` 의 내역 안에 있다.** 이 두 줄이 없으면 적중분이
+        # 어디에도 남지 않아 달러 환산이 전부 정가를 곱하고, 그 값은 실제 청구액이 아니라
+        # 그 이상일 수 없는 값(상한)이 된다. 판정 계열이 이미 같은 배선을 갖고 있다.
+        cache_creation, cache_read = _openai_cache_tokens(usage)
 
         # 안전 분류기가 거절하면 사용 가능한 산출이 없으므로 실패다.
         # 응답은 200 으로 왔으므로 **토큰은 이미 과금됐다** — 실패에 실어 보낸다.
@@ -435,6 +531,10 @@ class OpenAIGenerationClient:
                 attempts=sent,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                cache_creation_input_tokens=cache_creation,
+                cache_read_input_tokens=cache_read,
+                # 거절도 시간을 썼다 — 토큰과 같은 자격으로 올려보낸다.
+                elapsed_ms=elapsed,
             )
 
         text = response.output_text or ""
@@ -444,6 +544,9 @@ class OpenAIGenerationClient:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             transport_attempts=sent,
+            elapsed_ms=elapsed,
+            cache_creation_input_tokens=cache_creation,
+            cache_read_input_tokens=cache_read,
         )
 
 
@@ -472,7 +575,7 @@ class AnthropicGenerationClient:
     def __init__(
         self,
         *,
-        api_key: str,
+        api_key: SecretStr,
         model: str,
         timeout: float = 120.0,
         client: anthropic.Anthropic | None = None,
@@ -481,7 +584,10 @@ class AnthropicGenerationClient:
         # 재시도·타임아웃은 이 래퍼가 단독 통제한다 (모듈 docstring 참조). 값을 `or`
         # 우변에만 두면 주입 시 우회되므로 **관문을 지나게** 한다.
         self._client = _pin_transport_policy(
-            client or anthropic.Anthropic(api_key=api_key, max_retries=0, timeout=timeout),
+            client
+            or anthropic.Anthropic(
+                api_key=api_key.get_secret_value(), max_retries=0, timeout=timeout
+            ),
             timeout=timeout,
         )
         self._model = model
@@ -521,9 +627,15 @@ class AnthropicGenerationClient:
 
         - `schema_name` 은 Anthropic 구조화 출력에 대응 필드가 없어 전송하지 않는다
           (`GenerationClient` 프로토콜 서명 유지용).
-        - `thinking` 설정은 보내지 않는다 — 미전송은 '끔'이 아니라 **adaptive thinking
-          켜짐**이 모델 기본이다. 판정 토큰에 thinking 이 포함되고 `max_output_tokens`
-          (와이어의 `max_tokens`)는 thinking+응답 합산 상한이므로 여유 있게 받는다.
+        - `thinking` 설정은 보내지 않는다. 미전송의 뜻은 **모델 계열에 따라 다르다** —
+          `claude-sonnet-5`·`claude-opus-5` 는 '끔'이 아니라 **adaptive thinking 켜짐**이
+          기본이다. `claude-haiku-4-5` 는 4.6 이전 계열이라 **미전송이면 안 켜진다**(끄는
+          것이 기본이고, 켜려면 `thinking={"type": "enabled", "budget_tokens": N}` 을
+          명시해야 한다 — thinking 이 **없는** 모델이 아니다). 켜지는 계열에서는 판정
+          토큰에 thinking 이 포함되고 `max_output_tokens`(와이어의 `max_tokens`)가
+          thinking+응답 합산 상한이지만, 안 켜지는 계열에서는 같은 값이 **순수 응답 상한**
+          이다. `judge_model` 은 조정 가능한 기본값이므로 계열을 바꾸면 이 상한의 뜻도
+          함께 바뀐다.
         - `effort` 는 **지정했을 때만** `output_config` 에 실어 보낸다
           (docs/standards.md "샘플링 파라미터를 보내지 않는다").
         """
@@ -544,7 +656,7 @@ class AnthropicGenerationClient:
             # `**request` 로 넘기면 오버로드 추론이 풀려 Any 가 되므로 반환 타입을 고정한다.
             return cast(Message, self._client.messages.create(**request))
 
-        response, sent = _call_with_one_retry(
+        response, sent, elapsed = _call_with_one_retry(
             stage=stage,
             call=_call,
             is_transport_error=_is_anthropic_transport_error,
@@ -573,6 +685,7 @@ class AnthropicGenerationClient:
                 output_tokens=output_tokens,
                 cache_creation_input_tokens=cache_creation,
                 cache_read_input_tokens=cache_read,
+                elapsed_ms=elapsed,
             )
 
         # adaptive thinking 이 켜져 있으면 text 블록 앞에 thinking 블록이 올 수 있다 —
@@ -591,6 +704,7 @@ class AnthropicGenerationClient:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             transport_attempts=sent,
+            elapsed_ms=elapsed,
             cache_creation_input_tokens=cache_creation,
             cache_read_input_tokens=cache_read,
         )
@@ -602,14 +716,15 @@ class OpenAIEmbeddingClient:
     def __init__(
         self,
         *,
-        api_key: str,
+        api_key: SecretStr,
         model: str,
         dimensions: int,
         timeout: float = 60.0,
         client: openai.OpenAI | None = None,
     ) -> None:
         self._client = _pin_transport_policy(
-            client or openai.OpenAI(api_key=api_key, max_retries=0, timeout=timeout),
+            client
+            or openai.OpenAI(api_key=api_key.get_secret_value(), max_retries=0, timeout=timeout),
             timeout=timeout,
         )
         self._model = model
@@ -636,7 +751,7 @@ class OpenAIEmbeddingClient:
                 dimensions=self._dimensions,
             )
 
-        response, _ = _call_with_one_retry(
+        response, _sent, elapsed = _call_with_one_retry(
             stage=stage,
             call=_call,
             is_transport_error=_is_openai_transport_error,
@@ -646,6 +761,7 @@ class OpenAIEmbeddingClient:
         return EmbeddingResult(
             vectors=[list(item.embedding) for item in ordered],
             total_tokens=response.usage.total_tokens,
+            elapsed_ms=elapsed,
         )
 
 
@@ -693,6 +809,7 @@ class BgeM3EmbeddingClient:
         del stage
         if not texts:
             return EmbeddingResult(vectors=[], total_tokens=0)
+        started = perf_counter()
         encoded = self._model.encode(list(texts), normalize_embeddings=True)
         tolist = getattr(encoded, "tolist", None)
         raw = tolist() if callable(tolist) else encoded
@@ -706,4 +823,5 @@ class BgeM3EmbeddingClient:
                 raise ValueError("BGE-M3 임베딩 값은 숫자여야 한다")
             vectors.append([float(value) for value in vector])
         # 로컬 추론은 provider 토큰 과금이 없으므로 기존 EmbeddingResult 계약에서 0이다.
-        return EmbeddingResult(vectors=vectors, total_tokens=0)
+        # **시간은 0 이 아니다** — 과금이 없다는 것과 시간을 쓰지 않았다는 것은 다르다.
+        return EmbeddingResult(vectors=vectors, total_tokens=0, elapsed_ms=_elapsed_ms(started))

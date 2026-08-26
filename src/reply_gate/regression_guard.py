@@ -77,25 +77,43 @@ RUN_SET_SIZE: Final = 3
 LIVE_SERIES_PREFIX: Final = "evaluation-live"
 
 #: 대조 가능성을 결정하는 지문 항목. **이 목록은 하한이지 상한이 아니다** —
-#: 실행 조건에 실린 키는 목록 밖이어도 같은 규칙으로 대조된다. 그래서 새 축(예: 기권 게이트
-#: 통계량·τ)을 붙이는 작업은 **값만 추가**하면 되고 이 모듈을 다시 열지 않아도 된다.
+#: 실행 조건에 실린 키는 목록 밖이어도 같은 규칙으로 대조된다. 그래서 새 축을 붙이는
+#: 작업은 대개 **값만 추가**하면 되고 이 모듈을 다시 열지 않아도 된다.
+#:
+#: **여기 올리는 것은 다른 일이다.** 목록에 든 항목은 값이 없어도 키가 존재하고 `None`
+#: (미상)을 든다 — 그래야 **양쪽 다 모르는** 두 산출물이 "항목이 통째로 없으니 어긋남
+#: 없음"으로 읽혀 한 세트에 묶이는 일이 없다(불변식 19 가 막는 실패 모양이다). 그래서
+#: "몰랐다는 사실 자체가 대조에 남아야 하는" 축만 올린다.
+#:
+#: 아래 일곱은 그 자격으로 올라왔다(사이클 5 T6): 실행이 도중에 중단됐는지 · 판정 호출의
+#: 사고 과정 설정 · 초안 판정 규칙(접기·패턴)의 판 · L1 채점표의 판 · 조회 가드(허용 함수·
+#: 허용 캐스트 타입·PII 유래 승인)의 판 · 검색 정렬의 tie-break · 기권 게이트의 미정의
+#: 처리 방식. **이 확장은 그 이전에 커밋된 라이브 전부를 그 항목 "미상"으로 만든다** —
+#: 대조 계보가 한 번 끊기는 대가를 재등재 시점에 치른 것이다.
 FINGERPRINT_FIELDS: Final[tuple[str, ...]] = (
     "label_version",
     "retrieval_labels_version",
     "acceptance_cut",
     "abstention_gate_statistic",
     "abstention_tau",
+    "abstention_undefined_policy",
     "query_rewrite",
+    "retrieval_order",
     "embedding_model",
     "embedding_dimensions",
     "top_k",
     "generation_model",
     "judge_model",
     "judge_effort",
+    "judge_thinking",
     "judge_prompt_version",
     "judge_fixture_version",
     "judge_prompt_caching",
+    "draft_rule_version",
+    "l1_fixture_version",
+    "sql_guard_version",
     "measurement_scope",
+    "run_completion",
 )
 
 #: **짝으로 읽는 지문 항목.** τ 는 임베딩 모델을 넘어 이전되지 않았다(손계산) — 임베딩

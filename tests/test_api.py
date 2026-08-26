@@ -27,6 +27,7 @@ DB 가 필요한 테스트는 `db` 마커가 붙고, 쓰기는 전부 `app_conn`
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from typing import Any, cast
@@ -35,6 +36,7 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from psycopg.rows import DictRow
+from pydantic import SecretStr
 
 from reply_gate.api import (
     InquiryResponse,
@@ -203,7 +205,7 @@ def service_client(
 
     def _override() -> ServiceOpener:
         return lambda: nullcontext(
-            InquiryService(pipeline=pipeline, app_conn=app_conn, readonly_conn=ro_conn)
+            InquiryService(open_pipeline=lambda: pipeline, app_conn=app_conn, readonly_conn=ro_conn)
         )
 
     app.dependency_overrides[get_service] = _override
@@ -340,6 +342,49 @@ def test_웹_폼은_한_장짜리_HTML_이다(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
+
+
+def _고객_뷰_토글_태그(문서: str) -> str:
+    """`id="customer-view"` 인 `<input>` 태그를 통째로 집는다.
+
+    태그 **밖**의 `checked` 를 세지 않으려고 태그 경계까지 함께 잡는다 — 문서 전체를
+    `"checked" in html` 로 재면 다른 요소의 속성이 이 판정을 뒤집는다.
+    """
+    태그 = re.search(r"<input[^>]*id=\"customer-view\"[^>]*>", 문서)
+    assert 태그 is not None, "고객 뷰 토글이 사라졌다"
+    return 태그.group(0)
+
+
+def test_웹_폼의_고객_뷰_토글은_기본이_꺼짐이다(client: TestClient) -> None:
+    """이 화면의 계약은 **판정 과정이 답변보다 먼저·크게** 다(`docs/contracts.md` 의 `GET /`).
+
+    기본이 고객 뷰로 뒤집히면 첫 화면이 답변 한 문단이 되어 계약이 **조용히** 깨진다 —
+    화면 자체는 멀쩡해 보이므로 사람 눈으로는 안 잡힌다. 토글을 추가한 세션이 그 자리를
+    한 번 뒤집어 본 결과가 이 검사다(`docs/engineering-notes.md` "게이트를 세운 세션은
+    그 게이트를 통과한 유일한 세션이다").
+    """
+    태그 = _고객_뷰_토글_태그(client.get("/").text)
+
+    assert "checked" not in 태그, f"토글 기본값이 켜져 있다: {태그}"
+
+
+def test_고객_뷰_토글_검사가_켜진_기본값과_사라진_토글을_잡는다() -> None:
+    """**음성 대조** — 위 검사가 빈 단언이 아니라는 것을 같은 파일이 증명한다.
+
+    검사기 함수와 그 앞의 유도부(태그를 찾는 자리)를 **둘 다** 태운다.
+    """
+    켜진_폼 = '<div><input type="checkbox" id="customer-view" checked></div>'
+    assert "checked" in _고객_뷰_토글_태그(켜진_폼)
+
+    # 태그 밖의 checked 는 세지 않는다 — 이게 없으면 검사가 다른 요소에 반응한다.
+    옆_요소가_checked = (
+        '<input type="checkbox" id="something-else" checked>'
+        '<input type="checkbox" id="customer-view">'
+    )
+    assert "checked" not in _고객_뷰_토글_태그(옆_요소가_checked)
+
+    with pytest.raises(AssertionError):
+        _고객_뷰_토글_태그("<div>토글이 없다</div>")
 
 
 def test_웹_폼에_기각_사유가_보이는_자리가_있다(client: TestClient) -> None:
@@ -794,8 +839,8 @@ def test_판정_토큰은_생성_합산에_섞이지_않는다() -> None:
 def keyless_pipeline() -> InquiryPipeline:
     """생성 키도 판정 키도 없는 조립 — **스위치는 켜 둔다**(조립이 키를 요구하지 않아야 한다)."""
     settings = Settings(
-        openai_api_key="",
-        anthropic_api_key="",
+        openai_api_key=SecretStr(""),
+        anthropic_api_key=SecretStr(""),
         l2_enabled=True,
         vector_top_k=5,
         vector_similarity_threshold=0.0,
@@ -906,7 +951,7 @@ def test_인덱스와_다른_모델로_질의하면_503_이고_인계로_기록�
 def test_판정_키가_없으면_POST_는_503_이고_파이프라인이_돌지_않는다(
     client: TestClient, recorder: RecordingService, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    api_settings(monkeypatch, l2_enabled=True, anthropic_api_key="")
+    api_settings(monkeypatch, l2_enabled=True, anthropic_api_key=SecretStr(""))
 
     response = client.post("/inquiries", json={"content": INQUIRY})
 
@@ -919,7 +964,7 @@ def test_판정_키가_없어도_접수_거부는_그대로_422다(
     client: TestClient, recorder: RecordingService, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """선검사가 422 경로까지 번지면 형식 오류가 설정 오류로 둔갑한다."""
-    api_settings(monkeypatch, l2_enabled=True, anthropic_api_key="")
+    api_settings(monkeypatch, l2_enabled=True, anthropic_api_key=SecretStr(""))
 
     response = client.post("/inquiries", json={"content": INQUIRY, "order_no": "12345"})
 
@@ -931,7 +976,7 @@ def test_판정_키가_없어도_조회는_동작한다(
     client: TestClient, recorder: RecordingService, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`GET /inquiries/{id}` 는 DB 만 읽는다 — 판정 자격 증명과 무관해야 한다."""
-    api_settings(monkeypatch, l2_enabled=True, anthropic_api_key="")
+    api_settings(monkeypatch, l2_enabled=True, anthropic_api_key=SecretStr(""))
 
     response = client.get("/inquiries/3b0a5a1e-0000-4000-8000-000000000000")
 
@@ -946,7 +991,7 @@ def test_판정_키_부재_503_은_처리_기록을_남기지_않는다(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """설정 오류는 `llm_call_failed` 인계가 아니다 — 기록으로 남으면 지표가 오염된다."""
-    api_settings(monkeypatch, l2_enabled=True, anthropic_api_key="")
+    api_settings(monkeypatch, l2_enabled=True, anthropic_api_key=SecretStr(""))
     before = app_conn.execute("SELECT count(*) AS n FROM inquiries").fetchone()
     assert before is not None
 
@@ -969,7 +1014,7 @@ def test_스위치가_꺼져_있으면_판정_키_없이도_POST_가_처리된�
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """양성 대조 — 선검사는 스위치가 켜져 있을 때만 건다."""
-    api_settings(monkeypatch, l2_enabled=False, anthropic_api_key="")
+    api_settings(monkeypatch, l2_enabled=False, anthropic_api_key=SecretStr(""))
     generation = scripted_client(
         {INTENT_STAGE: [intent_completion("policy")], DRAFT_STAGE: [citing_draft()]}
     )
@@ -1028,7 +1073,7 @@ def test_DB_가_없어도_빈_내용은_422다(monkeypatch: pytest.MonkeyPatch) 
 
 def test_DB_가_없어도_판정키_부재는_503이다(monkeypatch: pytest.MonkeyPatch) -> None:
     """설정 오류는 DB 상태와 무관하게 설정 오류다."""
-    _dbless(monkeypatch, l2_enabled=True, anthropic_api_key="")
+    _dbless(monkeypatch, l2_enabled=True, anthropic_api_key=SecretStr(""))
 
     with TestClient(app) as test_client:
         response = test_client.post("/inquiries", json={"content": INQUIRY})
