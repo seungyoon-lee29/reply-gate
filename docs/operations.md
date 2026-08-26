@@ -155,7 +155,7 @@ uv run pytest -m db        # skip 0 이어야 한다
 링크 쪽은 따로도 돌릴 수 있다:
 
 ```bash
-uv run python -m scripts.check_links        # 문서 46개 · 링크 408개 · 깨짐 0건
+uv run python -m scripts.check_links        # 문서 46개 · 링크 397개 · 깨짐 0건
 ```
 
 **건수 대조는 전체 스위트에서만 성립한다.** 경로·`-k`·`-m` 을 주면 그 세션이 스위트가 아니므로
