@@ -27,6 +27,7 @@ DB 가 필요한 테스트는 `db` 마커가 붙고, 쓰기는 전부 `app_conn`
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from typing import Any, cast
@@ -341,6 +342,49 @@ def test_웹_폼은_한_장짜리_HTML_이다(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
+
+
+def _고객_뷰_토글_태그(문서: str) -> str:
+    """`id="customer-view"` 인 `<input>` 태그를 통째로 집는다.
+
+    태그 **밖**의 `checked` 를 세지 않으려고 태그 경계까지 함께 잡는다 — 문서 전체를
+    `"checked" in html` 로 재면 다른 요소의 속성이 이 판정을 뒤집는다.
+    """
+    태그 = re.search(r"<input[^>]*id=\"customer-view\"[^>]*>", 문서)
+    assert 태그 is not None, "고객 뷰 토글이 사라졌다"
+    return 태그.group(0)
+
+
+def test_웹_폼의_고객_뷰_토글은_기본이_꺼짐이다(client: TestClient) -> None:
+    """이 화면의 계약은 **판정 과정이 답변보다 먼저·크게** 다(`docs/contracts.md` 의 `GET /`).
+
+    기본이 고객 뷰로 뒤집히면 첫 화면이 답변 한 문단이 되어 계약이 **조용히** 깨진다 —
+    화면 자체는 멀쩡해 보이므로 사람 눈으로는 안 잡힌다. 토글을 추가한 세션이 그 자리를
+    한 번 뒤집어 본 결과가 이 검사다(`docs/engineering-notes.md` "게이트를 세운 세션은
+    그 게이트를 통과한 유일한 세션이다").
+    """
+    태그 = _고객_뷰_토글_태그(client.get("/").text)
+
+    assert "checked" not in 태그, f"토글 기본값이 켜져 있다: {태그}"
+
+
+def test_고객_뷰_토글_검사가_켜진_기본값과_사라진_토글을_잡는다() -> None:
+    """**음성 대조** — 위 검사가 빈 단언이 아니라는 것을 같은 파일이 증명한다.
+
+    검사기 함수와 그 앞의 유도부(태그를 찾는 자리)를 **둘 다** 태운다.
+    """
+    켜진_폼 = '<div><input type="checkbox" id="customer-view" checked></div>'
+    assert "checked" in _고객_뷰_토글_태그(켜진_폼)
+
+    # 태그 밖의 checked 는 세지 않는다 — 이게 없으면 검사가 다른 요소에 반응한다.
+    옆_요소가_checked = (
+        '<input type="checkbox" id="something-else" checked>'
+        '<input type="checkbox" id="customer-view">'
+    )
+    assert "checked" not in _고객_뷰_토글_태그(옆_요소가_checked)
+
+    with pytest.raises(AssertionError):
+        _고객_뷰_토글_태그("<div>토글이 없다</div>")
 
 
 def test_웹_폼에_기각_사유가_보이는_자리가_있다(client: TestClient) -> None:

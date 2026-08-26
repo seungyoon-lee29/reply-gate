@@ -148,6 +148,13 @@
     #answer { margin: 0; }
     #error { color: var(--reject); font-weight: 600; }
     pre#raw-json { white-space: pre-wrap; word-break: break-all; margin: .5rem 0 0; }
+    .viewbar {
+      display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
+      margin-top: .75rem; padding-top: .75rem; border-top: 1px solid var(--line);
+    }
+    .viewbar label { display: flex; align-items: center; gap: .4rem; margin: 0; cursor: pointer; }
+    .viewbar input[type="checkbox"] { width: auto; margin: 0; }
+    .viewbar .hint { margin: 0; }
     [hidden] { display: none !important; }
     footer { color: var(--muted); font-size: .8rem; margin-top: 2rem; }
   </style>
@@ -190,6 +197,13 @@
     <div class="card">
       <p id="status-line"></p>
       <p class="hint" id="inquiry-id-line"></p>
+      <div class="viewbar">
+        <label for="customer-view">
+          <input type="checkbox" id="customer-view">
+          고객이 보는 화면
+        </label>
+        <span class="hint" id="view-note"></span>
+      </div>
     </div>
 
     <section class="card" id="verdict-flow">
@@ -212,8 +226,11 @@
     </section>
 
     <section class="card" id="escalation" hidden>
-      <h2>상담원 인계</h2>
-      <p>인계 사유: <code class="reason-code" id="escalation-reason"></code></p>
+      <h2 id="escalation-title">상담원 인계</h2>
+      <p id="escalation-detail">인계 사유: <code class="reason-code" id="escalation-reason"></code></p>
+      <p id="escalation-customer" hidden>
+        답변을 확정하지 못해 상담원이 확인하고 있습니다. 확인되는 대로 안내드리겠습니다.
+      </p>
     </section>
 
     <section class="card" id="answer-section" hidden>
@@ -222,14 +239,14 @@
       <ol id="claims"></ol>
     </section>
 
-    <section class="card">
+    <section class="card" id="citations-section">
       <h2>수집된 근거 (citations)</h2>
       <p class="hint">초안 전 인계라도 그 시점까지 모은 근거는 감사 목적으로 남는다.</p>
       <ol id="citations"></ol>
       <p class="hint" id="citations-empty" hidden>수집된 근거 없음.</p>
     </section>
 
-    <section class="card">
+    <section class="card" id="metrics-section">
       <h2>처리 지표</h2>
       <p class="hint" id="metrics"></p>
       <details>
@@ -452,7 +469,41 @@
     });
   }
 
+  // 마지막 응답. 보기 모드를 바꿀 때 재요청 없이 다시 칠하려고 들고 있는다.
+  let lastPayload = null;
+
+  // 고객이 보는 것은 확정 답변뿐이다. 판정 과정·근거·지표는 이 제품을 설명하는 자리이지
+  // 문의자에게 나가는 정보가 아니다 — 인계 사유 코드(`no_evidence`)가 특히 그렇다.
+  // **기본은 꺼짐이다**: 이 화면의 계약은 "판정 과정이 답변보다 먼저·크게"다
+  // (docs/contracts.md 의 `GET /` 절).
+  function applyView() {
+    if (lastPayload === null) return;
+    const payload = lastPayload;
+    const customer = el("customer-view").checked;
+    const escalated = payload.status === "escalated";
+
+    show("verdict-flow", !customer);
+    show("citations-section", !customer);
+    show("metrics-section", !customer);
+
+    show("escalation", escalated);
+    setText("escalation-title", customer ? "답변 준비 중" : "상담원 인계");
+    show("escalation-detail", !customer);
+    show("escalation-customer", customer && escalated);
+
+    show("answer-section", payload.answer !== null);
+    show("claims", !customer);
+
+    setText(
+      "view-note",
+      customer
+        ? "고객에게 나가는 것은 이것뿐이다. 끄면 이 답변이 나가기까지의 판정 과정이 보인다."
+        : "판정 과정이 답변보다 먼저·크게 보이는 것이 이 화면의 기본값이다."
+    );
+  }
+
   function render(payload) {
+    lastPayload = payload;
     const escalated = payload.status === "escalated";
     const line = el("status-line");
     clear(line);
@@ -465,13 +516,9 @@
 
     renderAttempts(payload);
 
-    show("escalation", escalated);
     setText("escalation-reason", payload.escalation_reason || "");
-
-    show("answer-section", payload.answer !== null);
     setText("answer", payload.answer || "");
     renderClaims(payload.claims);
-
     renderCitations(payload.citations);
 
     // 토큰은 계열별로 분리해 보여준다 — 생성과 판정은 provider·단가가 달라 합산이 무의미하다.
@@ -484,6 +531,7 @@
         " (L2 미실행이면 0 · 임베딩 토큰은 처리 기록에만 별도로 남는다)"
     );
     setText("raw-json", JSON.stringify(payload, null, 2));
+    applyView();
     show("result", true);
   }
 
@@ -524,6 +572,8 @@
     };
     call("/inquiries", options, el("submit"));
   });
+
+  el("customer-view").addEventListener("change", applyView);
 
   el("lookup-form").addEventListener("submit", (event) => {
     event.preventDefault();
