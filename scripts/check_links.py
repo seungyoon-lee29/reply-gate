@@ -39,10 +39,13 @@ from pathlib import Path
 #: 저장소 루트 — 이 파일 기준으로 유도한다. 손으로 적으면 옮길 때 조용히 어긋난다.
 REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 
-#: 검사 대상 문서 집합([미해결 34](../docs/tracking/findings.md) 이 정한 범위) — `docs/**` ·
-#: `README.md` · `CLAUDE.md` · `AGENTS.md`. `AGENTS.md` 는 루트뿐 아니라 모듈별 파일도 같은
-#: 이름이라 함께 든다.
-DOC_GLOBS: tuple[str, ...] = ("docs/**/*.md", "README.md", "CLAUDE.md", "**/AGENTS.md")
+#: 검사 대상 문서 집합 — `docs/**` · **루트의 모든 `.md`** · 모듈별 `AGENTS.md`.
+#:
+#: **루트를 이름으로 열거하지 않는다.** 첫 판은 `README.md`·`CLAUDE.md`·`AGENTS.md` 를 손으로
+#: 적어서, 감사가 손으로 훑었던 **문서 46개**보다 하나 좁은 45개만 봤다(빠진 것은 루트
+#: `기획-입력.md` 이고 그 안에도 상대 링크가 있다). 손으로 적은 목록은 새 문서가 생길 때마다
+#: 조용히 검사 밖으로 나간다 — `documents()` 의 주석이 스스로 경고하던 실패 모드다.
+DOC_GLOBS: tuple[str, ...] = ("docs/**/*.md", "*.md", "**/AGENTS.md")
 
 #: 검사에서 빼는 것들 — 이름이 아니라 **성질**로 가른다.
 #:
@@ -121,9 +124,15 @@ def slugify(heading: str) -> str:
     **낱말 문자·하이픈·공백이 아닌 것을 지우고** 공백을 하이픈으로 바꾼다. 한글은 낱말
     문자라 그대로 남고, 문장부호(`.`·`,`·`(`·`—`)는 사라진다 — 그래서 공백에 둘러싸인
     em dash 자리에는 하이픈이 **둘** 남는다.
+
+    **밑줄은 지우지 않는다.** GitHub 의 슬러거는 ASCII 문장부호 중 `-` 와 `_` 만 남기므로
+    `deferred_to_l2` 는 `deferred_to_l2` 그대로 앵커가 된다. 첫 판은 강조 기호를 벗기면서
+    `_` 를 함께 지워, 저장소의 **헤딩 열 개**에서 GitHub 과 다른 슬러그를 만들었다 — 실제로
+    도는 앵커를 "깨졌다"고 잡고 안 도는 앵커를 통과시키는, 판정이 **반대로** 나오는 자리였다.
+    (밑줄 강조 `_기울임_` 은 이 저장소가 쓰지 않는다. 쓰게 되면 여기서 갈라야 한다.)
     """
     text = _LINK.sub(lambda m: m.group("text"), heading)
-    text = re.sub(r"[*_`~]", "", text)
+    text = re.sub(r"[*`~]", "", text)
     text = text.lower()
     text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
     return text.strip().replace(" ", "-")
@@ -216,19 +225,25 @@ def check(root: Path = REPO_ROOT) -> tuple[tuple[Link, ...], tuple[Breakage, ...
     return tuple(checked), tuple(broken)
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, root: Path = REPO_ROOT) -> int:
+    """종료 코드 `0`(깨짐 없음) 또는 `1`.
+
+    **`root` 를 인자로 받는 것은 테스트를 위해서다.** 첫 판은 저장소 루트를 함수 안에서
+    고정해서, 종료 코드를 재는 검사가 `main` 을 부르지 못하고 `1 if broken else 0` 을
+    **테스트 쪽에서 다시 계산**했다 — `main` 을 `return 0` 으로 바꿔도 초록인 동어반복이다.
+    """
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--list", action="store_true", help="검사한 링크를 전수로 출력한다")
     args = parser.parse_args(argv)
 
-    checked, broken = check()
+    checked, broken = check(root)
     if args.list:
         for link in checked:
             print(f"{link.source}:{link.line}: {link.raw}")
 
-    print(f"문서 {len(documents())}개 · 링크 {len(checked)}개 · 깨짐 {len(broken)}건")
+    print(f"문서 {len(documents(root))}개 · 링크 {len(checked)}개 · 깨짐 {len(broken)}건")
     for breakage in broken:
         print(f"  {breakage}", file=sys.stderr)
     return 1 if broken else 0

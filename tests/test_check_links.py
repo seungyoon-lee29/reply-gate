@@ -56,6 +56,22 @@ def test_검사_대상이_비어_있지_않고_전시_문서를_포함한다() -
     assert not any(part.startswith(".") for name in names for part in name.split("/")[:-1])
 
 
+def test_루트_문서를_이름으로_열거하지_않는다() -> None:
+    """**모집단이 글롭에서 나온다.** 첫 판은 루트 셋을 손으로 적어 하나를 흘렸다.
+
+    감사가 손으로 훑은 것은 **문서 46개**였는데 검사기의 첫 판은 45개만 봤다 — 빠진 것은
+    루트 `기획-입력.md` 이고 그 안에도 저장소 안을 가리키는 상대 링크가 있다. 판정 수단을
+    세우면서 모집단이 좁아지면 "0건 깨짐"의 뜻이 조용히 달라진다.
+    """
+    names = {path.relative_to(REPO_ROOT).as_posix() for path in documents()}
+    루트_문서 = {name for name in names if "/" not in name}
+
+    assert 루트_문서 == {
+        path.name for path in REPO_ROOT.glob("*.md") if not path.name.startswith(".")
+    }
+    assert "기획-입력.md" in 루트_문서
+
+
 def test_앵커를_실제로_대조하고_있다() -> None:
     """앵커가 붙은 링크가 0건이면 위 검사는 파일 존재만 보는 셈이다.
 
@@ -189,6 +205,18 @@ def test_마크다운이_아닌_대상의_앵커는_판정하지_않고_잡는�
         ),
         pytest.param("`코드` 와 **굵게**", "코드-와-굵게", id="서식은_벗긴다"),
         pytest.param("[표시](docs/x.md) 뒤", "표시-뒤", id="링크는_표시만_남는다"),
+        # GitHub 의 슬러거는 ASCII 문장부호 중 `-` 와 `_` 만 남긴다. 첫 판은 강조 기호를
+        # 벗기면서 `_` 를 함께 지워, 저장소의 헤딩 열 개에서 **판정이 반대로** 나왔다.
+        pytest.param(
+            "9. 리포트 JSON 의 이월 목록 키가 `deferred_to_l2` 에서 `deferred` 로 바뀌었다",
+            "9-리포트-json-의-이월-목록-키가-deferred_to_l2-에서-deferred-로-바뀌었다",
+            id="밑줄은_낱말_문자라_남는다",
+        ),
+        pytest.param(
+            "2. 승격 기준선의 `judge_fixture_version` 지문",
+            "2-승격-기준선의-judge_fixture_version-지문",
+            id="식별자_밑줄",
+        ),
     ],
 )
 def test_슬러그가_GitHub_규칙을_따른다(heading: str, expected: str) -> None:
@@ -215,10 +243,21 @@ def test_진입점은_깨진_것이_없으면_0_을_돌려준다(capsys: pytest.
     assert "깨짐 0건" in capsys.readouterr().out
 
 
-def test_깨짐이_있으면_종료_코드가_1_이다(문서_묶음: Path) -> None:
-    """`main` 은 실제 저장소를 보므로, 종료 코드 규칙은 판정 결과로 직접 잰다."""
-    (문서_묶음 / "README.md").write_text("# 안내\n\n[없다](docs/gone.md)\n", encoding="utf-8")
-    _checked, broken = check(문서_묶음)
+def test_깨짐이_있으면_종료_코드가_1_이다(
+    문서_묶음: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """**`main` 을 실제로 부른다.**
 
-    assert broken and isinstance(broken[0], Breakage)
-    assert (1 if broken else 0) == 1
+    첫 판은 `main` 이 저장소 루트를 함수 안에서 고정해 부를 수 없었고, 대신 테스트가
+    `1 if broken else 0` 을 **다시 계산**했다 — `main` 을 `return 0` 으로 바꿔도 초록인
+    동어반복이다. 검사가 "있다"와 "문다"의 차이가 정확히 여기였다.
+    """
+    (문서_묶음 / "README.md").write_text("# 안내\n\n[없다](docs/gone.md)\n", encoding="utf-8")
+
+    코드 = main([], root=문서_묶음)
+    출력 = capsys.readouterr()
+
+    assert 코드 == 1
+    assert "깨짐 1건" in 출력.out
+    assert "docs/gone.md — 대상 파일이 없다" in 출력.err
+    assert isinstance(check(문서_묶음)[1][0], Breakage)

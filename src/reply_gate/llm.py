@@ -629,10 +629,13 @@ class AnthropicGenerationClient:
           (`GenerationClient` 프로토콜 서명 유지용).
         - `thinking` 설정은 보내지 않는다. 미전송의 뜻은 **모델 계열에 따라 다르다** —
           `claude-sonnet-5`·`claude-opus-5` 는 '끔'이 아니라 **adaptive thinking 켜짐**이
-          기본이지만, `claude-haiku-4-5` 는 thinking 이 아예 없다. 켜지는 계열에서는 판정
+          기본이다. `claude-haiku-4-5` 는 4.6 이전 계열이라 **미전송이면 안 켜진다**(끄는
+          것이 기본이고, 켜려면 `thinking={"type": "enabled", "budget_tokens": N}` 을
+          명시해야 한다 — thinking 이 **없는** 모델이 아니다). 켜지는 계열에서는 판정
           토큰에 thinking 이 포함되고 `max_output_tokens`(와이어의 `max_tokens`)가
-          thinking+응답 합산 상한이므로 여유 있게 받는다. `judge_model` 은 조정 가능한
-          기본값이므로 계열을 바꾸면 이 상한의 뜻도 함께 바뀐다.
+          thinking+응답 합산 상한이지만, 안 켜지는 계열에서는 같은 값이 **순수 응답 상한**
+          이다. `judge_model` 은 조정 가능한 기본값이므로 계열을 바꾸면 이 상한의 뜻도
+          함께 바뀐다.
         - `effort` 는 **지정했을 때만** `output_config` 에 실어 보낸다
           (docs/standards.md "샘플링 파라미터를 보내지 않는다").
         """

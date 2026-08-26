@@ -1755,7 +1755,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8000/inquiries
 ### 5. 검증 — **API 키 불필요**
 
 ```bash
-uv run pytest              # 1,488 passed
+uv run pytest              # 1,497 passed
 uv run ruff check .        # 0
 uv run ruff format --check .   # 187 files
 uv run mypy                # strict — 79 files, 0 errors
@@ -1767,7 +1767,7 @@ uv run mypy                # strict — 79 files, 0 errors
 > **전체 녹색을 주장하려면 `docker compose up -d --wait` 를 먼저 실행해야 한다.**
 
 ```bash
-uv run pytest -m db        # DB 통합 테스트만 — 178 passed, 1,310 deselected
+uv run pytest -m db        # DB 통합 테스트만 — 178 passed, 1,319 deselected
 ```
 
 DB 통합 테스트는 세션당 1회 스키마 적용 + 주문 시딩을 하고, 각 테스트가 쓴 행은 롤백으로 되돌린다.
@@ -1910,6 +1910,16 @@ uv run python -m scripts.compare_retrieval --live --embedding-axis   # 임베딩
 - **허용 목록의 두 번째 사본** — 캐스트 대상 타입 13종을 보안 문서가 이름으로 적고, 코드와
   갈리면 검사가 RED 를 낸다. "구현이 정한 목록으로 구현을 검증한다"를 끊는 자리다
 
+**그리고 그 게이트들을 하루 뒤에 뒤집어 봤다 (2026-08-26):**
+
+- **세운 판정 수단 셋이 스스로는 판정하지 못했다** — 건수 대조가 **수집**을 **통과**로 세서
+  `1,310 passed · 178 skipped` 인 실행에서도 `1,488 passed` 인용이 초록이었고, 슬러그가 `_` 를
+  지워 헤딩 열 개에서 GitHub 과 **판정이 반대로** 났으며, 종료 코드 검사는 동어반복이었다.
+  검사 모집단도 감사가 훑은 46개보다 하나 좁았다 — [findings 37](docs/tracking/findings.md)
+- **얻은 것은 규율 하나다** — *"검사를 지우면 빨개지는가"가 아니라 **"검사가 겨냥한 상태를
+  만들면 빨개지는가"**를 물어라.* 넷 다 앞엣것은 통과했다. **게이트를 세운 세션은 그 게이트를
+  통과한 유일한 세션이다**
+
 > **"구조 검사가 못박는다"의 한계를 함께 적는다.** 이 저장소의 구조 검사는 AST 를 읽되
 > **이름과 문면의 블록리스트**로 위반을 찾는다 — 실수는 잘 잡지만 **저자가 피하려고 마음먹으면
 > 뚫린다.** 예를 들어 판정 층에 `thinking` 을 **다른 이름의 파라미터로** 보내면 조건 지문이
@@ -1936,7 +1946,7 @@ uv run python -m scripts.compare_retrieval --live --embedding-axis   # 임베딩
 | **RAG 심화 중 남은 것** | 하이브리드 검색(BM25+벡터)·리랭킹·**청킹 전략**은 전부 **측정했고 채택하지 않았다**([이유](#검색-품질--게이트-앞의-층)) — 안 해 본 것이 아니라 이 코퍼스에서 값을 못 한다. BGE-M3 로컬 임베딩 행만 의존성 미설치로 **미측정**이다. |
 | **지표 확장** | 사유별 검출률 분해, 건당 비용 추이, 인계율 대시보드 |
 | **병렬화 · 비동기 처리** | 정책 검색과 주문 조회는 독립이지만 지금은 순차다. 비동기화는 **검토까지 하고 하지 않기로 정했다**([결정 0020](docs/tracking/decisions/0020-비동기화를-검토하고-이번-사이클에는-하지-않는다.md)) — 헤드라인 지표를 1도 움직이지 않으면서 `status` enum·DB CHECK 셋(볼륨 재생성)·계약의 동치 하나를 연다. 그리고 겨냥이 어긋난다: 진짜 꼬리는 **재생성 1회가 만드는 40~49초**인데 비동기화는 그 시간을 줄이지 않고 감춘다. **선행 조건이던 단계별 계측이 사이클 5 에 생겼고, 그 실측이 같은 결론을 가리킨다** — 순차로 도는 두 조회는 합쳐 30 ms 대이고 지연의 주인은 L2 판정 한 층이다. |
-| **DB 접속 문자열의 평문 비밀번호** | 지금까지 확인된 노출 경로는 접속 실패 메시지 하나뿐이고, 고치기 전에 재현이 먼저인데 그 재현이 별도 작업이다. **여전히 미해결**로 남긴다([findings 24](docs/tracking/findings.md)). |
+| ~~**DB 접속 문자열의 평문 비밀번호**~~ | **사이클 종료 뒤 닫았다 (2026-08-25)** — 걸어 둔 조건이 "고치기 전에 재현이 먼저"였고, 감사가 카나리아로 그 재현을 마쳤다. 조립 결과를 비밀 전용 타입으로 감싸 표시·덤프를 필드와 같은 자격으로 닫았고 평문이 되는 지점이 psycopg 에 넘기는 **한 줄**로 좁아졌다([findings 24](docs/tracking/findings.md)). **로테이션은 따로다** — 타입 전환은 다음 노출만 막는다. |
 | **운영 기능** | 인증 · 레이트리밋 · 멀티테넌시. 포트폴리오 범위 밖. |
 
 ---
@@ -1972,4 +1982,4 @@ uv run python -m scripts.compare_retrieval --live --embedding-axis   # 임베딩
 | [`data/promoted_baseline.json`](data/promoted_baseline.json) | **승격 기준선 참조** — 회귀 판정을 구속하는 유일한 기준선. **사람만 바꾼다**(구조 테스트가 쓰기 경로를 막는다) |
 | [`scripts/handcalc_adoption_axis.py`](scripts/handcalc_adoption_axis.py) | 채택 축 손계산 산출물 — **무과금·오프라인**, 커밋된 검색 리포트만 읽는다 |
 | [`scripts/seed_orders.py`](scripts/seed_orders.py) · [`scripts/index_policies.py`](scripts/index_policies.py) | 시딩 · 인덱싱 |
-| [`tests/`](tests/) | **1,488건** (그중 DB 통합 **178건**) |
+| [`tests/`](tests/) | **1,497건** (그중 DB 통합 **178건**) |

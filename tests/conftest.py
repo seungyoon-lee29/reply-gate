@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+from collections import Counter
 from collections.abc import Iterator
 from typing import Any
 
@@ -54,17 +55,39 @@ def declared_settings(**overrides: Any) -> Settings:
 _skip_reason_cache: list[str | None] = []
 
 
-def _db_skip_reason() -> str | None:
+def db_skip_reason() -> str | None:
+    """DB 가 없어 `db` 마커 테스트가 skip 될 사유. 접속되면 `None`.
+
+    **공개인 것은 건수 대조가 이것을 읽기 때문이다**(`tests/test_documented_counts.py`).
+    문서가 인용하는 "N passed" 는 skip 이 0 일 때만 수집 건수와 같으므로, 대조하기 전에
+    이 실행에서 skip 이 예정돼 있는지를 먼저 물어야 한다.
+    """
     if not _skip_reason_cache:
         _skip_reason_cache.append(database_unavailable_reason())
     return _skip_reason_cache[0]
+
+
+#: 이 실행에서 **실제로 보고된** 결과 집계. 건수 대조가 "수집"이 아니라 "통과"를 세기 위해
+#: 읽는다 — 수집 건수는 skip 을 구분하지 못한다(그 자리가 실제로 뚫려 있었다).
+_보고된_결과: Counter[str] = Counter()
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    """호출 단계의 결과를 세고, 앞 단계에서 난 skip·오류도 놓치지 않는다."""
+    if report.when == "call" or report.outcome != "passed":
+        _보고된_결과[report.outcome] += 1
+
+
+def 보고된_결과() -> Counter[str]:
+    """지금까지 보고된 결과의 사본. **대조 시점 이전에 난 skip 을 잡는 유일한 통로다.**"""
+    return _보고된_결과.copy()
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:
     """`db` 마커 테스트는 DB 가 없을 때만 skip 한다."""
     if item.get_closest_marker("db") is None:
         return
-    reason = _db_skip_reason()
+    reason = db_skip_reason()
     if reason is not None:
         pytest.skip(reason)
 
