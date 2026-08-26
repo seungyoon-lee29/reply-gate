@@ -105,6 +105,9 @@ _패턴: tuple[tuple[str, re.Pattern[str]], ...] = (
     # (`387` 로 적혔는데 그 커밋의 실측이 `389` 였고 두 커밋 뒤에 `391` 이 됐다).
     ("check_links 문서", re.compile(rf"scripts\.check_links[^\n]*?#\s*문서\s*{_NUMBER}\s*개")),
     ("check_links 링크", re.compile(rf"scripts\.check_links[^\n]*?·\s*링크\s*{_NUMBER}\s*개")),
+    # 같은 계열이 하나 더 있었다 — `tests/AGENTS.md` 불변식 3 이 음성 대조를 든 파일 수를
+    # 인용하는데, 이 검사가 서기 전에 이미 **18 로 적힌 채 실제는 24** 였다.
+    ("음성 대조 파일", re.compile(rf"음성 대조' tests/`[^\n]*?{_NUMBER}\s*개 테스트 파일")),
 )
 
 
@@ -183,6 +186,25 @@ def _mypy_파일수() -> int | None:
     return int(매치.group(1)) if 매치 else None
 
 
+def _음성_대조_파일수() -> int:
+    """`grep -rl '음성 대조' tests/` 와 같은 것을 센다 — **재귀이고 확장자를 가리지 않는다.**
+
+    `tests/AGENTS.md` 불변식 3 이 이 수를 인용한다. grep 과 다르게 세면 문서가 가리키는
+    명령과 검사가 갈리므로, 명령의 의미를 그대로 옮긴다.
+    """
+    뿌리 = REPO_ROOT / "tests"
+    걸린_것 = 0
+    for 경로 in sorted(뿌리.rglob("*")):
+        if not 경로.is_file():
+            continue
+        try:
+            본문 = 경로.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        걸린_것 += "음성 대조" in 본문
+    return 걸린_것
+
+
 def _도구_실측() -> dict[str, int | None]:
     """도구를 그 자리에서 돌려 읽은 값. `None` 은 **재지 못했다**는 뜻이다(0 이 아니다).
 
@@ -195,6 +217,7 @@ def _도구_실측() -> dict[str, int | None]:
         "mypy 파일": _mypy_파일수(),
         "check_links 문서": len(documents()),
         "check_links 링크": len(검사한_링크),
+        "음성 대조 파일": _음성_대조_파일수(),
     }
 
 
@@ -274,13 +297,16 @@ def test_인용_자리가_비어_있지_않다() -> None:
         "mypy 파일",
         "check_links 문서",
         "check_links 링크",
+        "음성 대조 파일",
     }
     # 같은 건수를 여러 자리가 인용한다는 사실 자체가 이 검사의 존재 이유다 — 네 곳이 동시에
     # 틀어졌던 사고가 그 모양이었다. 상수 대신 **자리 수 > 이름 수**로 잰다.
     assert len(인용들) > len({인용.이름 for 인용 in 인용들})
-    assert {인용.자리.split(":")[0] for 인용 in 인용들} == {"README.md", "docs/operations.md"}, (
-        "지금 상태를 주장하는 건수 인용이 사는 문서다 — 늘어나면 여기를 갱신한다"
-    )
+    assert {인용.자리.split(":")[0] for 인용 in 인용들} == {
+        "README.md",
+        "docs/operations.md",
+        "tests/AGENTS.md",
+    }, "지금 상태를 주장하는 건수 인용이 사는 문서다 — 늘어나면 여기를 갱신한다"
 
 
 def test_문서가_인용한_도구_건수가_실행값과_같다(pytestconfig: pytest.Config) -> None:

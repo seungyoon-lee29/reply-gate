@@ -155,7 +155,7 @@ uv run pytest -m db        # skip 0 이어야 한다
 링크 쪽은 따로도 돌릴 수 있다:
 
 ```bash
-uv run python -m scripts.check_links        # 문서 46개 · 링크 400개 · 깨짐 0건
+uv run python -m scripts.check_links        # 문서 46개 · 링크 408개 · 깨짐 0건
 ```
 
 **건수 대조는 전체 스위트에서만 성립한다.** 경로·`-k`·`-m` 을 주면 그 세션이 스위트가 아니므로
@@ -187,6 +187,11 @@ uv run python -m scripts.check_links        # 문서 46개 · 링크 400개 · �
 **이 줄이 마지막으로 손으로 옮겨 적는 값이다** — 이제 문서가 인용한 건수를 스위트가 직접
 대조한다(위 "건수 대조").
 
+**미결 둘(승격 지문 처분 · 헤드라인 모집단)을 처분한 뒤의 실행값**(2026-08-26):
+`ruff check` 0 · `ruff format --check` **189 파일** · `mypy` **81 파일** 0 ·
+`pytest` **1,505 통과** · `pytest -m db` **178 통과 / skip 0**. 늘어난 8건은 헤드라인
+모집단의 구속 셋과 음성 대조 다섯이다([findings 36](tracking/findings.md)).
+
 **판정 수단을 되짚어 고친 뒤의 실행값**(2026-08-26): `ruff check` 0 · `ruff format --check`
 **187 파일** · `mypy` **79 파일** 0 · `pytest` **1,497 통과** ·
 `pytest -m db` **178 통과 / skip 0**. 앞 줄의 *"마지막으로 손으로 옮겨 적는 값"* 은
@@ -213,6 +218,39 @@ uv run python -m scripts.evaluate --live --measurements 3 --judge-model claude-o
 **`--declare-experiment` 는 "이번에 의도적으로 바꾼 축"의 선언이다.** 선언된 항목은 회귀
 가드가 대조를 **진행하며 차이를 병기**하고, 선언되지 않은 지문 불일치만 "대조 불가"가 된다.
 선언은 그 실행의 예외 처리이지 승격 등재의 정정이 아니다.
+
+### 다음에 풀셋 라이브를 사면 두 항목을 반드시 선언한다
+
+**승격 기준선(`-28`·`-29`·`-30`)의 지문 두 칸이 지금 코드와 갈려 있다**
+([findings 32](tracking/findings.md)) — 사이클 종료 뒤 감사 수정이 `draft_rule_version` 을
+움직였고(결합 표식 접기를 `Mn` → `M` 계열로), L1 채점표가 35 → **37건**이 되면서
+`l1_fixture_version` 이 움직였다. 선언 없이 돌리면 구속 줄이 **"대조 불가 + 어긋난 항목 둘"**
+로 나온다(0 이나 "통과"가 아니다 — 그건 설계대로다).
+
+```bash
+uv run python -m scripts.evaluate --live   --declare-experiment draft_rule_version   --declare-experiment l1_fixture_version
+```
+
+**함께 지는 의무 하나 — 분모를 병기한다.** 채점표가 늘면서 **측정 1 의 검출 분모가
+26 → 28** 이 됐다(양성 28 · 음성 9). 선언한 실행의 비악화 판정은 **분모가 다른 두 값 사이의
+비교**이므로, 그 수치를 앞 세트와 나란히 인용할 때 분모를 반드시 함께 적는다 —
+*"입력이 달라진 뒤의 동일성은 재현이 아니다"*(findings 31).
+
+**재등재를 사지 않기로 정했다 (2026-08-26 사용자 결정).** 라이브 3회는 약 $1.6(직전 승격 3회
+실측 $1.656935, 단가 기준일 2026-08-19)이고 이 프로젝트는 유료 실측을 닫았다. 그리고 재등재
+자체가 계보를 한 번 더 끊는다([결정 0027](tracking/decisions/0027-승격-기준선을-재등재한다.md)) —
+갈린 것은 두 칸인데 재등재는 기준선 전체를 옮긴다. **방향을 바꾸려면 그것도 사람이 정한다.**
+
+### 헤드라인 수치는 커밋된 리포트에서 다시 센다 — **무과금**
+
+```bash
+uv run python -m scripts.recount_headline        # 재집계와 문서 값을 나란히
+```
+
+모집단 규칙의 **정본은 `tracking/status.md` 의 "헤드라인 모집단을 규칙으로 고정한다" 표**이고
+이 스크립트는 그 표를 읽는다. 반대로 세우면 구현이 스스로 모집단을 정한다
+([findings 36](tracking/findings.md)). `pytest` 안의
+`tests/test_headline_population.py` 가 재집계값을 그 표와 대조한다.
 
 측정은 셋이다.
 

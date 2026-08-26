@@ -1755,10 +1755,10 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8000/inquiries
 ### 5. 검증 — **API 키 불필요**
 
 ```bash
-uv run pytest              # 1,497 passed
+uv run pytest              # 1,505 passed
 uv run ruff check .        # 0
-uv run ruff format --check .   # 187 files
-uv run mypy                # strict — 79 files, 0 errors
+uv run ruff format --check .   # 189 files
+uv run mypy                # strict — 81 files, 0 errors
 ```
 
 > **`uv run pytest` 는 DB 기동을 전제한다.** `db` 마커가 붙은 통합 테스트(178건)는
@@ -1767,7 +1767,7 @@ uv run mypy                # strict — 79 files, 0 errors
 > **전체 녹색을 주장하려면 `docker compose up -d --wait` 를 먼저 실행해야 한다.**
 
 ```bash
-uv run pytest -m db        # DB 통합 테스트만 — 178 passed, 1,319 deselected
+uv run pytest -m db        # DB 통합 테스트만 — 178 passed, 1,327 deselected
 ```
 
 DB 통합 테스트는 세션당 1회 스키마 적용 + 주문 시딩을 하고, 각 테스트가 쓴 행은 롤백으로 되돌린다.
@@ -1919,6 +1919,11 @@ uv run python -m scripts.compare_retrieval --live --embedding-axis   # 임베딩
 - **얻은 것은 규율 하나다** — *"검사를 지우면 빨개지는가"가 아니라 **"검사가 겨냥한 상태를
   만들면 빨개지는가"**를 물어라.* 넷 다 앞엣것은 통과했다. **게이트를 세운 세션은 그 게이트를
   통과한 유일한 세션이다**
+- **헤드라인 모집단도 이제 코드가 센다** — 미끼 기각 재현 `12/95` · `G06` 계보 `18/19` ·
+  `G30` 계보 `4/7` 은 오래 **사람이 손으로 재집계한 값**이었다. 모집단 판별자가 리포트 안에
+  필드로 있었으므로(측정 2 를 실제로 돌렸는가 · 기권 게이트가 배선됐는가), 규칙을 문서에
+  정본으로 고정하고 `scripts/recount_headline.py` 가 **그 표를 읽어** 다시 센다. 세 값이
+  그대로 재현됐다 — [findings 36](docs/tracking/findings.md)
 
 > **"구조 검사가 못박는다"의 한계를 함께 적는다.** 이 저장소의 구조 검사는 AST 를 읽되
 > **이름과 문면의 블록리스트**로 위반을 찾는다 — 실수는 잘 잡지만 **저자가 피하려고 마음먹으면
@@ -1982,4 +1987,4 @@ uv run python -m scripts.compare_retrieval --live --embedding-axis   # 임베딩
 | [`data/promoted_baseline.json`](data/promoted_baseline.json) | **승격 기준선 참조** — 회귀 판정을 구속하는 유일한 기준선. **사람만 바꾼다**(구조 테스트가 쓰기 경로를 막는다) |
 | [`scripts/handcalc_adoption_axis.py`](scripts/handcalc_adoption_axis.py) | 채택 축 손계산 산출물 — **무과금·오프라인**, 커밋된 검색 리포트만 읽는다 |
 | [`scripts/seed_orders.py`](scripts/seed_orders.py) · [`scripts/index_policies.py`](scripts/index_policies.py) | 시딩 · 인덱싱 |
-| [`tests/`](tests/) | **1,497건** (그중 DB 통합 **178건**) |
+| [`tests/`](tests/) | **1,505건** (그중 DB 통합 **178건**) |
